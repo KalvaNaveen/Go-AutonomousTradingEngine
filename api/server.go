@@ -12,6 +12,8 @@ import (
 	"bnf_go_engine/config"
 	"bnf_go_engine/core"
 	"bnf_go_engine/storage"
+
+	"github.com/gorilla/websocket"
 )
 
 // Server provides the REST API for the dashboard frontend.
@@ -73,6 +75,9 @@ func (s *Server) Start(addr string) {
 	// Trade analysis
 	mux.HandleFunc("/api/analysis/", s.handleAnalysis)
 
+	// Live WebSocket
+	mux.HandleFunc("/api/ws/live", s.handleWSLive)
+
 	log.Printf("[API] Starting on %s", addr)
 	if err := http.ListenAndServe(addr, handler); err != nil {
 		log.Printf("[API] Server error: %v", err)
@@ -97,7 +102,7 @@ func writeJSON(w http.ResponseWriter, data interface{}) {
 	json.NewEncoder(w).Encode(data)
 }
 
-func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+func (s *Server) buildHealthData() map[string]interface{} {
 	wsConnected := false
 	ticksFresh := false
 	if s.tickStore != nil {
@@ -105,7 +110,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		wsConnected = s.tickStore.IsReady()
 	}
 
-	writeJSON(w, map[string]interface{}{
+	return map[string]interface{}{
 		"status":       "running",
 		"engine":       "BNF Go Engine v1.0",
 		"uptime":       fmt.Sprintf("%dh %dm %ds", int(time.Since(s.startTime).Hours()), int(time.Since(s.startTime).Minutes())%60, int(time.Since(s.startTime).Seconds())%60),
@@ -114,10 +119,14 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		"ticks_fresh":  ticksFresh,
 		"cache_loaded": s.dailyCache.IsLoaded(),
 		"timestamp":    config.NowIST().Format(time.RFC3339),
-	})
+	}
 }
 
-func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, s.buildHealthData())
+}
+
+func (s *Server) buildStatusData() map[string]interface{} {
 	regime := "UNKNOWN"
 	if s.scanner != nil {
 		regime = s.scanner.DetectRegime()
@@ -173,7 +182,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	writeJSON(w, map[string]interface{}{
+	return map[string]interface{}{
 		"regime":         regime,
 		"engine_stopped": s.risk.EngineStopped,
 		"stop_reason":    s.risk.StopReason,
@@ -185,7 +194,11 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		"universe_count": 250, // Hardcoded for Nifty 250 universe
 		"index_data":     indexData,
 		"news_feed":      s.macro.GetNewsFeed(),
-	})
+	}
+}
+
+func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, s.buildStatusData())
 }
 
 func (s *Server) handleAnalysis(w http.ResponseWriter, r *http.Request) {
@@ -320,13 +333,16 @@ func (s *Server) handleSummary(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]interface{}{"summary": summary, "date": dateStr})
 }
 
-func (s *Server) handleLogs(w http.ResponseWriter, r *http.Request) {
-	dateStr := r.URL.Query().Get("date")
+func (s *Server) buildLogsData(dateStr string) map[string]interface{} {
 	if dateStr == "" {
 		dateStr = config.TodayIST().Format("2006-01-02")
 	}
 	logs := s.journal.GetLogsForDate(dateStr)
-	writeJSON(w, map[string]interface{}{"logs": logs, "date": dateStr})
+	return map[string]interface{}{"logs": logs, "date": dateStr}
+}
+
+func (s *Server) handleLogs(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, s.buildLogsData(r.URL.Query().Get("date")))
 }
 
 func (s *Server) handleRisk(w http.ResponseWriter, r *http.Request) {
@@ -368,4 +384,48 @@ func (s *Server) handlePerformance(w http.ResponseWriter, r *http.Request) {
 		"best_regime":  summary.BestRegime,
 		"worst_regime": summary.WorstRegime,
 	})
+}
+
+var upgrader = websocket.Upgrader{
+	CheckOrigin: func(r *http.Request) bool {
+		return true // Allow all origins for the dashboard
+	},
+}
+
+func (s *Server) handleWSLive(w http.ResponseWriter, r *http.Request) {
+	conn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.Printf("[API] WS Upgrade failed: %v", err)
+		return
+	}
+	defer conn.Close()
+
+	// Stream updates every 500ms
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+
+	// Send an initial payload immediately
+	payload := map[string]interface{}{
+		"type":   "live_update",
+		"health": s.buildHealthData(),
+		"status": s.buildStatusData(),
+		"logs":   s.buildLogsData(""),
+	}
+	if err := conn.WriteJSON(payload); err != nil {
+		return
+	}
+
+	for range ticker.C {
+		payload := map[string]interface{}{
+			"type":   "live_update",
+			"health": s.buildHealthData(),
+			"status": s.buildStatusData(),
+			"logs":   s.buildLogsData(""),
+		}
+
+		if err := conn.WriteJSON(payload); err != nil {
+			// Client disconnected
+			break
+		}
+	}
 }

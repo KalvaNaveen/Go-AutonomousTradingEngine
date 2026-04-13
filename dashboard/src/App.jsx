@@ -776,44 +776,76 @@ function App() {
   }, []);
 
   useEffect(() => {
-    let timer = setInterval(() => {
-      Promise.all([
-        fetch('/api/health').then(r => r.json()).catch(() => ({})),
-        fetch('/api/status').then(r => r.json()).catch(() => ({})),
-        fetch('/api/logs').then(r => r.json()).catch(() => ({}))
-      ]).then(([health, rootStatus, logsData]) => {
-        if (!health.status && !rootStatus.regime) {
-          setWsConnected(false);
-          return;
-        }
+    const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const wsUrl = `${wsProtocol}//${window.location.host}/api/ws/live`;
+    let ws = null;
+    let reconnectTimer = null;
+
+    const connectWS = () => {
+      ws = new WebSocket(wsUrl);
+      
+      ws.onopen = () => {
         setWsConnected(true);
-        setState(prev => {
-          const currentPnl = rootStatus.daily_pnl || 0;
-          const newHistory = [...(prev.pnl_history || []).slice(-29), currentPnl];
-          return {
-            ...prev,
-            pnl_history: newHistory,
-            pnl: currentPnl,
-            regime: rootStatus.regime || 'UNKNOWN',
-            uptime: health.uptime || '0h 0m 0s',
-            ws_connected: health.ws_connected || false,
-            positions: rootStatus.open_positions || [],
-            daily_trades_used: rootStatus.stats ? rootStatus.stats.total : 0,
-            universe_count: rootStatus.universe_count || 0,
-            index_data: rootStatus.index_data || prev.index_data,
-            news_feed: rootStatus.news_feed || prev.news_feed || [],
-            activity_log: logsData.logs || [],
-            agents: [
-              { name: 'Go Engine', status: health.status === 'running' ? 'active' : 'offline' },
-              { name: 'TickStore (WS)', status: health.ws_connected ? 'active' : 'stale' },
-              { name: 'DailyCache', status: health.cache_loaded ? 'active' : 'loading' },
-              { name: 'RiskAgent', status: rootStatus.engine_stopped ? 'stopped' : 'active' },
-            ]
-          };
-        });
-      });
-    }, 1000);
-    return () => clearInterval(timer);
+      };
+
+      ws.onmessage = (e) => {
+        try {
+          const data = JSON.parse(e.data);
+          if (data.type === 'live_update') {
+            const health = data.health || {};
+            const rootStatus = data.status || {};
+            const logsData = data.logs || {};
+
+            setWsConnected(true);
+            setState(prev => {
+              const currentPnl = rootStatus.daily_pnl || 0;
+              const newHistory = [...(prev.pnl_history || []).slice(-29), currentPnl];
+              return {
+                ...prev,
+                pnl_history: newHistory,
+                pnl: currentPnl,
+                regime: rootStatus.regime || 'UNKNOWN',
+                uptime: health.uptime || '0h 0m 0s',
+                ws_connected: health.ws_connected || false,
+                positions: rootStatus.open_positions || [],
+                daily_trades_used: rootStatus.stats ? rootStatus.stats.total : 0,
+                universe_count: rootStatus.universe_count || 0,
+                index_data: rootStatus.index_data || prev.index_data,
+                news_feed: rootStatus.news_feed || prev.news_feed || [],
+                activity_log: logsData.logs || [],
+                agents: [
+                  { name: 'Go Engine', status: health.status === 'running' ? 'active' : 'offline' },
+                  { name: 'TickStore (WS)', status: health.ws_connected ? 'active' : 'stale' },
+                  { name: 'DailyCache', status: health.cache_loaded ? 'active' : 'loading' },
+                  { name: 'RiskAgent', status: rootStatus.engine_stopped ? 'stopped' : 'active' },
+                ]
+              };
+            });
+          }
+        } catch (err) {
+          console.error("WS Parse error", err);
+        }
+      };
+
+      ws.onclose = () => {
+        setWsConnected(false);
+        setState(prev => ({ ...prev, 
+          agents: prev.agents.map(a => ({...a, status: 'offline'}))
+        }));
+        reconnectTimer = setTimeout(connectWS, 2000);
+      };
+
+      ws.onerror = () => {
+        ws.close();
+      };
+    };
+
+    connectWS();
+
+    return () => {
+      if (ws) ws.close();
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+    };
   }, []);
 
   const agentStatusColor = (s) => s === 'active' ? '#00D09C' : s === 'stopped' ? '#FF4D4D' : s === 'stale' ? '#FFB319' : '#475569';
