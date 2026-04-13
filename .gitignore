@@ -1,0 +1,21 @@
+# Binaries
+*.exe
+*.exe~
+
+# Environment
+.env
+
+# Data files
+data/*.db
+data/*.txt
+data/*.csv
+service_log.txt
+service_error.txt
+
+# Dashboard build
+dashboard/node_modules/
+dashboard/dist/
+
+# IDE
+.vscode/
+.idea/
