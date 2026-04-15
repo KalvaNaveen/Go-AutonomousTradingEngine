@@ -24,6 +24,7 @@ type KiteWebSocket struct {
 	conn        *websocket.Conn
 	mu          sync.Mutex
 	connected   bool
+	readStarted bool // tracks whether readLoop goroutine is running
 	reconnects  int
 }
 
@@ -55,6 +56,10 @@ func (kws *KiteWebSocket) Connect() error {
 	kws.mu.Lock()
 	kws.conn = conn
 	kws.connected = true
+	shouldStartRead := !kws.readStarted
+	if shouldStartRead {
+		kws.readStarted = true
+	}
 	kws.mu.Unlock()
 
 	log.Printf("[WS] Connected. Subscribing %d tokens in FULL mode", len(kws.tokens))
@@ -63,11 +68,11 @@ func (kws *KiteWebSocket) Connect() error {
 	kws.subscribe(kws.tokens)
 	kws.setMode("full", kws.tokens)
 
-	// Start reading in goroutine IF this is the first connection
-	// We'll manage goroutines carefully so we don't leak them
-	if !kws.connected { // Safety check to prevent double-spawning if Connect is called externally
-		kws.connected = true
+	// Start readLoop goroutine ONLY on first Connect (not on reconnects,
+	// since the reconnect is called FROM readLoop which continues after)
+	if shouldStartRead {
 		go kws.readLoop()
+		log.Println("[WS] readLoop goroutine started")
 	}
 
 	return nil

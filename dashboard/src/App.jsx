@@ -324,9 +324,10 @@ function LiveFloor({ state, logEndRef }) {
           <div className="stat-value" style={{color: 'var(--accent-yellow)'}}>{state.daily_trades_used} Trd</div>
         </div>
         <div className="panel stat-card">
-          <div className="stat-label">System Health</div>
-          <div className="stat-value" style={{ color: state.ws_connected ? 'var(--accent-green)' : 'var(--accent-yellow)', fontSize: '1rem' }}>
-            {state.ws_connected ? 'OPERATIONAL' : 'MARKET CLOSED'}
+          <div className="stat-label">ML Accuracy</div>
+          <div className="stat-value" style={{ display: 'flex', flexDirection: 'column', color: (state.ml_stats?.accuracy || 0) > 60 ? 'var(--accent-green)' : 'var(--accent-yellow)', fontSize: '1.2rem', fontWeight: 800 }}>
+             {state.ml_stats?.trained ? `${state.ml_stats.accuracy.toFixed(1)}%` : 'UNTRAINED'}
+             <span style={{fontSize: '0.65rem', color: 'var(--text-muted)', fontWeight: 600, marginTop: '2px'}}>{state.ml_stats?.samples || 0} TRADES</span>
           </div>
         </div>
       </div>
@@ -813,6 +814,7 @@ function App() {
                 index_data: rootStatus.index_data || prev.index_data,
                 news_feed: rootStatus.news_feed || prev.news_feed || [],
                 activity_log: logsData.logs || [],
+                ml_stats: rootStatus.ml_stats || { trained: false, accuracy: 0, samples: 0, bias: 0 },
                 agents: [
                   { name: 'Go Engine', status: health.status === 'running' ? 'active' : 'offline' },
                   { name: 'TickStore (WS)', status: health.ws_connected ? 'active' : 'stale' },

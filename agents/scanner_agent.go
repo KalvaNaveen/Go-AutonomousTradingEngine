@@ -389,7 +389,7 @@ func (s *ScannerAgent) ScanS1(regime string) []*Signal {
 				Strategy: "S1_MA_CROSS", Symbol: symbol, Token: token, Regime: regime,
 				EntryPrice: current, StopPrice: stopPrice,
 				PartialTarget: math.Round((current+1.0*risk)*100) / 100,
-				TargetPrice: targetPrice, ATR: atr, ADX: adx,
+				TargetPrice: targetPrice, ATR: atr, ADX: adx, RVol: rvol,
 				Product: "MIS", IsShort: false, SortKey: adx,
 			})
 		} else if crossDown && !isAbove200 && ema21SlopeDown {
@@ -403,7 +403,7 @@ func (s *ScannerAgent) ScanS1(regime string) []*Signal {
 				Strategy: "S1_MA_CROSS", Symbol: symbol, Token: token, Regime: regime,
 				EntryPrice: current, StopPrice: stopPrice,
 				PartialTarget: math.Round((current-1.0*risk)*100) / 100,
-				TargetPrice: targetPrice, ATR: atr, ADX: adx,
+				TargetPrice: targetPrice, ATR: atr, ADX: adx, RVol: rvol,
 				Product: "MIS", IsShort: true, SortKey: adx,
 			})
 		}
@@ -601,10 +601,8 @@ func (s *ScannerAgent) ScanS3(regime string) []*Signal {
 		}
 	}
 
-	if len(signals) > 0 {
-		s.s3TradeDate = today
-		s.s3TradesToday++
-	}
+	// NOTE: s3TradesToday is incremented in Execute(), not here.
+	// Counting on generation causes rejected signals to consume the daily limit.
 
 	sort.Slice(signals, func(i, j int) bool { return signals[i].SortKey > signals[j].SortKey })
 	if len(signals) > 1 {
@@ -733,9 +731,11 @@ func (s *ScannerAgent) ScanS8(regime string) []*Signal {
 			continue
 		}
 
-		prevH := highs[len(highs)-2]
-		prevL := lows[len(lows)-2]
-		prevC := closes[len(closes)-2]
+		// DailyCache.Closes last element = yesterday's close (Kite returns completed bars only)
+		// So -1 = yesterday, -2 = day before yesterday
+		prevH := highs[len(highs)-1]
+		prevL := lows[len(lows)-1]
+		prevC := closes[len(closes)-1]
 		pivot := (prevH + prevL + prevC) / 3
 		r1 := 2*pivot - prevL
 		s1 := 2*pivot - prevH
@@ -1445,10 +1445,24 @@ func (s *ScannerAgent) RunAllScans(regime string) []*Signal {
 	all = append(all, s12...)
 	all = append(all, s13...)
 
-	// Diagnostic logging (once per minute to avoid spam)
+	// ═══ ALWAYS-ON DIAGNOSTICS (every 30s) ═══
+	// Shows exactly WHY signals aren't generating — never go silent
 	now := config.NowIST()
-	if now.Second() == 0 && len(all) > 0 {
-		log.Printf("[Scanner] RAW signals: S1=%d S2=%d S3=%d S6T=%d S6V=%d S7=%d S8=%d S9=%d S10=%d S11=%d S12=%d S13=%d TOTAL=%d",
+	if now.Second() == 0 || now.Second() == 30 {
+		// Count stocks with valid LTP
+		ltpCount := 0
+		candleCount := 0
+		for token := range s.Universe {
+			if s.GetLTP != nil && s.GetLTP(token) > 0 {
+				ltpCount++
+			}
+			if c := s.getCandles5m(token); len(c) >= 2 {
+				candleCount++
+			}
+		}
+		log.Printf("[DIAG] Universe=%d LTP_active=%d Candles5m≥2=%d CacheReady=%v InWindow=%v Regime=%s",
+			len(s.Universe), ltpCount, candleCount, s.cacheReady(), s.IsInTradeWindow(), regime)
+		log.Printf("[DIAG] RAW: S1=%d S2=%d S3=%d S6T=%d S6V=%d S7=%d S8=%d S9=%d S10=%d S11=%d S12=%d S13=%d TOTAL=%d",
 			len(s1), len(s2), len(s3), len(s6t), len(s6v), len(s7), len(s8), len(s9), len(s10), len(s11), len(s12), len(s13), len(all))
 	}
 

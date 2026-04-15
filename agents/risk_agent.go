@@ -305,6 +305,7 @@ func (r *RiskAgent) ClosePosition(oid string, exitPrice float64) float64 {
 	r.WeeklyPnl += finalLegPnl
 
 	totalTradePnl := pos.RealisedPnl + finalLegPnl
+	pos.RealisedPnl = totalTradePnl // Persist for GetDailyStats()
 	if totalTradePnl > 0 {
 		r.ConsecutiveLosses = 0
 	} else {

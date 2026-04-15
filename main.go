@@ -288,9 +288,9 @@ func main() {
 	// ══════════════════════════════════════════════════════════════
 	//  PHASE 7: Start API Server (Dashboard Backend)
 	// ══════════════════════════════════════════════════════════════
-	apiServer := api.NewServer(risk, journal, exec, scanner, tickStore, dailyCache, macroAgent)
-	go apiServer.Start(":8080")
-	log.Println("[Engine] API server started on :8080")
+	apiServer := api.NewServer(risk, journal, exec, scanner, tickStore, dailyCache, macroAgent, mlFilter)
+	go apiServer.Start(":8081")
+	log.Println("[Engine] API server started on :8081")
 
 	// Wire FillMonitor (for live mode)
 	if !config.PaperMode {
@@ -366,7 +366,6 @@ func main() {
 		scanCount := 0
 		lastRegimeCheck := time.Time{}
 		currentRegime := "UNKNOWN"
-		lastScanSecond := -1
 
 	dayLoop:
 		for range ticker.C {
@@ -416,12 +415,9 @@ func main() {
 			exec.MonitorPositions(currentRegime)
 			monElapsed := time.Now().UnixNano() - monStart
 
-			// ── Strategy scanning runs at 1s (once per second) ──
-			currentSecond := now.Second()
-			if currentSecond == lastScanSecond {
-				continue // Already scanned this second
-			}
-			lastScanSecond = currentSecond
+			// ── Strategy scanning now runs at EVERY 200ms tick ──
+			// Go is fast enough: 250 stocks × 12 strategies = ~10ms
+			// Catches breakouts 0.5-0.8s earlier than 1s scanning
 
 			if risk.EngineStopped {
 				continue // Only monitor positions, don't scan
@@ -572,8 +568,8 @@ func launchDashboardUI() {
 	time.Sleep(3 * time.Second)
 	
 	// Open the browser
-	log.Println("[UI] Opening browser at http://localhost:5173")
-	exec.Command("cmd", "/c", "start", "http://localhost:5173").Start()
+	log.Println("[UI] Opening browser at http://127.0.0.1:7999")
+	exec.Command("cmd", "/c", "start", "http://127.0.0.1:7999").Start()
 	
 	// Wait for process to exit
 	cmd.Wait()
