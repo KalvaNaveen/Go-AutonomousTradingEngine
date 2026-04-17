@@ -4,7 +4,6 @@ import (
 	"database/sql"
 	"fmt"
 	"log"
-	"strings"
 	"time"
 
 	"bnf_go_engine/config"
@@ -64,7 +63,8 @@ func (sm *StateManager) initDB() {
 			rs_score        INTEGER DEFAULT 0,
 			market_status   TEXT DEFAULT '',
 			weeks_no_progress INTEGER DEFAULT 0,
-			token           INTEGER DEFAULT 0
+			token           INTEGER DEFAULT 0,
+			is_short        INTEGER DEFAULT 0
 		)
 	`)
 
@@ -83,6 +83,7 @@ func (sm *StateManager) initDB() {
 		{"market_status", "TEXT DEFAULT ''"},
 		{"weeks_no_progress", "INTEGER DEFAULT 0"},
 		{"token", "INTEGER DEFAULT 0"},
+		{"is_short", "INTEGER DEFAULT 0"},
 	}
 	for _, m := range migrations {
 		db.Exec(fmt.Sprintf("ALTER TABLE active_positions ADD COLUMN %s %s", m.col, m.def))
@@ -136,9 +137,14 @@ func (sm *StateManager) Save(entryOID string, t *Trade) {
 		pf = 1
 	}
 
+	isShortInt := 0
+	if t.IsShort {
+		isShortInt = 1
+	}
+
 	db.Exec(`
 		INSERT OR REPLACE INTO active_positions VALUES
-		(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+		(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 	`,
 		entryOID, t.Symbol, t.Strategy, t.Product, t.Regime,
 		t.EntryPrice, t.StopPrice, t.PartialTarget, t.TargetPrice,
@@ -147,7 +153,7 @@ func (sm *StateManager) Save(entryOID string, t *Trade) {
 		t.EntryTime.Format(time.RFC3339), t.EntryDate.Format("2006-01-02"),
 		t.RVol, t.DeviationPct, "OPEN", now,
 		t.TrailStop, t.PyramidAdded, t.RSScore, t.MarketStatus,
-		t.WeeksNoProg, t.Token,
+		t.WeeksNoProg, t.Token, isShortInt,
 	)
 }
 
@@ -212,15 +218,16 @@ func (sm *StateManager) LoadOpenPositions() []*Trade {
 
 	cutoff := config.TodayIST().AddDate(0, 0, -1).Format("2006-01-02")
 	rows, err := db.Query(`
-		SELECT entry_oid, symbol, strategy, product, regime,
-		       entry_price, stop_price, partial_target, target_price,
+		SELECT entry_oid, symbol, strategy, product, COALESCE(regime,''),
+		       entry_price, stop_price, COALESCE(partial_target,0), target_price,
 		       qty, partial_qty, remaining_qty, partial_filled,
-		       sl_oid, partial_oid, target_oid,
+		       COALESCE(sl_oid,''), COALESCE(partial_oid,''), COALESCE(target_oid,''),
 		       entry_time, entry_date,
-		       rvol, deviation_pct,
-		       COALESCE(trail_stop,0), COALESCE(pyramid_added,0),
-		       COALESCE(rs_score,0), COALESCE(market_status,''),
-		       COALESCE(weeks_no_progress,0), COALESCE(token,0)
+		       CAST(COALESCE(NULLIF(rvol,''),0) AS REAL), CAST(COALESCE(NULLIF(deviation_pct,''),0) AS REAL),
+		       CAST(COALESCE(NULLIF(trail_stop,''),0) AS REAL), CAST(COALESCE(NULLIF(pyramid_added,''),0) AS INTEGER),
+		       CAST(COALESCE(NULLIF(rs_score,''),0) AS INTEGER), COALESCE(market_status,''),
+		       CAST(COALESCE(NULLIF(weeks_no_progress,''),0) AS INTEGER), CAST(COALESCE(NULLIF(token,''),0) AS INTEGER),
+		       CAST(COALESCE(NULLIF(is_short,''),0) AS INTEGER)
 		FROM active_positions
 		WHERE status='OPEN' AND entry_date >= ?
 		ORDER BY entry_time ASC
@@ -234,7 +241,7 @@ func (sm *StateManager) LoadOpenPositions() []*Trade {
 	for rows.Next() {
 		t := &Trade{}
 		var entryTimeStr, entryDateStr string
-		var pf int
+		var pf, isShortInt int
 		err := rows.Scan(
 			&t.EntryOID, &t.Symbol, &t.Strategy, &t.Product, &t.Regime,
 			&t.EntryPrice, &t.StopPrice, &t.PartialTarget, &t.TargetPrice,
@@ -243,7 +250,7 @@ func (sm *StateManager) LoadOpenPositions() []*Trade {
 			&entryTimeStr, &entryDateStr,
 			&t.RVol, &t.DeviationPct,
 			&t.TrailStop, &t.PyramidAdded, &t.RSScore, &t.MarketStatus,
-			&t.WeeksNoProg, &t.Token,
+			&t.WeeksNoProg, &t.Token, &isShortInt,
 		)
 		if err != nil {
 			continue
@@ -251,7 +258,7 @@ func (sm *StateManager) LoadOpenPositions() []*Trade {
 		t.PartialFilled = pf == 1
 		t.EntryTime, _ = time.Parse(time.RFC3339, entryTimeStr)
 		t.EntryDate, _ = time.Parse("2006-01-02", entryDateStr)
-		t.IsShort = strings.Contains(strings.ToUpper(t.Strategy), "SHORT")
+		t.IsShort = isShortInt == 1
 		trades = append(trades, t)
 	}
 	return trades

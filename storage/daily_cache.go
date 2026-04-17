@@ -1,15 +1,19 @@
 package storage
 
 import (
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"math"
 	"net/http"
+	"os"
 	"sort"
 	"sync"
 	"time"
+
+	_ "modernc.org/sqlite"
 
 	"bnf_go_engine/agents"
 	"bnf_go_engine/config"
@@ -60,117 +64,151 @@ func NewDailyCache() *DailyCache {
 }
 
 // Preload fetches 260 days of historical data for all universe tokens.
-// Must be called before market open (8:45 AM).
+// Uses 3 parallel workers to respect Kite's ~3 req/sec rate limit while cutting load time by 3x.
 func (dc *DailyCache) Preload(universe map[uint32]string) bool {
-	log.Printf("[DailyCache] Preloading %d tokens (260d)...", len(universe))
+	log.Printf("[DailyCache] Preloading %d tokens (260d) with 3 parallel workers...", len(universe))
+
+	type tokenJob struct {
+		token  uint32
+		symbol string
+	}
+
+	jobs := make(chan tokenJob, len(universe))
+	for token, symbol := range universe {
+		jobs <- tokenJob{token, symbol}
+	}
+	close(jobs)
+
+	var mu sync.Mutex
 	loaded := 0
 	failed := 0
+	total := len(universe)
 
-	for token, symbol := range universe {
-		dailyData, err := dc.fetchDaily(token, 260)
-		if err != nil || len(dailyData) < 25 {
-			failed++
-			if err != nil {
-				log.Printf("[DailyCache] %s failed: %v", symbol, err)
+	var wg sync.WaitGroup
+	numWorkers := 3 // Kite rate limit ~3 req/sec
+
+	for w := 0; w < numWorkers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for job := range jobs {
+				dailyData, err := dc.fetchDaily(job.token, 260)
+				if err != nil || len(dailyData) < 25 {
+					mu.Lock()
+					failed++
+					mu.Unlock()
+					if err != nil {
+						log.Printf("[DailyCache] %s failed: %v", job.symbol, err)
+					}
+					time.Sleep(350 * time.Millisecond)
+					continue
+				}
+
+				closes := make([]float64, len(dailyData))
+				highs := make([]float64, len(dailyData))
+				lows := make([]float64, len(dailyData))
+				volumes := make([]float64, len(dailyData))
+				for i, d := range dailyData {
+					closes[i] = d.Close
+					highs[i] = d.High
+					lows[i] = d.Low
+					volumes[i] = float64(d.Volume)
+				}
+
+				ema25 := data.ComputeEMA(closes, 25)
+				ema25Val := 0.0
+				if len(ema25) > 0 {
+					ema25Val = ema25[len(ema25)-1]
+				}
+
+				rsiSlice := data.ComputeRSI(closes, 14)
+				rsi14 := 50.0
+				if len(rsiSlice) > 0 {
+					rsi14 = rsiSlice[len(rsiSlice)-1]
+				}
+
+				bbHi, _, bbLo := data.ComputeBollinger(closes, 20, 2.0)
+
+				avgVol := 1.0
+				if len(volumes) >= 20 {
+					s := 0.0
+					for _, v := range volumes[len(volumes)-20:] {
+						s += v
+					}
+					avgVol = s / 20.0
+				}
+
+				avgTurn := 0.0
+				if len(volumes) >= 20 && len(closes) >= 20 {
+					s := 0.0
+					off := len(volumes) - 20
+					for i := 0; i < 20; i++ {
+						s += volumes[off+i] * closes[off+i] / 1e7
+					}
+					avgTurn = s / 20.0
+				}
+
+				atr14 := computeATR(highs, lows, closes, 14)
+				pivot := computePivotSupport(closes, lows)
+
+				sma50, sma150, sma200 := 0.0, 0.0, 0.0
+				if len(closes) >= 50 {
+					sma50 = sma(closes, 50)
+				}
+				if len(closes) >= 150 {
+					sma150 = sma(closes, 150)
+				}
+				if len(closes) >= 200 {
+					sma200 = sma(closes, 200)
+				}
+
+				sma200Up := false
+				if len(closes) >= 220 {
+					sma200Prev := sma(closes[:len(closes)-20], 200)
+					sma200Up = sma200 > sma200Prev
+				}
+
+				high52 := maxSlice(closes)
+				low52 := minSlice(closes)
+
+				dc.mu.Lock()
+				dc.store[job.token] = &DailyCacheEntry{
+					Symbol:       job.symbol,
+					Closes:       closes,
+					Highs:        highs,
+					Lows:         lows,
+					Volumes:      volumes,
+					EMA25:        ema25Val,
+					RSI14:        rsi14,
+					BBUpper:      bbHi,
+					BBLower:      bbLo,
+					AvgDailyVol:  avgVol,
+					TurnoverCr:   math.Round(avgTurn*100) / 100,
+					PivotSupport: pivot,
+					ATR14:        math.Round(atr14*100) / 100,
+					SMA50:        math.Round(sma50*100) / 100,
+					SMA150:       math.Round(sma150*100) / 100,
+					SMA200:       math.Round(sma200*100) / 100,
+					SMA200Up:     sma200Up,
+					High52W:      math.Round(high52*100) / 100,
+					Low52W:       math.Round(low52*100) / 100,
+				}
+				dc.mu.Unlock()
+
+				mu.Lock()
+				loaded++
+				if loaded%25 == 0 {
+					log.Printf("[DailyCache] Progress: %d/%d loaded", loaded, total)
+				}
+				mu.Unlock()
+
+				// Per-worker rate limit: each worker sleeps 350ms = 3 workers × ~3 req/s total
+				time.Sleep(350 * time.Millisecond)
 			}
-			continue
-		}
-
-		closes := make([]float64, len(dailyData))
-		highs := make([]float64, len(dailyData))
-		lows := make([]float64, len(dailyData))
-		volumes := make([]float64, len(dailyData))
-		for i, d := range dailyData {
-			closes[i] = d.Close
-			highs[i] = d.High
-			lows[i] = d.Low
-			volumes[i] = float64(d.Volume)
-		}
-
-		ema25 := data.ComputeEMA(closes, 25)
-		ema25Val := 0.0
-		if len(ema25) > 0 {
-			ema25Val = ema25[len(ema25)-1]
-		}
-
-		rsiSlice := data.ComputeRSI(closes, 14)
-		rsi14 := 50.0
-		if len(rsiSlice) > 0 {
-			rsi14 = rsiSlice[len(rsiSlice)-1]
-		}
-
-		bbHi, _, bbLo := data.ComputeBollinger(closes, 20, 2.0)
-
-		avgVol := 1.0
-		if len(volumes) >= 20 {
-			s := 0.0
-			for _, v := range volumes[len(volumes)-20:] {
-				s += v
-			}
-			avgVol = s / 20.0
-		}
-
-		avgTurn := 0.0
-		if len(volumes) >= 20 && len(closes) >= 20 {
-			s := 0.0
-			off := len(volumes) - 20
-			for i := 0; i < 20; i++ {
-				s += volumes[off+i] * closes[off+i] / 1e7
-			}
-			avgTurn = s / 20.0
-		}
-
-		atr14 := computeATR(highs, lows, closes, 14)
-		pivot := computePivotSupport(closes, lows)
-
-		sma50, sma150, sma200 := 0.0, 0.0, 0.0
-		if len(closes) >= 50 {
-			sma50 = sma(closes, 50)
-		}
-		if len(closes) >= 150 {
-			sma150 = sma(closes, 150)
-		}
-		if len(closes) >= 200 {
-			sma200 = sma(closes, 200)
-		}
-
-		sma200Up := false
-		if len(closes) >= 220 {
-			sma200Prev := sma(closes[:len(closes)-20], 200)
-			sma200Up = sma200 > sma200Prev
-		}
-
-		high52 := maxSlice(closes)
-		low52 := minSlice(closes)
-
-		dc.mu.Lock()
-		dc.store[token] = &DailyCacheEntry{
-			Symbol:       symbol,
-			Closes:       closes,
-			Highs:        highs,
-			Lows:         lows,
-			Volumes:      volumes,
-			EMA25:        ema25Val,
-			RSI14:        rsi14,
-			BBUpper:      bbHi,
-			BBLower:      bbLo,
-			AvgDailyVol:  avgVol,
-			TurnoverCr:   math.Round(avgTurn*100) / 100,
-			PivotSupport: pivot,
-			ATR14:        math.Round(atr14*100) / 100,
-			SMA50:        math.Round(sma50*100) / 100,
-			SMA150:       math.Round(sma150*100) / 100,
-			SMA200:       math.Round(sma200*100) / 100,
-			SMA200Up:     sma200Up,
-			High52W:      math.Round(high52*100) / 100,
-			Low52W:       math.Round(low52*100) / 100,
-		}
-		dc.mu.Unlock()
-
-		loaded++
-		// Rate limit: Kite historical_data limit ~3/sec
-		time.Sleep(350 * time.Millisecond)
+		}()
 	}
+
+	wg.Wait()
 
 	// Compute RS scores cross-sectionally
 	dc.computeRSScores()
@@ -237,6 +275,8 @@ func (dc *DailyCache) GetAvgDailyVol(token uint32) float64 {
 // ── Kite REST Historical Data ────────────────────────────────
 
 type dailyBar struct {
+	Date   string
+	Open   float64
 	Close  float64
 	High   float64
 	Low    float64
@@ -287,7 +327,13 @@ func (dc *DailyCache) fetchDaily(token uint32, days int) ([]dailyBar, error) {
 			if len(c) < 6 {
 				continue
 			}
+			dateStr := ""
+			if s, ok := c[0].(string); ok && len(s) >= 10 {
+				dateStr = s[:10]
+			}
 			bars = append(bars, dailyBar{
+				Date:   dateStr,
+				Open:   toFloat(c[1]),
 				Close:  toFloat(c[4]),
 				High:   toFloat(c[2]),
 				Low:    toFloat(c[3]),
@@ -451,4 +497,63 @@ func max(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// SyncEODToHistoricalDB reaches out to Kite historical APIs to fetch the official finalized daily 
+// OHLCV for all tokens, and flushes it immediately into historical.db for the Quantum Simulator to consume.
+func (dc *DailyCache) SyncEODToHistoricalDB(universe map[uint32]string) {
+	dbPath := config.BaseDir + string(os.PathSeparator) + "data" + string(os.PathSeparator) + "historical.db"
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		log.Printf("[DailyCache] ❌ Failed to open historical.db for EOD sync: %v", err)
+		return
+	}
+	defer db.Close()
+
+	log.Printf("[DailyCache] 💾 Starting EOD Historical DB Sync for %d tokens...", len(universe))
+	
+	count := 0
+	today := config.TodayIST().Format("2006-01-02")
+
+	for token := range universe {
+		bars, err := dc.fetchDaily(token, 1) // Just pull the latest 1-2 days
+		if err != nil || len(bars) == 0 {
+			continue // Token didn't trade or auth error
+		}
+		
+		// Map Kite payload to EOD
+		var todayBar *dailyBar
+		for _, b := range bars {
+			if b.Date == today {
+				todayClone := b
+				todayBar = &todayClone
+				break
+			}
+		}
+
+		if todayBar == nil {
+			lastBar := bars[len(bars)-1]
+			todayBar = &lastBar
+		}
+
+		_, err = db.Exec(`
+			INSERT INTO daily_data (token, date, open, high, low, close, volume) 
+			VALUES (?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT(token, date) DO UPDATE SET 
+				open=excluded.open, 
+				high=excluded.high, 
+				low=excluded.low, 
+				close=excluded.close, 
+				volume=excluded.volume
+		`, token, todayBar.Date, todayBar.Open, todayBar.High, todayBar.Low, todayBar.Close, todayBar.Volume)
+
+		if err == nil {
+			count++
+		}
+		
+		// Kite Connect API rate limits strictly cap historical calls to 3 requests/sec
+		time.Sleep(340 * time.Millisecond) 
+	}
+
+	log.Printf("[DailyCache] ✅ EOD Sync Complete! Written %d daily candles to historical.db", count)
 }

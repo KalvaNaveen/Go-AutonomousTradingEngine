@@ -19,8 +19,8 @@ import (
 const (
 	MLFeatureCount       = 8
 	MLLearningRate       = 0.01
-	MLMinConfidence      = 0.45
-	MLMinTrainingSamples = 20 // Lowered from 30 since we have 26 real trades
+	MLMinConfidence      = 0.30 // Lowered from 0.45 to prevent blocking every signal
+	MLMinTrainingSamples = 20
 )
 
 // MLFilter holds the trained logistic regression model

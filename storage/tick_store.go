@@ -121,7 +121,11 @@ func (ts *TickStore) OnTick(token uint32, ltp float64, vol int64, dayOpen, dayHi
 	if vol > 0 {
 		td.Volume = vol
 	}
-	td.ChangePct = changePct
+	// Only update ChangePct if it was explicitly parsed (non-zero) or if it's the very first write
+	// This prevents small LTP-only packets from overwriting the valid percentage with 0
+	if changePct != 0 || td.ChangePct == 0 {
+		td.ChangePct = changePct
+	}
 	if dayOpen > 0 {
 		td.DayOpen = dayOpen
 	}
@@ -256,6 +260,13 @@ func (ts *TickStore) GetVolume(token uint32) int64 {
 	td.mu.Lock()
 	defer td.mu.Unlock()
 	return td.Volume
+}
+
+func (ts *TickStore) GetChangePct(token uint32) float64 {
+	td := ts.getOrCreate(token)
+	td.mu.Lock()
+	defer td.mu.Unlock()
+	return td.ChangePct
 }
 
 func (ts *TickStore) GetDayOpen(token uint32) float64 {

@@ -54,6 +54,8 @@ type BacktestResult struct {
 	AvgHoldMins   float64
 	DailyReturns  []float64
 	TradeLog      []BacktestTrade
+	FinalCapital  float64
+	ExecutionTime time.Duration
 }
 
 // BacktestTrade is a single simulated trade
@@ -89,6 +91,7 @@ type Backtester struct {
 	HistDB     string // path to historical.db
 	Universe   map[uint32]string
 	DailyBars  map[uint32][]HistoricalBar // token -> sorted bars
+	LogOutput  func(string, ...interface{}) // Optional hook for WebSocket streaming
 }
 
 func NewBacktester(cfg BacktestConfig) *Backtester {
@@ -121,13 +124,21 @@ func NewBacktester(cfg BacktestConfig) *Backtester {
 	}
 }
 
+func (bt *Backtester) log(format string, v ...interface{}) {
+	if bt.LogOutput != nil {
+		bt.LogOutput(format, v...)
+	} else {
+		log.Printf("[Backtest] "+format, v...)
+	}
+}
+
 // LoadData loads historical OHLCV data from historical.db
 func (bt *Backtester) LoadData() error {
 	if bt.HistDB == "" {
 		return fmt.Errorf("no historical.db found")
 	}
 
-	log.Printf("[Backtest] Loading historical data from %s", bt.HistDB)
+	bt.log("Loading historical data from %s", bt.HistDB)
 
 	db, err := sql.Open("sqlite", bt.HistDB)
 	if err != nil {
@@ -149,7 +160,7 @@ func (bt *Backtester) LoadData() error {
 	}
 	rows.Close()
 
-	log.Printf("[Backtest] Found tables: %v", tables)
+	bt.log("Found tables: %v", tables)
 
 	// Try to find OHLCV data — the Python engine stores it in various formats
 	// Common table names: 'daily_ohlcv', 'historical', 'candles'
@@ -190,13 +201,13 @@ func (bt *Backtester) LoadData() error {
 			cols = append(cols, name)
 		}
 		pragma.Close()
-		log.Printf("[Backtest] Columns: %v", cols)
+		bt.log("Columns: %v", cols)
 	}
 
 	// Count rows
 	var totalRows int
 	db.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM [%s]", ohlcvTable)).Scan(&totalRows)
-	log.Printf("[Backtest] Total rows: %d", totalRows)
+	bt.log("Total rows: %d", totalRows)
 
 	// Load data (try common column name patterns)
 	query := fmt.Sprintf(`
@@ -240,7 +251,7 @@ func (bt *Backtester) LoadData() error {
 		loaded++
 	}
 
-	log.Printf("[Backtest] Loaded %d bars for %d symbols", loaded, len(bt.DailyBars))
+	bt.log("Loaded %d bars for %d symbols", loaded, len(bt.DailyBars))
 	return nil
 }
 

@@ -1,0 +1,46 @@
+package main
+
+import (
+	"database/sql"
+	"fmt"
+	"log"
+
+	_ "modernc.org/sqlite"
+)
+
+func main() {
+	db, err := sql.Open("sqlite", "data/journal.db")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer db.Close()
+
+	// get trades count
+	var count int
+	db.QueryRow("SELECT COUNT(*) FROM trades WHERE date = '2026-04-15'").Scan(&count)
+	fmt.Printf("Trades on 2026-04-15: %d\n", count)
+
+	// get daily summary
+	var stopped int
+	var reason string
+	err = db.QueryRow("SELECT engine_stopped, stop_reason FROM daily_summary WHERE date = '2026-04-15'").Scan(&stopped, &reason)
+	if err == nil {
+		fmt.Printf("Summary -> Engine stopped: %d, reason: %s\n", stopped, reason)
+	} else {
+		fmt.Println("No summary found for 2026-04-15")
+	}
+
+	// get last 20 logs for that day to see why
+	rows, err := db.Query("SELECT time, agent, action, detail FROM agent_logs WHERE date = '2026-04-15' LIMIT 30")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer rows.Close()
+
+	fmt.Println("=== LOGS ===")
+	for rows.Next() {
+		var t, agent, action, detail string
+		rows.Scan(&t, &agent, &action, &detail)
+		fmt.Printf("[%s] %s: %s | %s\n", t, agent, action, detail)
+	}
+}

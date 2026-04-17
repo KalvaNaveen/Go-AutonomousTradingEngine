@@ -109,8 +109,8 @@ const (
 	MaxPositionsPerStrat = 5
 	MaxPositionPct     = 0.15
 	MaxTradesPerDay    = 100
-	EODSquareoffTime   = "15:05"
-	EODSquareoffFinal  = "15:10"
+	EODSquareoffTime   = "15:15"
+	EODSquareoffFinal  = "15:15"
 	PreemptiveExitTime = "14:50"
 
 	STTBuffer         = 0.997
@@ -167,8 +167,8 @@ const (
 	S2_BB_PERIOD     = 20
 	S2_BB_SD         = 2.0
 	S2_RSI_PERIOD    = 14
-	S2_RSI_OVERSOLD  = 28
-	S2_RSI_OVERBOUGHT = 72
+	S2_RSI_OVERSOLD  = 32
+	S2_RSI_OVERBOUGHT = 68
 	S2_ATR_SL_MULT   = 1.0
 	S2_RR            = 1.2
 	S2_RISK_PCT      = 0.005
@@ -231,13 +231,36 @@ const (
 	S9_RR          = 3.0
 )
 
+// S14: RSI Scalper (RSI-2 on 5min — Larry Connors adapted for intraday)
+const (
+	S14_RSI_PERIOD      = 2
+	S14_RSI_OVERSOLD    = 10
+	S14_RSI_OVERBOUGHT  = 90
+	S14_RSI_EXIT        = 50
+	S14_STOP_PCT        = 0.005 // 0.5% tight scalp stop
+	S14_MAX_HOLD_MINS   = 30
+	S14_MIN_PRICE       = 50.0
+)
+
+// S15: RSI Swing (RSI-14 pullback with EMA20 trend confirmation)
+const (
+	S15_RSI_PERIOD      = 14
+	S15_RSI_OVERSOLD    = 35
+	S15_RSI_OVERBOUGHT  = 65
+	S15_EMA_TREND       = 20
+	S15_ATR_SL_MULT     = 1.0
+	S15_RR              = 2.0
+	S15_MAX_HOLD_MINS   = 120
+	S15_MIN_PRICE       = 100.0
+)
+
 // ── Timing ──────────────────────────────────────────────────
 const (
-	TradeWindowStart = "09:15"
-	TradeWindowEnd   = "14:50"
-	IntradaySquareoff = "15:10"
-	HuntWindowStart  = "09:15"
-	LastEntryTime    = "14:50"
+	TradeWindowStart    = "09:16"
+	TradeWindowEnd      = "15:15"
+	IntradaySquareoff   = "15:15"
+	HuntWindowStart     = "09:16"
+	LastEntryTime       = "14:50"
 	FillPollIntervalSec = 30
 	FillTimeoutMinutes  = 30
 )

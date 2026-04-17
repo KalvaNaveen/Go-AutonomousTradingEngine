@@ -80,7 +80,7 @@ func (kws *KiteWebSocket) Connect() error {
 
 func (kws *KiteWebSocket) subscribe(tokens []uint32) {
 	// Kite subscribe message: {"a": "subscribe", "v": [token1, token2, ...]}
-	msg := fmt.Sprintf(`{"a":"subscribe","v":[`)
+	msg := `{"a":"subscribe","v":[`
 	for i, t := range tokens {
 		if i > 0 {
 			msg += ","
@@ -187,19 +187,33 @@ func (kws *KiteWebSocket) parseTick(pkt []byte) {
 	var bidQty, askQty int64
 	var exchangeTS time.Time
 
-	// FULL mode packet (184 bytes for equity)
-	if len(pkt) >= 44 {
-		vol = int64(binary.BigEndian.Uint32(pkt[16:20]))
-		dayOpen = float64(int32(binary.BigEndian.Uint32(pkt[20:24]))) / 100.0
-		dayHigh = float64(int32(binary.BigEndian.Uint32(pkt[24:28]))) / 100.0
-		dayLow = float64(int32(binary.BigEndian.Uint32(pkt[28:32]))) / 100.0
-	}
+	isIndex := token == 256265 || token == 260105 || token == 264969 // NIFTY50, BANKNIFTY, VIX
+	
+	if isIndex {
+		if len(pkt) >= 28 {
+			dayHigh = float64(int32(binary.BigEndian.Uint32(pkt[8:12]))) / 100.0
+			dayLow = float64(int32(binary.BigEndian.Uint32(pkt[12:16]))) / 100.0
+			dayOpen = float64(int32(binary.BigEndian.Uint32(pkt[16:20]))) / 100.0
+			closePrice := float64(int32(binary.BigEndian.Uint32(pkt[20:24]))) / 100.0
+			if closePrice > 0 {
+				changePct = ((ltp - closePrice) / closePrice) * 100.0
+			}
+		}
+	} else {
+		// FULL mode packet (164/184 bytes for equity)
+		if len(pkt) >= 44 {
+			vol = int64(binary.BigEndian.Uint32(pkt[16:20]))
+			dayOpen = float64(int32(binary.BigEndian.Uint32(pkt[20:24]))) / 100.0
+			dayHigh = float64(int32(binary.BigEndian.Uint32(pkt[24:28]))) / 100.0
+			dayLow = float64(int32(binary.BigEndian.Uint32(pkt[28:32]))) / 100.0
+		}
 
-	// Close price for change calculation
-	if len(pkt) >= 36 {
-		closePrice := float64(int32(binary.BigEndian.Uint32(pkt[32:36]))) / 100.0
-		if closePrice > 0 {
-			changePct = ((ltp - closePrice) / closePrice) * 100.0
+		// Close price for change calculation (equity)
+		if len(pkt) >= 36 {
+			closePrice := float64(int32(binary.BigEndian.Uint32(pkt[32:36]))) / 100.0
+			if closePrice > 0 {
+				changePct = ((ltp - closePrice) / closePrice) * 100.0
+			}
 		}
 	}
 

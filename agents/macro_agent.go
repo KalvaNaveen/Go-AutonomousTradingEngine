@@ -200,7 +200,9 @@ func (m *MacroAgent) fetchAndProcess() {
 		sentiment := "neutral"
 		var matchedSymbol string
 		for symbol, token := range mapping {
-			if !strings.Contains(combined, strings.ToLower(symbol)) {
+			// Strict word boundary match to prevent 'ACC' matching 'according'
+			matched, _ := regexp.MatchString(`\b`+strings.ToLower(regexp.QuoteMeta(symbol))+`\b`, combined)
+			if !matched {
 				continue
 			}
 			matchedSymbol = symbol

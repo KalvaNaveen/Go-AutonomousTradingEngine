@@ -5,6 +5,9 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -65,6 +68,9 @@ func (s *Server) Start(addr string) {
 	// Daily summary
 	mux.HandleFunc("/api/summary", s.handleSummary)
 
+	// P&L summary (daily/weekly/monthly breakdown)
+	mux.HandleFunc("/api/pnl-summary", s.handlePnlSummary)
+
 	// Agent logs
 	mux.HandleFunc("/api/logs", s.handleLogs)
 
@@ -79,6 +85,29 @@ func (s *Server) Start(addr string) {
 
 	// Live WebSocket
 	mux.HandleFunc("/api/ws/live", s.handleWSLive)
+
+	// Historical Simulator WebSocket
+	mux.HandleFunc("/api/ws/simulator", s.handleWSSimulator)
+
+	// Serve pre-built dashboard from dist/ directory (no npm needed)
+	distDir := filepath.Join(config.BaseDir, "dashboard", "dist")
+	if _, err := os.Stat(distDir); err == nil {
+		fs := http.FileServer(http.Dir(distDir))
+		mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+			// Allow scripts/styles to execute (CSP)
+			w.Header().Set("Content-Security-Policy", "default-src * 'unsafe-inline' 'unsafe-eval' data: blob:; script-src * 'unsafe-inline' 'unsafe-eval'; style-src * 'unsafe-inline';")
+			// If the file exists, serve it; otherwise serve index.html (SPA fallback)
+			path := filepath.Join(distDir, r.URL.Path)
+			if _, err := os.Stat(path); os.IsNotExist(err) || r.URL.Path == "/" {
+				http.ServeFile(w, r, filepath.Join(distDir, "index.html"))
+				return
+			}
+			fs.ServeHTTP(w, r)
+		})
+		log.Printf("[API] Serving dashboard from %s", distDir)
+	} else {
+		log.Println("[API] No dashboard dist found — UI will not be served")
+	}
 
 	log.Printf("[API] Starting on %s", addr)
 	if err := http.ListenAndServe(addr, handler); err != nil {
@@ -131,12 +160,16 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 func (s *Server) buildStatusData() map[string]interface{} {
 	regime := "UNKNOWN"
 	if s.scanner != nil {
-		regime = s.scanner.DetectRegime()
+		regime = s.scanner.LastRegime
+		if regime == "" {
+			regime = s.scanner.DetectRegime()
+		}
 	}
 
 	stats := s.risk.GetDailyStats()
 
 	openPositions := make([]map[string]interface{}, 0)
+	s.exec.Mu.RLock()
 	for oid, trade := range s.exec.ActiveTrades {
 		pos := map[string]interface{}{
 			"oid":         oid,
@@ -148,7 +181,7 @@ func (s *Server) buildStatusData() map[string]interface{} {
 			"qty":         trade.Qty,
 			"is_short":    trade.IsShort,
 			"regime":      trade.Regime,
-			"entry_time":  trade.EntryTime.Format("15:04:05"),
+			"entry_time":  trade.EntryTime.Format(time.RFC3339),
 		}
 
 		// Live P&L
@@ -167,20 +200,28 @@ func (s *Server) buildStatusData() map[string]interface{} {
 		}
 		openPositions = append(openPositions, pos)
 	}
+	s.exec.Mu.RUnlock()
 
 	indexData := map[string]interface{}{
-		"nifty50": nil,
-		"vix":     nil,
+		"nifty50":       nil,
+		"nifty50_pct":   nil,
+		"banknifty":     nil,
+		"banknifty_pct": nil,
+		"vix":           nil,
+		"vix_pct":       nil,
 	}
 	if s.tickStore != nil {
 		if ltp := s.tickStore.GetLTP(config.Nifty50Token); ltp > 0 {
 			indexData["nifty50"] = ltp
+			indexData["nifty50_pct"] = s.tickStore.GetChangePct(config.Nifty50Token)
 		}
 		if ltp := s.tickStore.GetLTP(config.SectorTokens["NIFTY BANK"]); ltp > 0 {
 			indexData["banknifty"] = ltp
+			indexData["banknifty_pct"] = s.tickStore.GetChangePct(config.SectorTokens["NIFTY BANK"])
 		}
 		if ltp := s.tickStore.GetLTP(config.IndiaVIXToken); ltp > 0 {
 			indexData["vix"] = ltp
+			indexData["vix_pct"] = s.tickStore.GetChangePct(config.IndiaVIXToken)
 		}
 	}
 
@@ -193,7 +234,7 @@ func (s *Server) buildStatusData() map[string]interface{} {
 		"capital":        s.risk.TotalCapital,
 		"daily_pnl":      s.risk.DailyPnl,
 		"paper_mode":     config.PaperMode,
-		"universe_count": 250, // Hardcoded for Nifty 250 universe
+		"universe_count": len(s.scanner.Universe),
 		"index_data":     indexData,
 		"news_feed":      s.macro.GetNewsFeed(),
 		"ml_stats": map[string]interface{}{
@@ -298,6 +339,7 @@ func (s *Server) handleAnalysis(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handlePositions(w http.ResponseWriter, r *http.Request) {
 	positions := make([]map[string]interface{}, 0)
+	s.exec.Mu.RLock()
 	for oid, trade := range s.exec.ActiveTrades {
 		pos := map[string]interface{}{
 			"oid":           oid,
@@ -311,10 +353,11 @@ func (s *Server) handlePositions(w http.ResponseWriter, r *http.Request) {
 			"is_short":      trade.IsShort,
 			"product":       trade.Product,
 			"regime":        trade.Regime,
-			"entry_time":    trade.EntryTime.Format("15:04:05"),
+			"entry_time":    trade.EntryTime.Format(time.RFC3339),
 		}
 		positions = append(positions, pos)
 	}
+	s.exec.Mu.RUnlock()
 	writeJSON(w, map[string]interface{}{"positions": positions})
 }
 
@@ -339,6 +382,51 @@ func (s *Server) handleSummary(w http.ResponseWriter, r *http.Request) {
 	}
 	summary := s.journal.GetDailySummaryForDate(dateStr)
 	writeJSON(w, map[string]interface{}{"summary": summary, "date": dateStr})
+}
+
+func (s *Server) handlePnlSummary(w http.ResponseWriter, r *http.Request) {
+	now := config.NowIST()
+	today := now.Format("2006-01-02")
+
+	// Weekly: Monday of current week → today
+	weekday := now.Weekday()
+	if weekday == 0 { weekday = 7 } // Sunday = 7
+	monday := now.AddDate(0, 0, -int(weekday-1))
+	weekStart := monday.Format("2006-01-02")
+	weeklyBreakdown := s.journal.GetPnlBreakdown(weekStart, today)
+
+	// Monthly: 1st of current month → today
+	monthStart := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, now.Location()).Format("2006-01-02")
+	monthlyBreakdown := s.journal.GetPnlBreakdown(monthStart, today)
+
+	// Aggregate weekly totals
+	wPnl, wTrades, wWins := 0.0, 0, 0
+	for _, d := range weeklyBreakdown {
+		wPnl += d["pnl"].(float64)
+		wTrades += d["trades"].(int)
+		wWins += d["wins"].(int)
+	}
+
+	// Aggregate monthly totals
+	mPnl, mTrades, mWins := 0.0, 0, 0
+	for _, d := range monthlyBreakdown {
+		mPnl += d["pnl"].(float64)
+		mTrades += d["trades"].(int)
+		mWins += d["wins"].(int)
+	}
+
+	writeJSON(w, map[string]interface{}{
+		"weekly": map[string]interface{}{
+			"pnl": wPnl, "trades": wTrades, "wins": wWins, "losses": wTrades - wWins,
+			"from": weekStart, "to": today,
+			"breakdown": weeklyBreakdown,
+		},
+		"monthly": map[string]interface{}{
+			"pnl": mPnl, "trades": mTrades, "wins": mWins, "losses": mTrades - mWins,
+			"from": monthStart, "to": today,
+			"breakdown": monthlyBreakdown,
+		},
+	})
 }
 
 func (s *Server) buildLogsData(dateStr string) map[string]interface{} {
@@ -436,4 +524,54 @@ func (s *Server) handleWSLive(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 	}
+}
+
+func (s *Server) handleWSSimulator(w http.ResponseWriter, r *http.Request) {
+	conn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.Printf("[API] Simulator WS Upgrade failed: %v", err)
+		return
+	}
+	defer conn.Close()
+
+	daysStr := r.URL.Query().Get("days")
+	days := 30
+	if parsed, err := strconv.Atoi(daysStr); err == nil && parsed > 0 {
+		days = parsed
+	}
+
+	writeLog := func(format string, v ...interface{}) {
+		msg := fmt.Sprintf("[SIM] "+format, v...)
+		conn.WriteMessage(1, []byte(msg)) // 1 = TextMessage
+	}
+
+	writeLog("Initializing Quantum Simulation Core (Days: %d)...", days)
+
+	endDate := config.TodayIST().Format("2006-01-02")
+	startDate := config.TodayIST().AddDate(0, 0, -days).Format("2006-01-02")
+
+	bt := core.NewBacktester(core.BacktestConfig{
+		StartDate:      startDate,
+		EndDate:        endDate,
+		InitialCapital: config.TotalCapital,
+		MaxPositions:   5,
+	})
+	
+	bt.LogOutput = writeLog
+
+	writeLog("Connecting to historical data matrix...")
+	
+	res, err := bt.Run()
+	if err != nil {
+		writeLog("[ERROR] Simulator aborted: %v", err)
+		return
+	}
+
+	writeLog("════ Simulation Summary ════")
+	writeLog("Total trades executed: %d", res.TotalTrades)
+	writeLog("Win Rate: %.1f%%  |  Profit Factor: %.2f", res.WinRate, res.ProfitFactor)
+	writeLog("Absolute PNL: ₹%.2f", res.TotalPnL)
+	writeLog("Ending Equity: ₹%.2f", res.FinalCapital)
+	
+	writeLog("Connection closed. Session ended.")
 }

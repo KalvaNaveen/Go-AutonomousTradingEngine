@@ -258,13 +258,49 @@ func main() {
 	// ══════════════════════════════════════════════════════════════
 	exec.RestoreFromState()
 
+	// Backfill missing Tokens to restored trades (vital for live P&L streaming)
+	symbolToToken := make(map[string]uint32)
+	for token, sym := range dataAgent.Universe {
+		symbolToToken[sym] = token
+	}
+	exec.Mu.Lock()
+	for _, trade := range exec.ActiveTrades {
+		if trade.Token == 0 {
+			if matchedTok, exists := symbolToToken[trade.Symbol]; exists {
+				trade.Token = matchedTok
+				log.Printf("[Engine] Recovered missing token for %s: %d", trade.Symbol, matchedTok)
+			}
+		}
+	}
+	exec.Mu.Unlock()
+
+	// Recover daily circuit breakers
+	dateStr := config.TodayIST().Format("2006-01-02")
+	summary := journal.GetDailySummaryForDate(dateStr)
+	if summary != nil {
+		if pnl, ok := summary["gross_pnl"].(float64); ok {
+			risk.DailyPnl = pnl
+			scanner.RecordPnl(pnl) // Ensure scanner circuit breaker is aware
+		}
+		if trades, ok := summary["total_trades"].(int); ok {
+			// Register previously taken trades on Scanner to respect MaxTradesPerDay
+			for i := 0; i < trades; i++ {
+				scanner.RegisterTrade()
+			}
+		}
+		if stopped, ok := summary["engine_stopped"].(bool); ok && stopped {
+			risk.EngineStopped = true
+			if reason, ok := summary["stop_reason"].(string); ok {
+				risk.StopReason = reason
+			}
+		}
+		log.Printf("[Engine] Restored daily limits from DB: trades=%d, pnl=%.2f, stopped=%v", 
+			summary["total_trades"], summary["gross_pnl"], summary["engine_stopped"])
+	}
+
 	// Wire Paper Broker LTP (needs TickStore + Universe, so done after both are ready)
 	if paperBroker != nil {
-		// Build reverse map: symbol → token
-		symbolToToken := make(map[string]uint32)
-		for token, sym := range dataAgent.Universe {
-			symbolToToken[sym] = token
-		}
+		// Maps already built globally in phase 5
 		paperBroker.GetLTP = func(symbol string) float64 {
 			if tok, ok := symbolToToken[symbol]; ok {
 				return tickStore.GetLTPIfFresh(tok)
@@ -354,8 +390,14 @@ func main() {
 			today.Format("2006-01-02"), dayOfWeek.String())
 
 		// Reset daily state
-		risk = agents.NewRiskAgent(config.TotalCapital)
-		exec.Risk = risk
+		risk.ResetDaily()
+
+		// Recover any trades already completed today so dashboard stats persist through restarts
+		todayTrades := journal.GetAllTradesForDate("")
+		if len(todayTrades) > 0 {
+			risk.RestoreDailyTrades(todayTrades)
+		}
+
 		scanner.NewSession()
 		tickStore.ResetDaily()
 		holidayChecked := false
@@ -406,6 +448,10 @@ func main() {
 				stats := risk.GetDailyStats()
 				log.Printf("[Engine] ═══ DAY COMPLETE ═══ Trades=%v Wins=%v P&L=₹%.2f Scans=%d",
 					stats["total"], stats["wins"], stats["gross_pnl"], scanCount)
+				
+				// Automatically persist EOD cache to Historical DB for Simulator use
+				dailyCache.SyncEODToHistoricalDB(dataAgent.Universe)
+
 				ticker.Stop()
 				break dayLoop
 			}
@@ -427,7 +473,13 @@ func main() {
 
 			// Regime detection (every 15 minutes)
 			if time.Since(lastRegimeCheck) > 15*time.Minute || currentRegime == "UNKNOWN" {
-				currentRegime = scanner.DetectRegime()
+				newRegime := scanner.DetectRegime()
+				if newRegime != currentRegime {
+					journal.LogAgentActivity("Scanner", "REGIME_CHANGE",
+						fmt.Sprintf("%s → %s", currentRegime, newRegime),
+						config.NowIST().Format("15:04:05"))
+				}
+				currentRegime = newRegime
 				lastRegimeCheck = time.Now()
 			}
 
@@ -442,6 +494,21 @@ func main() {
 			scanElapsed := time.Now().UnixNano() - scanStart
 			scanCount++
 
+			// Log scan results periodically (every 50 scans) or when signals found
+			if len(signals) > 0 {
+				for _, sig := range signals {
+					journal.LogAgentActivity("Scanner", "SIGNAL_FOUND",
+						fmt.Sprintf("%s %s Entry=%.1f SL=%.1f RSI=%.1f RVol=%.1f",
+							sig.Strategy, sig.Symbol, sig.EntryPrice, sig.StopPrice, sig.RSI, sig.RVol),
+						config.NowIST().Format("15:04:05"))
+				}
+			} else if scanCount%250 == 0 {
+				journal.LogAgentActivity("Scanner", "SCAN_CYCLE",
+					fmt.Sprintf("Completed %d scans | Regime=%s | Open=%d | %dms",
+						scanCount, currentRegime, len(exec.ActiveTrades), scanElapsed/1e6),
+					config.NowIST().Format("15:04:05"))
+			}
+
 			// Execute approved signals (with macro veto + ML filter + VaR + sector check)
 			execStart := time.Now().UnixNano()
 			executed := 0
@@ -451,9 +518,9 @@ func main() {
 				if config.DisabledStrategies[sig.Strategy] {
 					continue
 				}
-				if macroAgent.CheckVeto(sig.Symbol, !sig.IsShort, currentRegime) {
-					continue
-				}
+				// MACRO VETO DISABLED — news keyword matching is too crude, blocks valid signals
+				// macroAgent.CheckVeto is kept in code but not called
+				// Re-enable only after implementing proper NLP sentiment
 				// Sector correlation guard: max 3 positions per sector
 				if exec.SectorCount(sig.Symbol) >= 3 {
 					continue
@@ -474,6 +541,9 @@ func main() {
 				if !mlOK {
 					mlBlocked++
 					log.Printf("[ML] Blocked %s %s (prob=%.2f)", sig.Strategy, sig.Symbol, mlProb)
+					journal.LogAgentActivity("MLFilter", "BLOCKED",
+						fmt.Sprintf("%s %s prob=%.2f", sig.Strategy, sig.Symbol, mlProb),
+						config.NowIST().Format("15:04:05"))
 					continue
 				}
 
@@ -493,11 +563,18 @@ func main() {
 				if !varOK {
 					varBlocked++
 					log.Printf("[VaR] Blocked %s %s: %s", sig.Strategy, sig.Symbol, varReason)
+					journal.LogAgentActivity("VaREngine", "BLOCKED",
+						fmt.Sprintf("%s %s: %s", sig.Strategy, sig.Symbol, varReason),
+						config.NowIST().Format("15:04:05"))
 					continue
 				}
 
 				if exec.Execute(sig, currentRegime) {
 					executed++
+					journal.LogAgentActivity("Execution", "TRADE_OPENED",
+						fmt.Sprintf("%s %s Qty=%d Entry=%.1f SL=%.1f Target=%.1f",
+							sig.Strategy, sig.Symbol, sig.Qty, sig.EntryPrice, sig.StopPrice, sig.TargetPrice),
+						config.NowIST().Format("15:04:05"))
 				}
 			}
 			execElapsed := time.Now().UnixNano() - execStart
@@ -543,36 +620,12 @@ func sleepUntilMorning() {
 }
 
 func launchDashboardUI() {
-	time.Sleep(1 * time.Second) // Let API server bind
+	time.Sleep(500 * time.Millisecond) // Let API server bind
 
-	dashboardDir := config.BaseDir + string(os.PathSeparator) + "dashboard"
-	if _, err := os.Stat(dashboardDir); os.IsNotExist(err) {
-		log.Printf("[UI] Dashboard directory not found at: %s", dashboardDir)
-		return
-	}
-
-	log.Println("[UI] Launching Vite Dashboard Server...")
-	
-	// Create the command
-	cmd := exec.Command("npm", "run", "dev")
-	cmd.Dir = dashboardDir
-	cmd.Stdout = nil // ignore vite spam
-	cmd.Stderr = nil
-	
-	if err := cmd.Start(); err != nil {
-		log.Printf("[UI] Failed to launch Vite server: %v", err)
-		return
-	}
-	
-	// Give Vite a moment to start
-	time.Sleep(3 * time.Second)
-	
-	// Open the browser
-	log.Println("[UI] Opening browser at http://127.0.0.1:7999")
-	exec.Command("cmd", "/c", "start", "http://127.0.0.1:7999").Start()
-	
-	// Wait for process to exit
-	cmd.Wait()
+	// Dashboard is served directly by Go API server from dashboard/dist
+	// No npm/Vite needed — just open the browser
+	log.Println("[UI] Opening dashboard at http://127.0.0.1:8081")
+	exec.Command("cmd", "/c", "start", "http://127.0.0.1:8081").Start()
 }
 
 // waitForNetwork pings a reliable endpoint to ensure DNS and network are up 

@@ -64,6 +64,7 @@ type ScannerAgent struct {
 	symbolCooldown   map[string]int
 	dailyPnl         float64
 	dailyPnlDate     time.Time
+	LastRegime       string // Shared regime for both main loop and API
 }
 
 // Candle represents OHLCV data
@@ -107,10 +108,7 @@ func (s *ScannerAgent) DetectRegime() string {
 		}
 	}
 
-	if vix >= config.VIXExtremeStop {
-		return "EXTREME_PANIC"
-	}
-
+	result := "UNKNOWN"
 	adRatio := 0.5
 	if s.GetADRatio != nil {
 		a := s.GetADRatio()
@@ -130,26 +128,26 @@ func (s *ScannerAgent) DetectRegime() string {
 	}
 
 	if vix >= config.VIXExtremeStop {
-		return "EXTREME_PANIC"
-	}
-	if vix > config.VIXBearPanic && !aboveEMA && adRatio < 0.40 {
+		result = "EXTREME_PANIC"
+	} else if vix > config.VIXBearPanic && !aboveEMA && adRatio < 0.40 {
 		log.Printf("[Regime] BEAR_PANIC — VIX=%.1f AD=%.2f", vix, adRatio)
-		return "BEAR_PANIC"
-	}
-	if vix < config.VIXBearPanic && aboveEMA && adRatio > 0.60 {
+		result = "BEAR_PANIC"
+	} else if vix < config.VIXBearPanic && aboveEMA && adRatio > 0.60 {
 		log.Printf("[Regime] BULL — VIX=%.1f AD=%.2f", vix, adRatio)
-		return "BULL"
-	}
-	if config.VIXBullMax <= vix && vix < config.VIXExtremeStop {
+		result = "BULL"
+	} else if config.VIXBullMax <= vix && vix < config.VIXExtremeStop {
 		log.Printf("[Regime] VOLATILE — VIX=%.1f AD=%.2f", vix, adRatio)
-		return "VOLATILE"
-	}
-	if config.VIXNormalLow <= vix && vix < config.VIXBullMax {
+		result = "VOLATILE"
+	} else if config.VIXNormalLow <= vix && vix < config.VIXBullMax {
 		log.Printf("[Regime] NORMAL — VIX=%.1f AD=%.2f", vix, adRatio)
-		return "NORMAL"
+		result = "NORMAL"
+	} else {
+		log.Printf("[Regime] CHOP — VIX=%.1f AD=%.2f", vix, adRatio)
+		result = "CHOP"
 	}
-	log.Printf("[Regime] CHOP — VIX=%.1f AD=%.2f", vix, adRatio)
-	return "CHOP"
+
+	s.LastRegime = result
+	return result
 }
 
 // ── Time Enforcement ─────────────────────────────────────────
@@ -925,7 +923,7 @@ func (s *ScannerAgent) computeRVol(token uint32) float64 {
 
 // MinNetProfitPerTrade is the minimum expected net profit after ALL charges.
 // Trades that can't clear this hurdle are rejected — they create churn, not wealth.
-const MinNetProfitPerTrade = 50.0 // Rs. 50 minimum net profit
+const MinNetProfitPerTrade = 15.0 // Rs. 15 minimum net profit (lowered from 50 to allow scalps)
 
 // FilterByNetProfit rejects signals whose expected profit at target doesn't cover charges.
 // This single filter eliminates 60-70% of marginal trades that historically lost money.
@@ -1413,9 +1411,198 @@ func (s *ScannerAgent) ScanS13SectorRotation(regime string) []*Signal {
 	return signals
 }
 
+// ══════════════════════════════════════════════════════════════
+//  S14: RSI SCALPER (RSI-2 on 5-min — Larry Connors Method)
+//  RSI(2) is the most mean-reverting indicator on short timeframes.
+//  When RSI(2) < 10, price is extremely oversold → buy the bounce.
+//  When RSI(2) > 90, price is extremely overbought → short the fade.
+//  VWAP acts as the only trend filter. NO RVol. NO ADX.
+//  This is designed to FIRE signals, not sit idle.
+// ══════════════════════════════════════════════════════════════
+func (s *ScannerAgent) ScanS14RSIScalp(regime string) []*Signal {
+	if !s.IsInTradeWindow() || !s.checkDailyTradeLimit() || regime == "EXTREME_PANIC" || !s.cacheReady() {
+		return nil
+	}
+
+	var signals []*Signal
+	for token, symbol := range s.Universe {
+		current := s.GetLTP(token)
+		if current <= 0 || current < config.S14_MIN_PRICE {
+			continue
+		}
+
+		candles := s.getCandles5m(token)
+		if len(candles) < 5 {
+			continue
+		}
+		closes := make([]float64, len(candles))
+		for i, c := range candles {
+			closes[i] = c.Close
+		}
+
+		// RSI(2) — ultra-short period for scalping
+		rsiSlice := data.ComputeRSI(closes, config.S14_RSI_PERIOD)
+		if len(rsiSlice) == 0 {
+			continue
+		}
+		rsi2 := rsiSlice[len(rsiSlice)-1]
+
+		// VWAP trend filter (only filter we use)
+		vwap := 0.0
+		if s.GetVWAP != nil {
+			vwap = s.GetVWAP(token)
+		}
+
+		atr := s.DailyCache.ATR[token]
+		if atr <= 0 {
+			atr = current * 0.015
+		}
+
+		// LONG: RSI(2) < 10 (extreme oversold) + price above VWAP (uptrend)
+		if rsi2 < float64(config.S14_RSI_OVERSOLD) && (vwap <= 0 || current > vwap) {
+			stopPrice := math.Round(current*(1-config.S14_STOP_PCT)*100) / 100
+			risk := current - stopPrice
+			if risk <= 0 {
+				continue
+			}
+			targetPrice := math.Round((current + 1.5*risk) * 100) / 100
+
+			signals = append(signals, &Signal{
+				Strategy: "S14_RSI_SCALP", Symbol: symbol, Token: token, Regime: regime,
+				EntryPrice: current, StopPrice: stopPrice, TargetPrice: targetPrice,
+				RSI: rsi2, VWAP: vwap, ATR: atr,
+				Product: "MIS", IsShort: false, MaxHoldMins: config.S14_MAX_HOLD_MINS,
+				SortKey: float64(config.S14_RSI_OVERSOLD) - rsi2, // Lower RSI = stronger signal
+			})
+		}
+
+		// SHORT: RSI(2) > 90 (extreme overbought) + price below VWAP (downtrend)
+		if rsi2 > float64(config.S14_RSI_OVERBOUGHT) && (vwap <= 0 || current < vwap) {
+			stopPrice := math.Round(current*(1+config.S14_STOP_PCT)*100) / 100
+			risk := stopPrice - current
+			if risk <= 0 {
+				continue
+			}
+			targetPrice := math.Round((current - 1.5*risk) * 100) / 100
+
+			signals = append(signals, &Signal{
+				Strategy: "S14_RSI_SCALP", Symbol: symbol, Token: token, Regime: regime,
+				EntryPrice: current, StopPrice: stopPrice, TargetPrice: targetPrice,
+				RSI: rsi2, VWAP: vwap, ATR: atr,
+				Product: "MIS", IsShort: true, MaxHoldMins: config.S14_MAX_HOLD_MINS,
+				SortKey: rsi2 - float64(config.S14_RSI_OVERBOUGHT), // Higher RSI = stronger signal
+			})
+		}
+	}
+
+	sort.Slice(signals, func(i, j int) bool { return signals[i].SortKey > signals[j].SortKey })
+	if len(signals) > 5 {
+		signals = signals[:5]
+	}
+	return signals
+}
+
+// ══════════════════════════════════════════════════════════════
+//  S15: RSI SWING (RSI-14 Pullback + EMA20 Trend Confirmation)
+//  Buy pullbacks in uptrends, short pullbacks in downtrends.
+//  RSI(14) < 35 in an uptrend (price > EMA20) = classic dip buy.
+//  RSI(14) > 65 in a downtrend (price < EMA20) = classic rally short.
+//  Simple. Proven. High win rate on liquid stocks.
+// ══════════════════════════════════════════════════════════════
+func (s *ScannerAgent) ScanS15RSISwing(regime string) []*Signal {
+	if !s.IsInTradeWindow() || !s.checkDailyTradeLimit() || regime == "EXTREME_PANIC" || !s.cacheReady() {
+		return nil
+	}
+
+	var signals []*Signal
+	for token, symbol := range s.Universe {
+		current := s.GetLTP(token)
+		if current <= 0 || current < config.S15_MIN_PRICE {
+			continue
+		}
+
+		candles := s.get15MinOHLC(token)
+		if len(candles) < config.S15_EMA_TREND+2 {
+			continue
+		}
+
+		closes := make([]float64, len(candles))
+		highs := make([]float64, len(candles))
+		lows := make([]float64, len(candles))
+		for i, c := range candles {
+			closes[i] = c.Close
+			highs[i] = c.High
+			lows[i] = c.Low
+		}
+
+		// EMA20 trend filter on 15-min
+		ema20 := data.ComputeEMA(closes, config.S15_EMA_TREND)
+		if len(ema20) == 0 {
+			continue
+		}
+		emaVal := ema20[len(ema20)-1]
+
+		// RSI(14) on 15-min
+		rsiSlice := data.ComputeRSI(closes, config.S15_RSI_PERIOD)
+		if len(rsiSlice) == 0 {
+			continue
+		}
+		rsi14 := rsiSlice[len(rsiSlice)-1]
+
+		atr := s.DailyCache.ATR[token]
+		if atr <= 0 {
+			atr = current * 0.02
+		}
+
+		// LONG: Price > EMA20 (uptrend) + RSI < 35 (pullback/oversold)
+		if current > emaVal && rsi14 < float64(config.S15_RSI_OVERSOLD) {
+			stopPrice := math.Round((current - config.S15_ATR_SL_MULT*atr) * 100) / 100
+			risk := current - stopPrice
+			if risk <= 0 {
+				continue
+			}
+			targetPrice := math.Round((current + config.S15_RR*risk) * 100) / 100
+
+			signals = append(signals, &Signal{
+				Strategy: "S15_RSI_SWING", Symbol: symbol, Token: token, Regime: regime,
+				EntryPrice: current, StopPrice: stopPrice,
+				PartialTarget: math.Round((current + 1.0*risk) * 100) / 100,
+				TargetPrice: targetPrice, RSI: rsi14, ATR: atr,
+				Product: "MIS", IsShort: false, MaxHoldMins: config.S15_MAX_HOLD_MINS,
+				SortKey: float64(config.S15_RSI_OVERSOLD) - rsi14,
+			})
+		}
+
+		// SHORT: Price < EMA20 (downtrend) + RSI > 65 (rally/overbought)
+		if current < emaVal && rsi14 > float64(config.S15_RSI_OVERBOUGHT) {
+			stopPrice := math.Round((current + config.S15_ATR_SL_MULT*atr) * 100) / 100
+			risk := stopPrice - current
+			if risk <= 0 {
+				continue
+			}
+			targetPrice := math.Round((current - config.S15_RR*risk) * 100) / 100
+
+			signals = append(signals, &Signal{
+				Strategy: "S15_RSI_SWING", Symbol: symbol, Token: token, Regime: regime,
+				EntryPrice: current, StopPrice: stopPrice,
+				PartialTarget: math.Round((current - 1.0*risk) * 100) / 100,
+				TargetPrice: targetPrice, RSI: rsi14, ATR: atr,
+				Product: "MIS", IsShort: true, MaxHoldMins: config.S15_MAX_HOLD_MINS,
+				SortKey: rsi14 - float64(config.S15_RSI_OVERBOUGHT),
+			})
+		}
+	}
+
+	sort.Slice(signals, func(i, j int) bool { return signals[i].SortKey > signals[j].SortKey })
+	if len(signals) > 5 {
+		signals = signals[:5]
+	}
+	return signals
+}
+
 // RunAllScans executes all strategies and returns combined signals
 // FILTERED by net profitability — no signal reaches execution unless it
-// can produce ≥₹50 net profit after ALL Zerodha charges.
+// can produce ≥₹15 net profit after ALL Zerodha charges.
 func (s *ScannerAgent) RunAllScans(regime string) []*Signal {
 	var all []*Signal
 
@@ -1431,6 +1618,8 @@ func (s *ScannerAgent) RunAllScans(regime string) []*Signal {
 	s11 := s.ScanS11VWAPRevert(regime)
 	s12 := s.ScanS12EODReversion(regime)
 	s13 := s.ScanS13SectorRotation(regime)
+	s14 := s.ScanS14RSIScalp(regime)
+	s15 := s.ScanS15RSISwing(regime)
 
 	all = append(all, s1...)
 	all = append(all, s2...)
@@ -1444,6 +1633,39 @@ func (s *ScannerAgent) RunAllScans(regime string) []*Signal {
 	all = append(all, s11...)
 	all = append(all, s12...)
 	all = append(all, s13...)
+	all = append(all, s14...)
+	all = append(all, s15...)
+
+	// Catch-all to populate missing ML prerequisites for ANY strategy
+	for _, sig := range all {
+		if sig.RSI == 0 || sig.ADX == 0 || sig.RVol == 0 {
+			if sig.RVol == 0 && s.ComputeRVol != nil {
+				sig.RVol = s.ComputeRVol(sig.Token)
+			}
+			
+			candles := s.getCandles5m(sig.Token)
+			if len(candles) >= 15 {
+				closes := make([]float64, len(candles))
+				highs := make([]float64, len(candles))
+				lows := make([]float64, len(candles))
+				for i, c := range candles {
+					closes[i] = c.Close
+					highs[i] = c.High
+					lows[i] = c.Low
+				}
+				
+				if sig.RSI == 0 {
+					rsiSlice := data.ComputeRSI(closes, 14)
+					sig.RSI = rsiSlice[len(rsiSlice)-1]
+				}
+				if sig.ADX == 0 {
+					sig.ADX = data.ComputeADX(highs, lows, closes, 14)
+				}
+			} else if sig.RSI == 0 {
+				sig.RSI = 50.0 // Neutral fallback if data is missing
+			}
+		}
+	}
 
 	// ═══ ALWAYS-ON DIAGNOSTICS (every 30s) ═══
 	// Shows exactly WHY signals aren't generating — never go silent
@@ -1462,8 +1684,8 @@ func (s *ScannerAgent) RunAllScans(regime string) []*Signal {
 		}
 		log.Printf("[DIAG] Universe=%d LTP_active=%d Candles5m≥2=%d CacheReady=%v InWindow=%v Regime=%s",
 			len(s.Universe), ltpCount, candleCount, s.cacheReady(), s.IsInTradeWindow(), regime)
-		log.Printf("[DIAG] RAW: S1=%d S2=%d S3=%d S6T=%d S6V=%d S7=%d S8=%d S9=%d S10=%d S11=%d S12=%d S13=%d TOTAL=%d",
-			len(s1), len(s2), len(s3), len(s6t), len(s6v), len(s7), len(s8), len(s9), len(s10), len(s11), len(s12), len(s13), len(all))
+		log.Printf("[DIAG] RAW: S1=%d S2=%d S3=%d S6T=%d S6V=%d S7=%d S8=%d S9=%d S10=%d S11=%d S12=%d S13=%d S14=%d S15=%d TOTAL=%d",
+			len(s1), len(s2), len(s3), len(s6t), len(s6v), len(s7), len(s8), len(s9), len(s10), len(s11), len(s12), len(s13), len(s14), len(s15), len(all))
 	}
 
 	// CRITICAL: Filter by net profitability — remove any signal that can't cover charges

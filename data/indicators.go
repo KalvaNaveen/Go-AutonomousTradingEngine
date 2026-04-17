@@ -62,26 +62,36 @@ func ComputeRSI(prices []float64, period int) []float64 {
 	ag /= float64(period)
 	al /= float64(period)
 
-	rsiSize := len(deltas) - period
+	rsiSize := len(deltas) - period + 1
 	if rsiSize <= 0 {
 		return []float64{50.0}
 	}
 
 	rsi := make([]float64, 0, rsiSize)
 	
+	// Math: First RSI value uses the SMAs
+	var rs float64
+	if al != 0 {
+		rs = ag / al
+	} else {
+		rs = 1000 // Safely large number
+	}
+	seedRSI := 100.0 - (100.0 / (1.0 + rs))
+	if al == 0 { seedRSI = 100.0 }
+	rsi = append(rsi, seedRSI)
+
+	// Wilder's Smoothing for the rest
 	for i := period; i < len(deltas); i++ {
 		ag = (ag*float64(period-1) + gains[i]) / float64(period)
 		al = (al*float64(period-1) + losses[i]) / float64(period)
 		
-		var rs float64
 		if al != 0 {
 			rs = ag / al
+			rsiVal := 100.0 - (100.0 / (1.0 + rs))
+			rsi = append(rsi, rsiVal)
 		} else {
-			rs = 100
+			rsi = append(rsi, 100.0)
 		}
-		
-		rsiVal := 100.0 - (100.0 / (1.0 + rs))
-		rsi = append(rsi, rsiVal)
 	}
 	
 	if len(rsi) == 0 {

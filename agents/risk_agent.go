@@ -40,6 +40,16 @@ func NewRiskAgent(capital float64) *RiskAgent {
 	}
 }
 
+func (r *RiskAgent) ResetDaily() {
+    r.DailyPnl = 0
+    r.DailyTrades = nil
+    r.EngineStopped = false
+    r.StopReason = ""
+    r.ConsecutiveLosses = 0
+    r.OpenPositions = make(map[string]*core.Trade)
+    log.Println("[Risk] Daily stats reset successfully.")
+}
+
 func (r *RiskAgent) ApproveTrade(signal map[string]interface{}) (bool, string) {
 	if r.EngineStopped {
 		return false, fmt.Sprintf("ENGINE_STOPPED: %s", r.StopReason)
@@ -159,6 +169,7 @@ func (r *RiskAgent) ApproveTrade(signal map[string]interface{}) (bool, string) {
 	// Strategy-aware RR minimums
 	meanRevStrategies := map[string]bool{
 		"S2_BB_MEAN_REV": true, "S6_VWAP_BAND": true, "S7_MEAN_REV_LONG": true,
+		"S14_RSI_SCALP": true, "S15_RSI_SWING": true,
 	}
 
 	if strategy == "S3_ORB" && rr < 1.0 {
@@ -278,6 +289,7 @@ func (r *RiskAgent) RegisterOpen(oid string, pos *core.Trade) {
 func (r *RiskAgent) ClosePosition(oid string, exitPrice float64) float64 {
 	pos, exists := r.OpenPositions[oid]
 	if !exists {
+		log.Printf("[Risk] WARNING: ClosePosition called for OID=%s but position NOT FOUND in OpenPositions (PnL will be 0)", oid)
 		return 0.0
 	}
 	delete(r.OpenPositions, oid)
@@ -314,6 +326,21 @@ func (r *RiskAgent) ClosePosition(oid string, exitPrice float64) float64 {
 
 	r.DailyTrades = append(r.DailyTrades, pos)
 	return totalTradePnl
+}
+
+// RestoreDailyTrades loads today's previously completed trades into memory from the DB
+func (r *RiskAgent) RestoreDailyTrades(trades []map[string]interface{}) {
+	for _, tMap := range trades {
+		pnl, _ := tMap["gross_pnl"].(float64)
+		pos := &core.Trade{
+			Symbol:      tMap["symbol"].(string),
+			Strategy:    tMap["strategy"].(string),
+			RealisedPnl: pnl,
+		}
+		r.DailyTrades = append(r.DailyTrades, pos)
+		r.DailyPnl += pnl // Explicitly accumulate PnL here
+	}
+	log.Printf("[Risk] Restored %d completed trades from journal for daily stats (PnL=%.2f)", len(trades), r.DailyPnl)
 }
 
 func (r *RiskAgent) GetDailyStats() map[string]interface{} {
@@ -355,16 +382,33 @@ func (r *RiskAgent) GetDailyStats() map[string]interface{} {
 		avgLoss = lossPnl / float64(lossCount)
 	}
 
+	profitFactor := 0.0
+	if lossPnl != 0 {
+		profitFactor = math.Abs(winPnl / lossPnl)
+	} else if winPnl > 0 {
+		profitFactor = 99.0 // All wins, no losses
+	}
+
+	bestTrade := 0.0
+	for _, trade := range t {
+		pnl := trade.RealisedPnl
+		if pnl > bestTrade {
+			bestTrade = pnl
+		}
+	}
+
 	return map[string]interface{}{
-		"total":       len(t),
-		"wins":        wins,
-		"losses":      len(t) - wins,
-		"win_rate":    float64(wins) / float64(len(t)) * 100,
-		"gross_pnl":   totalPnl,
-		"avg_win":     avgWin,
-		"avg_loss":    avgLoss,
-		"loss_streak": r.ConsecutiveLosses,
-		"capital":     r.TotalCapital,
+		"total":         len(t),
+		"wins":          wins,
+		"losses":        len(t) - wins,
+		"win_rate":      float64(wins) / float64(len(t)) * 100,
+		"gross_pnl":     totalPnl,
+		"avg_win":       avgWin,
+		"avg_loss":      avgLoss,
+		"loss_streak":   r.ConsecutiveLosses,
+		"capital":       r.TotalCapital,
+		"profit_factor": math.Round(profitFactor*100) / 100,
+		"best_trade":    math.Round(bestTrade*100) / 100,
 	}
 }
 

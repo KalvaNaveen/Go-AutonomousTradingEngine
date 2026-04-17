@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"bnf_go_engine/config"
@@ -20,6 +21,7 @@ type ExecutionAgent struct {
 	State        *core.StateManager
 	Scanner      *ScannerAgent
 	ActiveTrades map[string]*core.Trade
+	Mu           sync.RWMutex // Protects ActiveTrades from concurrent API/trading access
 
 	// Broker interface (abstracted for paper/live switching)
 	PlaceOrder   func(symbol string, qty int, isShort bool, orderType string, price float64) (string, error)
@@ -56,12 +58,15 @@ func (e *ExecutionAgent) Execute(sig *Signal, regime string) bool {
 	sym := sig.Symbol
 
 	// Duplicate symbol guard
+	e.Mu.RLock()
 	for _, t := range e.ActiveTrades {
 		if t.Symbol == sym {
+			e.Mu.RUnlock()
 			log.Printf("[Exec] REJECTED %s: Already holding position", sym)
 			return false
 		}
 	}
+	e.Mu.RUnlock()
 
 	approved, reason := e.Risk.ApproveTrade(map[string]interface{}{
 		"strategy":     sig.Strategy,
@@ -141,7 +146,9 @@ func (e *ExecutionAgent) Execute(sig *Signal, regime string) bool {
 
 	// Persist immediately (crash-safe)
 	e.State.Save(oid, trade)
+	e.Mu.Lock()
 	e.ActiveTrades[oid] = trade
+	e.Mu.Unlock()
 	e.Risk.RegisterOpen(oid, trade)
 
 	// R:R calculation for alert
@@ -180,6 +187,9 @@ func (e *ExecutionAgent) MonitorPositions(regime string) {
 	now := config.NowIST()
 	h, m := now.Hour(), now.Minute()
 	t := h*100 + m
+
+	e.Mu.Lock()
+	defer e.Mu.Unlock()
 
 	for oid, trade := range e.ActiveTrades {
 		token := trade.Token
@@ -227,13 +237,13 @@ func (e *ExecutionAgent) MonitorPositions(regime string) {
 			if favorableMove >= initialRisk {
 				var newStop float64
 				if trade.IsShort {
-					// Trail at 50% of max favorable move from entry
-					newStop = trade.EntryPrice - favorableMove*0.5
+					// Trail at 30% of max favorable move from entry (loosened from 50%)
+					newStop = trade.EntryPrice - favorableMove*0.30
 					if newStop < trade.StopPrice { // Only tighten, never widen
 						trade.StopPrice = newStop
 					}
 				} else {
-					newStop = trade.EntryPrice + favorableMove*0.5
+					newStop = trade.EntryPrice + favorableMove*0.30
 					if newStop > trade.StopPrice {
 						trade.StopPrice = newStop
 					}
@@ -244,12 +254,12 @@ func (e *ExecutionAgent) MonitorPositions(regime string) {
 			if favorableMove >= 2*initialRisk {
 				var newStop float64
 				if trade.IsShort {
-					newStop = trade.EntryPrice - favorableMove*0.65
+					newStop = trade.EntryPrice - favorableMove*0.50
 					if newStop < trade.StopPrice {
 						trade.StopPrice = newStop
 					}
 				} else {
-					newStop = trade.EntryPrice + favorableMove*0.65
+					newStop = trade.EntryPrice + favorableMove*0.50
 					if newStop > trade.StopPrice {
 						trade.StopPrice = newStop
 					}
@@ -258,17 +268,30 @@ func (e *ExecutionAgent) MonitorPositions(regime string) {
 		}
 
 		// ═══ LAYER 3: TIME DECAY EXIT ═══
-		// If a trade hasn't moved meaningfully in 30 mins, exit at breakeven/small loss
+		// If a trade hasn't moved meaningfully, exit at breakeven/small loss to free up capital
 		holdMinutes := now.Sub(trade.EntryTime).Minutes()
 		maxHold := 180.0 // Default 3 hours
 		if trade.MaxHoldMins > 0 {
 			maxHold = float64(trade.MaxHoldMins)
 		}
 
-		// Stale trade: held >30 mins and P&L is near zero (< ₹20)
-		if holdMinutes > 30 && gross > -20 && gross < 20 {
+		// Decay limits depend heavily on the strategy paradigm
+		isMomentum := strings.HasPrefix(trade.Strategy, "S1_") || 
+					  strings.HasPrefix(trade.Strategy, "S3_") || 
+					  strings.HasPrefix(trade.Strategy, "S6_") ||
+					  strings.HasPrefix(trade.Strategy, "S10_") ||
+					  strings.HasPrefix(trade.Strategy, "S14_") ||
+					  strings.HasPrefix(trade.Strategy, "S15_")
+
+		decayLimit := 30.0
+		if !isMomentum {
+			decayLimit = 120.0 // Give mean reverting / sectoral trades 2 hours to breathe
+		}
+
+		// Stale trade: held > decayLimit mins and P&L is near zero (< ₹100)
+		if holdMinutes > decayLimit && gross > -100 && gross < 100 {
 			// Trade is going nowhere — exit to free up capital for better setups
-			log.Printf("[Exec] TIME_DECAY: %s held %.0f mins with PnL=%.0f — exiting", trade.Symbol, holdMinutes, gross)
+			log.Printf("[Exec] TIME_DECAY: %s (Strat: %s) held %.0f mins with flat PnL=%.0f — exiting", trade.Symbol, trade.Strategy, holdMinutes, gross)
 			e.forceExit(oid, trade, "TIME_DECAY_EXIT", ltp)
 			continue
 		}
@@ -404,6 +427,9 @@ func (e *ExecutionAgent) forceExit(oid string, trade *core.Trade, reason string,
 }
 
 func (e *ExecutionAgent) FlattenAll(reason string) {
+	e.Mu.Lock()
+	defer e.Mu.Unlock()
+
 	flattened := 0
 	for oid, trade := range e.ActiveTrades {
 		ltp := 0.0
@@ -489,11 +515,13 @@ func getSector(symbol string) string {
 func (e *ExecutionAgent) SectorCount(symbol string) int {
 	sector := getSector(symbol)
 	count := 0
+	e.Mu.RLock()
 	for _, trade := range e.ActiveTrades {
 		if getSector(trade.Symbol) == sector {
 			count++
 		}
 	}
+	e.Mu.RUnlock()
 	return count
 }
 

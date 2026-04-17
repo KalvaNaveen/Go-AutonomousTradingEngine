@@ -12,27 +12,32 @@ import (
 )
 
 // Journal persists all trade history to SQLite.
-// Exact port of Python core/journal.py
+// Uses a persistent connection pool for performance.
 type Journal struct {
 	dbPath string
+	db     *sql.DB
 }
 
 func NewJournal() *Journal {
 	j := &Journal{dbPath: config.JournalDB}
+	db, err := sql.Open("sqlite", j.dbPath)
+	if err != nil {
+		log.Printf("[Journal] DB open error: %v", err)
+	} else {
+		db.SetMaxOpenConns(1) // SQLite only supports one writer
+		db.Exec("PRAGMA journal_mode=WAL")
+		db.Exec("PRAGMA busy_timeout=5000")
+		j.db = db
+	}
 	j.initDB()
 	return j
 }
 
 func (j *Journal) initDB() {
-	db, err := sql.Open("sqlite", j.dbPath)
-	if err != nil {
-		log.Printf("[Journal] DB open error: %v", err)
+	if j.db == nil {
 		return
 	}
-	defer db.Close()
-
-	db.Exec("PRAGMA journal_mode=WAL")
-	db.Exec("PRAGMA busy_timeout=3000")
+	db := j.db
 
 	db.Exec(`
 		CREATE TABLE IF NOT EXISTS trades (
@@ -78,14 +83,12 @@ func (j *Journal) initDB() {
 }
 
 func (j *Journal) LogAgentActivity(agent, action, detail, timestampStr string) {
-	db, err := sql.Open("sqlite", j.dbPath)
-	if err != nil {
+	if j.db == nil {
 		return
 	}
-	defer db.Close()
 
 	dateStr := config.TodayIST().Format("2006-01-02")
-	db.Exec(`INSERT INTO agent_logs (date, time, agent, action, detail) VALUES (?,?,?,?,?)`,
+	j.db.Exec(`INSERT INTO agent_logs (date, time, agent, action, detail) VALUES (?,?,?,?,?)`,
 		dateStr, timestampStr, agent, action, detail)
 }
 
@@ -110,11 +113,9 @@ type TradeLog struct {
 }
 
 func (j *Journal) LogTrade(t *TradeLog) {
-	db, err := sql.Open("sqlite", j.dbPath)
-	if err != nil {
+	if j.db == nil {
 		return
 	}
-	defer db.Close()
 
 	now := config.NowIST()
 	hold := 0.0
@@ -131,7 +132,7 @@ func (j *Journal) LogTrade(t *TradeLog) {
 		timeStopHit = 1
 	}
 
-	db.Exec(`
+	j.db.Exec(`
 		INSERT INTO trades
 		(timestamp, date, entry_time, symbol, strategy, regime, rvol, deviation_pct,
 		 entry_price, partial_exit_price, partial_exit_qty,
@@ -177,18 +178,16 @@ func (j *Journal) LogExit(trade *Trade, exitPrice float64, reason string) {
 }
 
 func (j *Journal) LogDailySummary(stats map[string]interface{}, regime string, stopped bool, reason string) {
-	db, err := sql.Open("sqlite", j.dbPath)
-	if err != nil {
+	if j.db == nil {
 		return
 	}
-	defer db.Close()
 
 	stoppedInt := 0
 	if stopped {
 		stoppedInt = 1
 	}
 
-	db.Exec(`
+	j.db.Exec(`
 		INSERT OR REPLACE INTO daily_summary
 		(date, regime, total_trades, wins, losses, win_rate,
 		 gross_pnl, max_loss_streak, engine_stopped, stop_reason)
@@ -217,13 +216,11 @@ type PeriodSummary struct {
 }
 
 func (j *Journal) GetPeriodSummary(fromDate, toDate string) *PeriodSummary {
-	db, err := sql.Open("sqlite", j.dbPath)
-	if err != nil {
+	if j.db == nil {
 		return &PeriodSummary{}
 	}
-	defer db.Close()
 
-	rows, err := db.Query(`
+	rows, err := j.db.Query(`
 		SELECT gross_pnl, strategy, regime, symbol, entry_price, full_exit_price, qty
 		FROM trades WHERE date >= ? AND date <= ?
 	`, fromDate, toDate)
@@ -303,13 +300,11 @@ func (j *Journal) GetTodayTopActions(dateStr string, n int) []map[string]interfa
 	if dateStr == "" {
 		dateStr = config.TodayIST().Format("2006-01-02")
 	}
-	db, err := sql.Open("sqlite", j.dbPath)
-	if err != nil {
+	if j.db == nil {
 		return nil
 	}
-	defer db.Close()
 
-	rows, err := db.Query(`
+	rows, err := j.db.Query(`
 		SELECT symbol, strategy, gross_pnl, exit_reason
 		FROM trades WHERE date = ?
 		ORDER BY ABS(gross_pnl) DESC LIMIT ?
@@ -336,13 +331,11 @@ func (j *Journal) GetAllTradesForDate(dateStr string) []map[string]interface{} {
 	if dateStr == "" {
 		dateStr = config.TodayIST().Format("2006-01-02")
 	}
-	db, err := sql.Open("sqlite", j.dbPath)
-	if err != nil {
+	if j.db == nil {
 		return nil
 	}
-	defer db.Close()
 
-	rows, err := db.Query(`
+	rows, err := j.db.Query(`
 		SELECT symbol, strategy, entry_price, full_exit_price,
 		       gross_pnl, exit_reason, qty, entry_time, timestamp
 		FROM trades WHERE date = ? ORDER BY timestamp ASC
@@ -368,13 +361,11 @@ func (j *Journal) GetAllTradesForDate(dateStr string) []map[string]interface{} {
 }
 
 func (j *Journal) GetAvailableDates() []string {
-	db, err := sql.Open("sqlite", j.dbPath)
-	if err != nil {
+	if j.db == nil {
 		return nil
 	}
-	defer db.Close()
 
-	rows, err := db.Query("SELECT DISTINCT date FROM trades ORDER BY date DESC")
+	rows, err := j.db.Query("SELECT DISTINCT date FROM trades ORDER BY date DESC")
 	if err != nil {
 		return nil
 	}
@@ -388,7 +379,7 @@ func (j *Journal) GetAvailableDates() []string {
 	}
 
 	if len(dates) == 0 {
-		rows2, _ := db.Query("SELECT DISTINCT date FROM daily_summary ORDER BY date DESC")
+		rows2, _ := j.db.Query("SELECT DISTINCT date FROM daily_summary ORDER BY date DESC")
 		if rows2 != nil {
 			defer rows2.Close()
 			for rows2.Next() {
@@ -402,13 +393,11 @@ func (j *Journal) GetAvailableDates() []string {
 }
 
 func (j *Journal) GetLogsForDate(dateStr string) []map[string]string {
-	db, err := sql.Open("sqlite", j.dbPath)
-	if err != nil {
+	if j.db == nil {
 		return nil
 	}
-	defer db.Close()
 
-	rows, err := db.Query(`
+	rows, err := j.db.Query(`
 		SELECT time, agent, action, detail
 		FROM agent_logs WHERE date = ? ORDER BY id ASC
 	`, dateStr)
@@ -429,16 +418,14 @@ func (j *Journal) GetLogsForDate(dateStr string) []map[string]string {
 }
 
 func (j *Journal) GetDailySummaryForDate(dateStr string) map[string]interface{} {
-	db, err := sql.Open("sqlite", j.dbPath)
-	if err != nil {
+	if j.db == nil {
 		return nil
 	}
-	defer db.Close()
 
 	var total, wins, losses, stopped int
 	var winRate, pnl float64
 	var reason, regime string
-	err = db.QueryRow(`
+	err := j.db.QueryRow(`
 		SELECT total_trades, wins, losses, win_rate, gross_pnl, stop_reason, engine_stopped, regime
 		FROM daily_summary WHERE date = ?
 	`, dateStr).Scan(&total, &wins, &losses, &winRate, &pnl, &reason, &stopped, &regime)
@@ -450,6 +437,44 @@ func (j *Journal) GetDailySummaryForDate(dateStr string) map[string]interface{} 
 		"win_rate": winRate, "gross_pnl": pnl, "stop_reason": reason,
 		"engine_stopped": stopped == 1, "regime": regime,
 	}
+}
+
+// GetPnlBreakdown returns per-day P&L aggregates for a given date range.
+// Each entry has: date, pnl (sum of gross_pnl), trades (count), wins (count where pnl > 0).
+func (j *Journal) GetPnlBreakdown(fromDate, toDate string) []map[string]interface{} {
+	result := []map[string]interface{}{}
+	if j.db == nil {
+		return result
+	}
+
+	rows, err := j.db.Query(`
+		SELECT date, COALESCE(SUM(gross_pnl), 0), COUNT(*),
+		       COALESCE(SUM(CASE WHEN gross_pnl > 0 THEN 1 ELSE 0 END), 0)
+		FROM trades
+		WHERE date >= ? AND date <= ?
+		GROUP BY date
+		ORDER BY date ASC
+	`, fromDate, toDate)
+	if err != nil {
+		return result
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var d string
+		var pnl float64
+		var trades, wins int
+		if err := rows.Scan(&d, &pnl, &trades, &wins); err == nil {
+			result = append(result, map[string]interface{}{
+				"date":   d,
+				"pnl":    pnl,
+				"trades": trades,
+				"wins":   wins,
+				"losses": trades - wins,
+			})
+		}
+	}
+	return result
 }
 
 // Suppress unused import warning
