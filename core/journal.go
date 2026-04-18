@@ -305,7 +305,7 @@ func (j *Journal) GetTodayTopActions(dateStr string, n int) []map[string]interfa
 	}
 
 	rows, err := j.db.Query(`
-		SELECT symbol, strategy, gross_pnl, exit_reason
+		SELECT COALESCE(symbol, ''), COALESCE(strategy, ''), COALESCE(gross_pnl, 0.0), COALESCE(exit_reason, '')
 		FROM trades WHERE date = ?
 		ORDER BY ABS(gross_pnl) DESC LIMIT ?
 	`, dateStr, n)
@@ -336,8 +336,8 @@ func (j *Journal) GetAllTradesForDate(dateStr string) []map[string]interface{} {
 	}
 
 	rows, err := j.db.Query(`
-		SELECT symbol, strategy, entry_price, full_exit_price,
-		       gross_pnl, exit_reason, qty, entry_time, timestamp
+		SELECT COALESCE(symbol, ''), COALESCE(strategy, ''), COALESCE(entry_price, 0.0), COALESCE(full_exit_price, 0.0),
+		       COALESCE(gross_pnl, 0.0), COALESCE(exit_reason, ''), COALESCE(qty, 0), COALESCE(entry_time, ''), COALESCE(timestamp, '')
 		FROM trades WHERE date = ? ORDER BY timestamp ASC
 	`, dateStr)
 	if err != nil {

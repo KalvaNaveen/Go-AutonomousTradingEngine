@@ -130,7 +130,7 @@ func ComputeBollinger(prices []float64, period int, sd float64) (upper float64, 
 
 // ComputeADX matches TA-Lib ADX using full Wilder's smoothing for TR, +DM, -DM, and ADX.
 func ComputeADX(highs []float64, lows []float64, closes []float64, period int) float64 {
-	if len(highs) < period+2 {
+	if len(highs) <= period {
 		return 0.0
 	}
 

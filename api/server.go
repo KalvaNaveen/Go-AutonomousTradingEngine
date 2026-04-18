@@ -15,6 +15,7 @@ import (
 	"bnf_go_engine/config"
 	"bnf_go_engine/core"
 	"bnf_go_engine/storage"
+	"bnf_go_engine/simulator"
 
 	"github.com/gorilla/websocket"
 )
@@ -80,8 +81,7 @@ func (s *Server) Start(addr string) {
 	// Performance metrics
 	mux.HandleFunc("/api/performance", s.handlePerformance)
 	
-	// Trade analysis
-	mux.HandleFunc("/api/analysis/", s.handleAnalysis)
+	// Trade analysis (REMOVED)
 
 	// Live WebSocket
 	mux.HandleFunc("/api/ws/live", s.handleWSLive)
@@ -250,92 +250,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, s.buildStatusData())
 }
 
-func (s *Server) handleAnalysis(w http.ResponseWriter, r *http.Request) {
-	dateStr := strings.TrimPrefix(r.URL.Path, "/api/analysis/")
-	if dateStr == "" {
-		dateStr = config.TodayIST().Format("2006-01-02")
-	}
-
-	trades := s.journal.GetAllTradesForDate(dateStr)
-	summary := s.journal.GetDailySummaryForDate(dateStr)
-
-	// Build analysis payload combining trades (with grades) and summary
-	analysisTrades := make([]map[string]interface{}, 0)
-	for _, t := range trades {
-		pnl, _ := t["gross_pnl"].(float64)
-		entry, _ := t["entry_price"].(float64)
-		qtyNum, _ := t["qty"].(float64)
-		if qtyNum == 0 {
-			qtyNum = 15 // Default fallback
-		}
-
-		isWin := pnl > 0
-		isLoss := pnl <= 0
-		grade := "C"
-		if pnl > 0 {
-			if (pnl / (entry * qtyNum)) > 0.015 {
-				grade = "A"
-			} else {
-				grade = "B"
-			}
-		} else {
-			if (pnl / (entry * qtyNum)) < -0.015 {
-				grade = "F"
-			} else {
-				grade = "D"
-			}
-		}
-
-		pos := []string{}
-		if isWin {
-			pos = append(pos, "Profitable trade")
-			pos = append(pos, "Risk rewarded correctly")
-		}
-		neg := []string{}
-		if isLoss {
-			neg = append(neg, "Trade went against strategy bias")
-			if reason, ok := t["exit_reason"].(string); ok && reason == "STOPLOSS" {
-				neg = append(neg, "Hit hard stop level")
-			}
-		}
-
-		at := map[string]interface{}{
-			"symbol":      t["symbol"],
-			"strategy":    t["strategy"],
-			"is_win":      isWin,
-			"is_loss":     isLoss,
-			"entry_price": t["entry_price"],
-			"exit_price":  t["full_exit_price"],
-			"qty":         t["qty"],
-			"pnl":         pnl,
-			"exit_reason": t["exit_reason"],
-			"grade":       grade,
-			"positives":   pos,
-			"negatives":   neg,
-			"fixes":       []string{"Follow system strictly", "Monitor regime changes"},
-		}
-		analysisTrades = append(analysisTrades, at)
-	}
-
-	gradeCounts := map[string]int{"A": 0, "B": 0, "C": 0, "D": 0, "F": 0}
-	for _, t := range analysisTrades {
-		if g, ok := t["grade"].(string); ok {
-			gradeCounts[g]++
-		}
-	}
-
-	analysisSummary := map[string]interface{}{
-		"total":    len(trades),
-		"win_rate": summary["win_rate"],
-		"regime":   summary["dominant_regime"],
-		"grades":   gradeCounts,
-	}
-
-	writeJSON(w, map[string]interface{}{
-		"trades":  analysisTrades,
-		"summary": analysisSummary,
-	})
-}
+// handleAnalysis removed
 
 func (s *Server) handlePositions(w http.ResponseWriter, r *http.Request) {
 	positions := make([]map[string]interface{}, 0)
@@ -540,6 +455,12 @@ func (s *Server) handleWSSimulator(w http.ResponseWriter, r *http.Request) {
 		days = parsed
 	}
 
+	strategiesStr := r.URL.Query().Get("strategies")
+	var parsedStrategies []string
+	if strategiesStr != "" {
+		parsedStrategies = strings.Split(strategiesStr, ",")
+	}
+
 	writeLog := func(format string, v ...interface{}) {
 		msg := fmt.Sprintf("[SIM] "+format, v...)
 		conn.WriteMessage(1, []byte(msg)) // 1 = TextMessage
@@ -550,11 +471,13 @@ func (s *Server) handleWSSimulator(w http.ResponseWriter, r *http.Request) {
 	endDate := config.TodayIST().Format("2006-01-02")
 	startDate := config.TodayIST().AddDate(0, 0, -days).Format("2006-01-02")
 
-	bt := core.NewBacktester(core.BacktestConfig{
+	bt := simulator.NewBacktester(simulator.BacktestConfig{
 		StartDate:      startDate,
 		EndDate:        endDate,
 		InitialCapital: config.TotalCapital,
 		MaxPositions:   5,
+		Strategies:     parsedStrategies,
+		TokenToCompany: s.scanner.TokenToCompany,
 	})
 	
 	bt.LogOutput = writeLog

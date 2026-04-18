@@ -357,6 +357,34 @@ func (ts *TickStore) ResetDaily() {
 	})
 }
 
+// ── Backtester / Simulator Injection ────────────────────────
+
+// SetCandles5Min explicitly forces the historical 5-min candles for a given token (used strictly for backtesting)
+func (ts *TickStore) SetCandles5Min(token uint32, candles []agents.Candle) {
+	td := ts.getOrCreate(token)
+	td.mu.Lock()
+	defer td.mu.Unlock()
+
+	td.Candles5Min = make([]agents.Candle, len(candles))
+	copy(td.Candles5Min, candles)
+}
+
+// SetSimulatorState explicitly forces the Last Traded Price, DayOpen and Volume arrays (used strictly for backtesting)
+func (ts *TickStore) SetSimulatorState(token uint32, ltp float64, vol int64, open float64) {
+	td := ts.getOrCreate(token)
+	td.mu.Lock()
+	td.LastPrice = ltp
+	td.DayOpen = open
+	td.prevVolume = vol
+	td.LastTickAt = config.NowIST()
+	td.mu.Unlock()
+
+	vd := ts.getVWAP(token)
+	vd.mu.Lock()
+	vd.VWAP = ltp // For simplicity in backtest, set VWAP near LTP
+	vd.mu.Unlock()
+}
+
 // GetAdvanceCount returns (advancing, declining) for given tokens
 func (ts *TickStore) GetAdvanceCount(tokens []uint32) (int, int) {
 	adv, dec := 0, 0

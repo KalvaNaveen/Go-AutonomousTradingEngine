@@ -13,6 +13,7 @@ import (
 	"bnf_go_engine/broker"
 	"bnf_go_engine/config"
 	"bnf_go_engine/core"
+	"bnf_go_engine/simulator"
 	"bnf_go_engine/storage"
 
 	"github.com/joho/godotenv"
@@ -102,7 +103,7 @@ func main() {
 	// If ML has insufficient training data, run backtester to seed journal.db
 	if !mlFilter.Trained {
 		log.Println("[Engine] ML filter needs more data — running backtester to seed...")
-		core.RunBacktestAndSeed()
+		simulator.RunBacktestAndSeed()
 		// Retrain with new backtest data
 		mlFilter.TrainFromJournal()
 	}
@@ -169,6 +170,7 @@ func main() {
 
 	// Wire universe into scanner
 	scanner.Universe = dataAgent.Universe
+	scanner.TokenToCompany = dataAgent.TokenToCompany
 
 	// Preload daily cache (260d historical data)
 	dailyCache := storage.NewDailyCache()
@@ -325,8 +327,8 @@ func main() {
 	//  PHASE 7: Start API Server (Dashboard Backend)
 	// ══════════════════════════════════════════════════════════════
 	apiServer := api.NewServer(risk, journal, exec, scanner, tickStore, dailyCache, macroAgent, mlFilter)
-	go apiServer.Start(":8081")
-	log.Println("[Engine] API server started on :8081")
+	go apiServer.Start(":8085")
+	log.Println("[Engine] API server started on :8085")
 
 	// Wire FillMonitor (for live mode)
 	if !config.PaperMode {
@@ -374,6 +376,7 @@ func main() {
 			dayName := dayOfWeek.String()
 			log.Printf("[Engine] %s detected — sleeping until Monday", dayName)
 			agents.SendTelegram(fmt.Sprintf("📅 *WEEKEND — ENGINE OFF*\n`%s` — Market closed.\nWill auto-restart Monday 08:25 AM.", dayName))
+			log.Println("[Engine] Process sleeping. UI remains accessible at port 8081.")
 			sleepUntilMorning()
 			continue
 		}
@@ -408,6 +411,9 @@ func main() {
 		scanCount := 0
 		lastRegimeCheck := time.Time{}
 		currentRegime := "UNKNOWN"
+		
+		// Anti-spam log cache
+		recentlyLoggedSigs := make(map[string]time.Time)
 
 	dayLoop:
 		for range ticker.C {
@@ -497,10 +503,17 @@ func main() {
 			// Log scan results periodically (every 50 scans) or when signals found
 			if len(signals) > 0 {
 				for _, sig := range signals {
-					journal.LogAgentActivity("Scanner", "SIGNAL_FOUND",
-						fmt.Sprintf("%s %s Entry=%.1f SL=%.1f RSI=%.1f RVol=%.1f",
-							sig.Strategy, sig.Symbol, sig.EntryPrice, sig.StopPrice, sig.RSI, sig.RVol),
-						config.NowIST().Format("15:04:05"))
+					sigKey := sig.Strategy + "_" + sig.Symbol
+					lastLogTime, hasLogged := recentlyLoggedSigs[sigKey]
+					
+					// Only log if we haven't logged this exact signal in the last 5 minutes
+					if !hasLogged || time.Since(lastLogTime) > 5*time.Minute {
+						recentlyLoggedSigs[sigKey] = time.Now()
+						journal.LogAgentActivity("Scanner", "SIGNAL_FOUND",
+							fmt.Sprintf("%s %s Entry=%.1f SL=%.1f Target=%.1f (RSI=%.1f RVol=%.1f)",
+								sig.Strategy, sig.Symbol, sig.EntryPrice, sig.StopPrice, sig.TargetPrice, sig.RSI, sig.RVol),
+							config.NowIST().Format("15:04:05"))
+					}
 				}
 			} else if scanCount%250 == 0 {
 				journal.LogAgentActivity("Scanner", "SCAN_CYCLE",
@@ -596,7 +609,16 @@ func main() {
 		}
 
 		// ── Post-Market Cleanup ──
-		log.Println("[Engine] Day complete. Sleeping until next trading morning...")
+		log.Println("[Engine] Day complete. Running EOD Synchronization...")
+		dbPath := config.BaseDir + "/data/historical.db"
+		errSync := dataAgent.SyncHistoricalEODData(dbPath)
+		if errSync != nil {
+			log.Printf("[Engine] ERROR: EOD Sync failed: %v", errSync)
+			agents.SendTelegram(fmt.Sprintf("⚠️ *EOD SYNC FAILED*: %v", errSync))
+		}
+
+		log.Println("[Engine] Post-Market Cleanup complete. Trading paused. Sleeping until next morning...")
+		agents.SendTelegram("🏁 *ENGINE SHUTDOWN* — Trading day complete. Process sleeping.")
 		sleepUntilMorning()
 		log.Printf("[Engine] ═══ WAKING UP — %s ═══", config.NowIST().Format("2006-01-02 15:04"))
 	}

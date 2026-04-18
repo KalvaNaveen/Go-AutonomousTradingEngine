@@ -77,37 +77,68 @@ function DonutChart({ data, size = 120 }) {
 // ════════════════════════════════════════════
 
 function TabScanner({ logs }) {
-  const scannerLogs = logs.filter(l => l.agent && l.agent.toLowerCase().includes('scanner')).slice(-50).reverse();
+  const scannerLogs = logs.filter(l => l.agent && l.agent.toLowerCase().includes('scanner')).reverse();
+  const visibleLogs = scannerLogs.slice(0, 50);
 
   return (
-    <div className="card" style={{ flex: 1, display: 'flex', flexDirection: 'column', minHeight: 0 }}>
-      <div className="card-header" style={{ paddingBottom: '16px' }}>
-        <h3>Scanner Live Feed</h3>
-        <span style={{ fontSize: '12px', color: 'var(--text-muted)' }}>Real-time strategy scans</span>
-      </div>
-      <div className="table-scroll" style={{ overflowY: 'auto' }}>
-        {scannerLogs.length === 0 ? (
-          <div style={{ padding: '48px', textAlign: 'center' }}>
-            <div style={{ fontSize: '32px', marginBottom: '12px' }}>🔍</div>
-            <div style={{ fontSize: '14px', fontWeight: 600 }}>Scanner is waiting...</div>
-          </div>
-        ) : (
-          <table>
-            <thead>
-              <tr><th>Time</th><th>Agent</th><th>Action</th><th>Details</th></tr>
-            </thead>
-            <tbody>
-              {scannerLogs.map((log, i) => (
-                <tr key={i}>
-                  <td style={{ color: 'var(--text-muted)' }}>{log.time}</td>
-                  <td><span className="type-badge" style={{ background: 'var(--bg-badge-blue)', color: 'var(--accent-blue)' }}>{log.agent}</span></td>
-                  <td style={{ fontWeight: 500 }}>{log.action}</td>
-                  <td style={{ color: 'var(--text-secondary)' }}>{log.detail}</td>
+    <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minHeight: 0 }}>
+      {/* ── LOG FEED TABLE ── */}
+      <div className="card animate-in" style={{ animationDelay: '0.05s', flex: 1, display: 'flex', flexDirection: 'column', minHeight: 0, padding: 0 }}>
+        <div className="card-header" style={{ padding: '20px 24px', borderBottom: '1px solid var(--border-light)', background: 'var(--bg-card)' }}>
+          <h3 style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '18px' }}>
+            <div style={{ width: '8px', height: '8px', borderRadius: '50%', background: '#10B981', boxShadow: '0 0 10px #10B981' }}></div>
+            Live Scanner Feed
+          </h3>
+          <span style={{ fontSize: '12px', color: 'var(--text-muted)' }}>Latest {visibleLogs.length} pulses</span>
+        </div>
+        
+        <div className="table-scroll" style={{ overflowY: 'auto' }}>
+          {visibleLogs.length === 0 ? (
+            <div style={{ padding: '64px', textAlign: 'center' }}>
+              <div style={{ fontSize: '48px', marginBottom: '16px', opacity: 0.5 }}>📡</div>
+              <div style={{ fontSize: '16px', fontWeight: 600, color: 'var(--text-secondary)' }}>Awaiting telemetry signals...</div>
+            </div>
+          ) : (
+            <table style={{ width: '100%', borderCollapse: 'collapse', textAlign: 'left' }}>
+              <thead style={{ position: 'sticky', top: 0, background: 'var(--bg-card)', zIndex: 1, borderBottom: '1px solid var(--border-light)' }}>
+                <tr>
+                  <th style={{ padding: '12px 24px', fontSize: '11px', color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.05em', fontWeight: 600 }}>Time</th>
+                  <th style={{ padding: '12px 24px', fontSize: '11px', color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.05em', fontWeight: 600 }}>Agent</th>
+                  <th style={{ padding: '12px 24px', fontSize: '11px', color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.05em', fontWeight: 600 }}>Action</th>
+                  <th style={{ padding: '12px 24px', fontSize: '11px', color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.05em', fontWeight: 600 }}>Details</th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
-        )}
+              </thead>
+              <tbody>
+                {visibleLogs.map((log, i) => {
+                  const isCycle = log.detail && log.detail.includes('SCAN_CYCLE');
+                  return (
+                    <tr key={i} style={{ 
+                      borderBottom: '1px solid var(--border-light)',
+                      background: i % 2 !== 0 ? 'rgba(0,0,0,0.01)' : 'transparent',
+                      transition: 'background 0.2s',
+                    }} className="hover-row">
+                      <td style={{ padding: '14px 24px', fontSize: '13px', color: 'var(--text-muted)', fontFamily: 'monospace' }}>{log.time}</td>
+                      <td style={{ padding: '14px 24px' }}>
+                        <span className="type-badge" style={{ 
+                          background: isCycle ? 'rgba(48, 99, 245, 0.1)' : 'var(--bg-badge-blue)', 
+                          color: isCycle ? 'var(--accent-blue)' : 'var(--text-primary)',
+                          fontSize: '11px',
+                          display: 'inline-block'
+                        }}>
+                          {log.agent}
+                        </span>
+                      </td>
+                      <td style={{ padding: '14px 24px', fontSize: '13px', fontWeight: 600, color: 'var(--text-primary)' }}>{log.action}</td>
+                      <td style={{ padding: '14px 24px', fontSize: '14px', color: isCycle ? 'var(--text-secondary)' : 'var(--text-primary)', fontWeight: isCycle ? 400 : 500, lineHeight: 1.4 }}>
+                        {log.detail}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          )}
+        </div>
       </div>
     </div>
   );
@@ -325,76 +356,32 @@ function NewsFeedWidget({ news }) {
   );
 }
 
-function TabAnalysis() {
-  const [analysis, setAnalysis] = useState([]);
-  const [loading, setLoading] = useState(true);
-
-  useEffect(() => {
-    fetch('/api/analysis/')
-      .then(res => res.json())
-      .then(data => { setAnalysis(data.trades || []); setLoading(false); })
-      .catch(() => setLoading(false));
-  }, []);
-
-  const getGradeColor = (g) => {
-    switch (g) {
-      case 'A': return '#059669'; case 'B': return '#2ECC71';
-      case 'C': return 'var(--accent-orange)';
-      case 'D': case 'F': return 'var(--accent-red)';
-      default: return 'var(--text-secondary)';
-    }
-  };
-
-  return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: '16px', flex: 1, minHeight: 0 }}>
-      {loading ? <div className="card" style={{ padding: '24px' }}>Loading analysis...</div> : analysis.length === 0 ? (
-        <div className="card" style={{ padding: '48px', textAlign: 'center' }}>No executed trades to analyze today.</div>
-      ) : (
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(360px, 1fr))', gap: '16px', overflowY: 'auto' }}>
-          {analysis.map((t, i) => (
-            <div key={i} className="card" style={{ padding: '20px', display: 'flex', gap: '16px' }}>
-              <div style={{
-                width: '48px', height: '48px', borderRadius: '12px',
-                background: `${getGradeColor(t.grade)}15`, color: getGradeColor(t.grade),
-                display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '24px', fontWeight: 800
-              }}>
-                {t.grade}
-              </div>
-              <div style={{ flex: 1 }}>
-                <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '8px' }}>
-                  <span className="symbol-cell" style={{ fontSize: '15px' }}>{t.symbol}</span>
-                  <span style={{ fontWeight: 700, color: t.pnl >= 0 ? '#059669' : 'var(--accent-red)' }}>
-                    {t.pnl >= 0 ? '+' : ''}₹{Math.abs(t.pnl).toFixed(0)}
-                  </span>
-                </div>
-                <div style={{ fontSize: '12px', color: 'var(--text-muted)', marginBottom: '12px' }}>
-                  Strategy: <b>{t.strategy}</b> • Exit: <b>{t.exit_reason}</b>
-                </div>
-                {t.pos && t.pos.length > 0 && <div style={{ fontSize: '12px', color: '#059669', display: 'flex', flexDirection: 'column', gap: '4px' }}>
-                  {t.pos.map((m, j) => <div key={j}>✓ {m}</div>)}
-                </div>}
-                {t.neg && t.neg.length > 0 && <div style={{ fontSize: '12px', color: 'var(--accent-red)', display: 'flex', flexDirection: 'column', gap: '4px', marginTop: '4px' }}>
-                  {t.neg.map((m, j) => <div key={j}>✕ {m}</div>)}
-                </div>}
-              </div>
-            </div>
-          ))}
-        </div>
-      )}
-    </div>
-  );
-}
+const AVAILABLE_STRATEGIES = [
+  "S1_MA_CROSS", "S2_BB_MEAN_REV", "S3_ORB", "S6_TREND_SHORT", 
+  "S6_VWAP_BAND", "S7_MEAN_REV_LONG", "S8_VOL_PIVOT", "S9_MTF_MOMENTUM", 
+  "S10_GAP_FILL", "S11_VWAP_REVERT", "S12_EOD_REVERT", "S13_SECTOR_ROT", 
+  "S14_RSI_SCALP", "S15_RSI_SWING"
+];
 
 function TabSimulator() {
   const [days, setDays] = useState(30);
   const [top, setTop] = useState(50);
   const [running, setRunning] = useState(false);
   const [logs, setLogs] = useState([]);
+  const [selectedStrategies, setSelectedStrategies] = useState(AVAILABLE_STRATEGIES);
+
+  const toggleStrategy = (strat) => {
+    if (selectedStrategies.includes(strat)) {
+      setSelectedStrategies(selectedStrategies.filter(s => s !== strat));
+    } else {
+      setSelectedStrategies([...selectedStrategies, strat]);
+    }
+  };
 
   const runSimulator = () => {
     setRunning(true);
     setLogs(["[SIM] Initializing Native Go Backtester..."]);
-    const wsUrl = `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}/api/ws/simulator?days=${days}&top=${top}`;
+    const wsUrl = `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}/api/ws/simulator?days=${days}&top=${top}&strategies=${selectedStrategies.join(',')}`;
 
     const ws = new WebSocket(wsUrl);
     ws.onopen = () => setLogs(prev => [...prev, "[SIM] Connected to Engine Simulator Core."]);
@@ -427,6 +414,34 @@ function TabSimulator() {
           <button onClick={runSimulator} disabled={running} style={{ padding: '10px 24px', background: 'var(--accent-blue)', color: 'white', border: 'none', borderRadius: '8px', fontWeight: 600, cursor: running ? 'not-allowed' : 'pointer' }}>
             {running ? 'Simulating...' : 'Run Simulation'}
           </button>
+        </div>
+      </div>
+
+      <div style={{ marginBottom: '24px' }}>
+        <h4 style={{ fontSize: '13px', fontWeight: 600, color: 'var(--text-secondary)', marginBottom: '12px' }}>FILTER STRATEGIES</h4>
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: '8px' }}>
+          {AVAILABLE_STRATEGIES.map(strat => {
+            const isActive = selectedStrategies.includes(strat);
+            return (
+              <button
+                key={strat}
+                onClick={() => toggleStrategy(strat)}
+                style={{
+                  padding: '6px 12px',
+                  borderRadius: '16px',
+                  fontSize: '12px',
+                  fontWeight: 600,
+                  cursor: 'pointer',
+                  border: isActive ? '1px solid var(--accent-blue)' : '1px solid var(--border-light)',
+                  background: isActive ? 'var(--accent-blue)' : 'transparent',
+                  color: isActive ? 'white' : 'var(--text-secondary)',
+                  transition: 'all 0.2s ease'
+                }}
+              >
+                {strat}
+              </button>
+            );
+          })}
         </div>
       </div>
 
@@ -518,16 +533,42 @@ function App() {
               const pnl = stats.gross_pnl != null ? stats.gross_pnl : (root.daily_pnl || 0);
               const hist = [...(prev.pnl_history || []).slice(-59), pnl];
 
-              const phases = {
-                auto_login: health.status ? 'active' : 'pending',
-                cache_load: health.cache_loaded ? 'active' : (health.status === 'running' ? 'running' : 'pending'),
-                universe_load: root.universe_count > 0 ? 'active' : 'pending',
-                websocket: health.ws_connected ? 'active' : 'pending',
-                scanner: root.engine_stopped ? 'error' : (health.status === 'running' ? 'active' : 'pending'),
-                execution: root.engine_stopped ? 'error' : (health.status === 'running' ? 'active' : 'pending'),
-                risk: root.engine_stopped ? 'error' : (health.status === 'running' ? 'active' : 'pending'),
-                eod_squareoff: 'pending'
-              };
+              // Check if we're inside market hours (09:15 - 15:30 IST)
+              const nowIST = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }));
+              const hhmm = nowIST.getHours() * 100 + nowIST.getMinutes();
+              const isWeekend = nowIST.getDay() === 0 || nowIST.getDay() === 6;
+              const isMarketHours = !isWeekend && hhmm >= 915 && hhmm <= 1530;
+              const isPostMarket = !isWeekend && hhmm > 1530;
+              const isPreMarket = !isWeekend && hhmm < 830;
+
+              let phases;
+              if (isPostMarket) {
+                // After market close: everything grey, only EOD green
+                phases = {
+                  auto_login: 'pending', cache_load: 'pending', universe_load: 'pending',
+                  websocket: 'pending', scanner: 'pending', execution: 'pending',
+                  risk: 'pending', eod_squareoff: 'active'
+                };
+              } else if (isPreMarket || isWeekend) {
+                // Before engine boot or non-trading days: all grey (pending)
+                phases = {
+                  auto_login: 'pending', cache_load: 'pending', universe_load: 'pending',
+                  websocket: 'pending', scanner: 'pending', execution: 'pending',
+                  risk: 'pending', eod_squareoff: 'pending'
+                };
+              } else {
+                // During market: derive from live engine state
+                phases = {
+                  auto_login: health.status ? 'active' : 'pending',
+                  cache_load: health.cache_loaded ? 'active' : (health.status === 'running' ? 'running' : 'pending'),
+                  universe_load: root.universe_count > 0 ? 'active' : 'pending',
+                  websocket: health.ws_connected ? 'active' : 'pending',
+                  scanner: root.engine_stopped ? 'error' : (health.status === 'running' ? 'active' : 'pending'),
+                  execution: root.engine_stopped ? 'error' : (health.status === 'running' ? 'active' : 'pending'),
+                  risk: root.engine_stopped ? 'error' : (health.status === 'running' ? 'active' : 'pending'),
+                  eod_squareoff: 'pending'
+                };
+              }
 
               const stratBreak = { ...(prev.strategy_breakdown || {}) };
               (root.open_positions || []).forEach(p => {
@@ -612,7 +653,7 @@ function App() {
             { id: 'dashboard', icon: '📊', label: 'Dashboard' },
             { id: 'scanner', icon: '🔍', label: 'Scanner Feed' },
             { id: 'history', icon: '📋', label: 'Trade Journal' },
-            { id: 'analysis', icon: '📈', label: 'AI Analysis' },
+
             { id: 'simulator', icon: '🧪', label: 'Quantum Simulator' },
           ].map(item => (
             <button key={item.id} className={`nav-item ${activeTab === item.id ? 'active' : ''}`} onClick={() => setActiveTab(item.id)}>
@@ -713,7 +754,7 @@ function App() {
 
         {activeTab === 'scanner' && <TabScanner logs={state.activity_log || []} />}
         {activeTab === 'history' && <TabJournal />}
-        {activeTab === 'analysis' && <TabAnalysis />}
+
         {activeTab === 'simulator' && <TabSimulator />}
 
         {activeTab === 'dashboard' && (
@@ -742,7 +783,7 @@ function App() {
                         </div>
                       </div>
                       <div style={{ flex: 1, minHeight: '80px', padding: '0 8px 8px' }}>
-                        <AreaChart data={state.pnl_history} width={300} height={90} />
+                        <AreaChart data={[0, ...(state.pnl_history || [])]} width={300} height={90} />
                       </div>
                     </div>
                   );
@@ -757,8 +798,8 @@ function App() {
                   const wWins = w.wins || 0;
                   const wLosses = w.losses || 0;
                   const bd = w.breakdown || [];
-                  // Cumulative equity curve
-                  const cumulative = [];
+                  // Cumulative equity curve: Always start at 0
+                  const cumulative = [0];
                   let running = 0;
                   bd.forEach(d => { running += (d.pnl || 0); cumulative.push(running); });
                   // Day dots: Mon-Fri
@@ -788,7 +829,7 @@ function App() {
                         </div>
                       </div>
                       <div style={{ flex: 1, minHeight: '52px', padding: '0 8px' }}>
-                        <AreaChart data={cumulative.length > 0 ? cumulative : [0]} width={300} height={65} />
+                        <AreaChart data={cumulative} width={300} height={65} />
                       </div>
                       {/* Day dots */}
                       <div style={{ display: 'flex', justifyContent: 'center', gap: '10px', padding: '6px 0 10px' }}>
@@ -820,8 +861,8 @@ function App() {
                   const mWins = m.wins || 0;
                   const mLosses = m.losses || 0;
                   const bd = m.breakdown || [];
-                  // Cumulative equity curve
-                  const cumulative = [];
+                  // Cumulative equity curve: Always start at 0
+                  const cumulative = [0];
                   let running = 0;
                   bd.forEach(d => { running += (d.pnl || 0); cumulative.push(running); });
                   const winRate = mTrades > 0 ? ((mWins / mTrades) * 100).toFixed(0) : '0';
@@ -844,7 +885,7 @@ function App() {
                         </div>
                       </div>
                       <div style={{ flex: 1, minHeight: '80px', padding: '0 8px 8px' }}>
-                        <AreaChart data={cumulative.length > 0 ? cumulative : [0]} width={300} height={90} />
+                        <AreaChart data={cumulative} width={300} height={90} />
                       </div>
                     </div>
                   );

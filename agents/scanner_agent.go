@@ -38,19 +38,21 @@ type Signal struct {
 // ScannerAgent — exact port of Python scanner_agent.py
 type ScannerAgent struct {
 	// Data references (will be set by engine)
-	Universe     map[uint32]string   // token -> symbol
-	GetLTP       func(uint32) float64
-	GetVWAP      func(uint32) float64
-	GetVolume    func(uint32) int64
-	GetDepth     func(uint32) map[string]float64
-	GetCandles5m func(uint32) []Candle
-	GetORB       func(uint32) (float64, float64) // high, low
-	DailyCache   *DailyCache
+	Universe       map[uint32]string // token -> symbol
+	TokenToCompany map[uint32]string // token -> company name
+	GetLTP         func(uint32) float64
+	GetVWAP        func(uint32) float64
+	GetVolume      func(uint32) int64
+	GetDepth       func(uint32) map[string]float64
+	GetCandles5m   func(uint32) []Candle
+	GetORB         func(uint32) (float64, float64) // high, low
+	DailyCache     *DailyCache
 	ComputeRVol  func(uint32) float64
 	GetIntraday  func(uint32, string) []Candle
 	GetIndiaVIX  func() float64
 	GetADRatio   func() float64
 	GetDayOpen   func(uint32) float64
+	SimulatorMode bool // When true, bypasses time/cooldown checks for backtesting
 
 	// Cooldown tracking
 	s6Cooldown       map[string]time.Time
@@ -152,6 +154,9 @@ func (s *ScannerAgent) DetectRegime() string {
 
 // ── Time Enforcement ─────────────────────────────────────────
 func (s *ScannerAgent) IsInTradeWindow() bool {
+	if s.SimulatorMode {
+		return true
+	}
 	now := config.NowIST()
 	t := now.Hour()*100 + now.Minute()
 	sh, sm := config.ParseTime(config.TradeWindowStart)
@@ -162,6 +167,9 @@ func (s *ScannerAgent) IsInTradeWindow() bool {
 }
 
 func (s *ScannerAgent) checkDailyTradeLimit() bool {
+	if s.SimulatorMode {
+		return true // No daily trade limits in backtest
+	}
 	if s.CircuitBreakerTripped() {
 		return false
 	}
@@ -1604,37 +1612,60 @@ func (s *ScannerAgent) ScanS15RSISwing(regime string) []*Signal {
 // FILTERED by net profitability — no signal reaches execution unless it
 // can produce ≥₹15 net profit after ALL Zerodha charges.
 func (s *ScannerAgent) RunAllScans(regime string) []*Signal {
+	return s.RunStrategyScans(regime, nil)
+}
+
+// RunStrategyScans executes specific strategies by string name. 
+// If strategies is nil or empty, all strategies will be run (backward compatible with RunAllScans).
+func (s *ScannerAgent) RunStrategyScans(regime string, strategies []string) []*Signal {
 	var all []*Signal
 
-	s1 := s.ScanS1(regime)
-	s2 := s.ScanS2(regime)
-	s3 := s.ScanS3(regime)
-	s6t := s.ScanS6TrendShort(regime)
-	s6v := s.ScanS6VWAP(regime)
-	s7 := s.ScanS7(regime)
-	s8 := s.ScanS8(regime)
-	s9 := s.ScanS9(regime)
-	s10 := s.ScanS10GapFill(regime)
-	s11 := s.ScanS11VWAPRevert(regime)
-	s12 := s.ScanS12EODReversion(regime)
-	s13 := s.ScanS13SectorRotation(regime)
-	s14 := s.ScanS14RSIScalp(regime)
-	s15 := s.ScanS15RSISwing(regime)
+	// Mapping of strategy names to their execution functions
+	strategyMap := map[string]func(string) []*Signal{
+		"S1_MA_CROSS":      s.ScanS1,
+		"S2_BB_MEAN_REV":   s.ScanS2,
+		"S3_ORB":           s.ScanS3,
+		"S6_TREND_SHORT":   s.ScanS6TrendShort,
+		"S6_VWAP_BAND":     s.ScanS6VWAP,
+		"S7_MEAN_REV_LONG": s.ScanS7,
+		"S8_VOL_PIVOT":     s.ScanS8,
+		"S9_MTF_MOMENTUM":  s.ScanS9,
+		"S10_GAP_FILL":     s.ScanS10GapFill,
+		"S11_VWAP_REVERT":  s.ScanS11VWAPRevert,
+		"S12_EOD_REVERT":   s.ScanS12EODReversion,
+		"S13_SECTOR_ROT":   s.ScanS13SectorRotation,
+		"S14_RSI_SCALP":    s.ScanS14RSIScalp,
+		"S15_RSI_SWING":    s.ScanS15RSISwing,
+	}
 
-	all = append(all, s1...)
-	all = append(all, s2...)
-	all = append(all, s3...)
-	all = append(all, s6t...)
-	all = append(all, s6v...)
-	all = append(all, s7...)
-	all = append(all, s8...)
-	all = append(all, s9...)
-	all = append(all, s10...)
-	all = append(all, s11...)
-	all = append(all, s12...)
-	all = append(all, s13...)
-	all = append(all, s14...)
-	all = append(all, s15...)
+	// Helper to track which strategies actually ran for diagnostics
+	runCounts := make(map[string]int)
+
+	// Determine which strategies to run
+	var toRun []string
+	if len(strategies) == 0 {
+		// Run all if none specified
+		for k := range strategyMap {
+			toRun = append(toRun, k)
+		}
+	} else {
+		// Filter based on input
+		for _, name := range strategies {
+			if _, exists := strategyMap[name]; exists {
+				toRun = append(toRun, name)
+			} else {
+				log.Printf("[Scanner] Warning: Unknown strategy requested: %s (skipping)", name)
+			}
+		}
+	}
+
+	// Execute matched strategies
+	for _, name := range toRun {
+		scanFunc := strategyMap[name]
+		sigs := scanFunc(regime)
+		all = append(all, sigs...)
+		runCounts[name] = len(sigs)
+	}
 
 	// Catch-all to populate missing ML prerequisites for ANY strategy
 	for _, sig := range all {
@@ -1642,7 +1673,7 @@ func (s *ScannerAgent) RunAllScans(regime string) []*Signal {
 			if sig.RVol == 0 && s.ComputeRVol != nil {
 				sig.RVol = s.ComputeRVol(sig.Token)
 			}
-			
+
 			candles := s.getCandles5m(sig.Token)
 			if len(candles) >= 15 {
 				closes := make([]float64, len(candles))
@@ -1653,7 +1684,7 @@ func (s *ScannerAgent) RunAllScans(regime string) []*Signal {
 					highs[i] = c.High
 					lows[i] = c.Low
 				}
-				
+
 				if sig.RSI == 0 {
 					rsiSlice := data.ComputeRSI(closes, 14)
 					sig.RSI = rsiSlice[len(rsiSlice)-1]
@@ -1668,10 +1699,8 @@ func (s *ScannerAgent) RunAllScans(regime string) []*Signal {
 	}
 
 	// ═══ ALWAYS-ON DIAGNOSTICS (every 30s) ═══
-	// Shows exactly WHY signals aren't generating — never go silent
 	now := config.NowIST()
 	if now.Second() == 0 || now.Second() == 30 {
-		// Count stocks with valid LTP
 		ltpCount := 0
 		candleCount := 0
 		for token := range s.Universe {
@@ -1684,8 +1713,14 @@ func (s *ScannerAgent) RunAllScans(regime string) []*Signal {
 		}
 		log.Printf("[DIAG] Universe=%d LTP_active=%d Candles5m≥2=%d CacheReady=%v InWindow=%v Regime=%s",
 			len(s.Universe), ltpCount, candleCount, s.cacheReady(), s.IsInTradeWindow(), regime)
+		
+		// Map the run counts appropriately for the live engine to see familiar output
 		log.Printf("[DIAG] RAW: S1=%d S2=%d S3=%d S6T=%d S6V=%d S7=%d S8=%d S9=%d S10=%d S11=%d S12=%d S13=%d S14=%d S15=%d TOTAL=%d",
-			len(s1), len(s2), len(s3), len(s6t), len(s6v), len(s7), len(s8), len(s9), len(s10), len(s11), len(s12), len(s13), len(s14), len(s15), len(all))
+			runCounts["S1_MA_CROSS"], runCounts["S2_BB_MEAN_REV"], runCounts["S3_ORB"], 
+			runCounts["S6_TREND_SHORT"], runCounts["S6_VWAP_BAND"], runCounts["S7_MEAN_REV_LONG"], 
+			runCounts["S8_VOL_PIVOT"], runCounts["S9_MTF_MOMENTUM"], runCounts["S10_GAP_FILL"], 
+			runCounts["S11_VWAP_REVERT"], runCounts["S12_EOD_REVERT"], runCounts["S13_SECTOR_ROT"], 
+			runCounts["S14_RSI_SCALP"], runCounts["S15_RSI_SWING"], len(all))
 	}
 
 	// CRITICAL: Filter by net profitability — remove any signal that can't cover charges

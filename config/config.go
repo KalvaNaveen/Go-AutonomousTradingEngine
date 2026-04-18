@@ -147,11 +147,11 @@ const (
 )
 
 // ══════════════════════════════════════════════════════════════
-//  STRATEGY CONFIGURATIONS
+//  STRATEGY CONFIGURATIONS  (var, not const — enables runtime optimization)
 // ══════════════════════════════════════════════════════════════
 
 // S1: Moving Average Crossover
-const (
+var (
 	S1_EMA_FAST    = 9
 	S1_EMA_SLOW    = 21
 	S1_EMA_TREND   = 200
@@ -163,21 +163,21 @@ const (
 )
 
 // S2: BB + RSI Mean Reversion
-const (
-	S2_BB_PERIOD     = 20
-	S2_BB_SD         = 2.0
-	S2_RSI_PERIOD    = 14
-	S2_RSI_OVERSOLD  = 32
+var (
+	S2_BB_PERIOD      = 20
+	S2_BB_SD          = 2.0
+	S2_RSI_PERIOD     = 14
+	S2_RSI_OVERSOLD   = 32
 	S2_RSI_OVERBOUGHT = 68
-	S2_ATR_SL_MULT   = 1.0
-	S2_RR            = 1.2
-	S2_RISK_PCT      = 0.005
-	S2_MAX_HOLD_MINS = 45
-	S2_VIX_MAX       = 30.0
+	S2_ATR_SL_MULT    = 1.0
+	S2_RR             = 1.2
+	S2_RISK_PCT       = 0.005
+	S2_MAX_HOLD_MINS  = 45
+	S2_VIX_MAX        = 30.0
 )
 
 // S3: Opening Range Breakout
-const (
+var (
 	S3_RISK_PCT    = 0.005
 	S3_MAX_TRADES  = 2
 	S3_ENTRY_END   = "11:30"
@@ -186,7 +186,7 @@ const (
 )
 
 // S6 Trend Short
-const (
+var (
 	S6_RSI_PERIOD        = 4
 	S6_RSI_ENTRY_LOW     = 60
 	S6_RSI_ENTRY_HIGH    = 90
@@ -199,59 +199,59 @@ const (
 )
 
 // S6 VWAP Band
-const (
+var (
 	S6_VWAP_SD       = 2.0
 	S6_VWAP_RISK_PCT = 0.005
 	S6_VWAP_RR       = 1.5
 )
 
 // S7: Mean Reversion Long
-const (
-	S7_RSI_PERIOD       = 14
-	S7_RSI_OVERSOLD     = 28
-	S7_RSI_EXIT         = 45
+var (
+	S7_RSI_PERIOD         = 14
+	S7_RSI_OVERSOLD       = 28
+	S7_RSI_EXIT           = 45
 	S7_VWAP_DEVIATION_PCT = 0.020
-	S7_MIN_TURNOVER_CR  = 50.0
-	S7_RVOL_MIN         = 1.5
-	S7_ATR_PERIOD       = 14
+	S7_MIN_TURNOVER_CR    = 50.0
+	S7_RVOL_MIN           = 1.5
+	S7_ATR_PERIOD         = 14
 )
 
 // S8: Volume Profile + Pivot
-const (
+var (
 	S8_VOL_SPIKE_MULT = 2.5
 	S8_RISK_PCT       = 0.0075
 )
 
 // S9: Multi-Timeframe Momentum
-const (
-	S9_EMA_TREND   = 200
-	S9_RSI_PERIOD  = 14
+var (
+	S9_EMA_TREND     = 200
+	S9_RSI_PERIOD    = 14
 	S9_RSI_THRESHOLD = 45
-	S9_ATR_SL_MULT = 2.0
-	S9_RR          = 3.0
+	S9_ATR_SL_MULT   = 2.0
+	S9_RR            = 3.0
 )
 
 // S14: RSI Scalper (RSI-2 on 5min — Larry Connors adapted for intraday)
-const (
-	S14_RSI_PERIOD      = 2
-	S14_RSI_OVERSOLD    = 10
-	S14_RSI_OVERBOUGHT  = 90
-	S14_RSI_EXIT        = 50
-	S14_STOP_PCT        = 0.005 // 0.5% tight scalp stop
-	S14_MAX_HOLD_MINS   = 30
-	S14_MIN_PRICE       = 50.0
+var (
+	S14_RSI_PERIOD     = 2
+	S14_RSI_OVERSOLD   = 10
+	S14_RSI_OVERBOUGHT = 90
+	S14_RSI_EXIT       = 50
+	S14_STOP_PCT       = 0.005 // 0.5% tight scalp stop
+	S14_MAX_HOLD_MINS  = 30
+	S14_MIN_PRICE      = 50.0
 )
 
 // S15: RSI Swing (RSI-14 pullback with EMA20 trend confirmation)
-const (
-	S15_RSI_PERIOD      = 14
-	S15_RSI_OVERSOLD    = 35
-	S15_RSI_OVERBOUGHT  = 65
-	S15_EMA_TREND       = 20
-	S15_ATR_SL_MULT     = 1.0
-	S15_RR              = 2.0
-	S15_MAX_HOLD_MINS   = 120
-	S15_MIN_PRICE       = 100.0
+var (
+	S15_RSI_PERIOD     = 14
+	S15_RSI_OVERSOLD   = 35
+	S15_RSI_OVERBOUGHT = 65
+	S15_EMA_TREND      = 20
+	S15_ATR_SL_MULT    = 1.0
+	S15_RR             = 2.0
+	S15_MAX_HOLD_MINS  = 120
+	S15_MIN_PRICE      = 100.0
 )
 
 // ── Timing ──────────────────────────────────────────────────
