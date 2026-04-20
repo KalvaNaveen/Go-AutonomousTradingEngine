@@ -46,7 +46,12 @@ func (r *RiskAgent) ResetDaily() {
     r.EngineStopped = false
     r.StopReason = ""
     r.ConsecutiveLosses = 0
-    r.OpenPositions = make(map[string]*core.Trade)
+    
+    // Only wipe OpenPositions if it's empty, so we don't accidentally
+    // delete trades that were just restored via crash recovery.
+    if len(r.OpenPositions) == 0 {
+        r.OpenPositions = make(map[string]*core.Trade)
+    }
     log.Println("[Risk] Daily stats reset successfully.")
 }
 

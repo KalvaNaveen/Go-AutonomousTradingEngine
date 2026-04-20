@@ -326,9 +326,16 @@ func main() {
 	// ══════════════════════════════════════════════════════════════
 	//  PHASE 7: Start API Server (Dashboard Backend)
 	// ══════════════════════════════════════════════════════════════
+	const dashboardPort = "8085"
+	const dashboardAddr = ":" + dashboardPort
+	const dashboardURL = "http://127.0.0.1:" + dashboardPort
+
+	// Kill any zombie process holding the port from a previous crash
+	killOldProcess(dashboardPort)
+
 	apiServer := api.NewServer(risk, journal, exec, scanner, tickStore, dailyCache, macroAgent, mlFilter)
-	go apiServer.Start(":8085")
-	log.Println("[Engine] API server started on :8085")
+	go apiServer.Start(dashboardAddr)
+	log.Printf("[Engine] API server started on %s — Dashboard: %s", dashboardAddr, dashboardURL)
 
 	// Wire FillMonitor (for live mode)
 	if !config.PaperMode {
@@ -376,7 +383,7 @@ func main() {
 			dayName := dayOfWeek.String()
 			log.Printf("[Engine] %s detected — sleeping until Monday", dayName)
 			agents.SendTelegram(fmt.Sprintf("📅 *WEEKEND — ENGINE OFF*\n`%s` — Market closed.\nWill auto-restart Monday 08:25 AM.", dayName))
-			log.Println("[Engine] Process sleeping. UI remains accessible at port 8081.")
+			log.Printf("[Engine] Process sleeping. UI remains accessible at %s", dashboardURL)
 			sleepUntilMorning()
 			continue
 		}
@@ -642,12 +649,25 @@ func sleepUntilMorning() {
 }
 
 func launchDashboardUI() {
-	time.Sleep(500 * time.Millisecond) // Let API server bind
+	const url = "http://127.0.0.1:8085"
+	time.Sleep(1 * time.Second) // Let API server bind
 
-	// Dashboard is served directly by Go API server from dashboard/dist
-	// No npm/Vite needed — just open the browser
-	log.Println("[UI] Opening dashboard at http://127.0.0.1:8081")
-	exec.Command("cmd", "/c", "start", "http://127.0.0.1:8081").Start()
+	// Verify the server is actually responding before opening the browser
+	client := &http.Client{Timeout: 2 * time.Second}
+	for i := 0; i < 5; i++ {
+		resp, err := client.Get(url + "/api/health")
+		if err == nil {
+			resp.Body.Close()
+			log.Printf("[UI] Dashboard ready — opening %s", url)
+			exec.Command("cmd", "/c", "start", url).Start()
+			return
+		}
+		log.Printf("[UI] Waiting for API server (attempt %d/5)...", i+1)
+		time.Sleep(1 * time.Second)
+	}
+	log.Println("[UI] WARNING: API server not responding — dashboard may not load")
+	// Still try to open it
+	exec.Command("cmd", "/c", "start", url).Start()
 }
 
 // waitForNetwork pings a reliable endpoint to ensure DNS and network are up 
@@ -667,4 +687,71 @@ func waitForNetwork() {
 		time.Sleep(3 * time.Second)
 	}
 	log.Println("[Engine] WARNING: Proceeding despite network check failure.")
+}
+
+// killOldProcess kills any zombie process occupying the given port.
+// This handles the common case where a previous engine crash left a process
+// holding the port, preventing the new server from binding.
+func killOldProcess(port string) {
+	// Use netstat to find the PID using this port
+	out, err := exec.Command("cmd", "/c",
+		fmt.Sprintf("netstat -ano | findstr :%s | findstr LISTENING", port)).Output()
+	if err != nil || len(out) == 0 {
+		return // Port is free
+	}
+
+	// Parse the PID from netstat output (last column)
+	lines := fmt.Sprintf("%s", out)
+	for _, line := range splitLines(lines) {
+		fields := splitFields(line)
+		if len(fields) < 5 {
+			continue
+		}
+		pid := fields[len(fields)-1]
+		if pid == "0" {
+			continue
+		}
+		log.Printf("[Engine] Killing zombie process on port %s (PID=%s)", port, pid)
+		exec.Command("taskkill", "/F", "/PID", pid).Run()
+		time.Sleep(500 * time.Millisecond) // Let the OS release the port
+	}
+}
+
+func splitLines(s string) []string {
+	var lines []string
+	start := 0
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\n' {
+			line := s[start:i]
+			if len(line) > 0 && line[len(line)-1] == '\r' {
+				line = line[:len(line)-1]
+			}
+			if len(line) > 0 {
+				lines = append(lines, line)
+			}
+			start = i + 1
+		}
+	}
+	if start < len(s) {
+		lines = append(lines, s[start:])
+	}
+	return lines
+}
+
+func splitFields(s string) []string {
+	var fields []string
+	inField := false
+	start := 0
+	for i := 0; i <= len(s); i++ {
+		if i == len(s) || s[i] == ' ' || s[i] == '\t' {
+			if inField {
+				fields = append(fields, s[start:i])
+				inField = false
+			}
+		} else if !inField {
+			start = i
+			inField = true
+		}
+	}
+	return fields
 }

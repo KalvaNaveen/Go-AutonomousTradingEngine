@@ -280,6 +280,7 @@ func (e *ExecutionAgent) MonitorPositions(regime string) {
 					  strings.HasPrefix(trade.Strategy, "S3_") || 
 					  strings.HasPrefix(trade.Strategy, "S6_") ||
 					  strings.HasPrefix(trade.Strategy, "S10_") ||
+                      strings.HasPrefix(trade.Strategy, "S13_") ||
 					  strings.HasPrefix(trade.Strategy, "S14_") ||
 					  strings.HasPrefix(trade.Strategy, "S15_")
 
@@ -290,6 +291,28 @@ func (e *ExecutionAgent) MonitorPositions(regime string) {
 
 		// Stale trade: held > decayLimit mins and P&L is near zero (< ₹100)
 		if holdMinutes > decayLimit && gross > -100 && gross < 100 {
+			
+			// --- SMART DECAY ENHANCEMENT ---
+			// If the timer runs out, check if favorable momentum is suddenly returning.
+			isSurging := false
+			if e.Scanner != nil && e.Scanner.ComputeRVol != nil && e.Scanner.GetVWAP != nil {
+				rvol := e.Scanner.ComputeRVol(token)
+				vwap := e.Scanner.GetVWAP(token)
+				
+				if rvol > 1.3 { // Relative volume is highly active
+					if !trade.IsShort && ltp > vwap { // Long trade trending above VWAP
+						isSurging = true
+					} else if trade.IsShort && ltp < vwap { // Short trade trending below VWAP
+						isSurging = true
+					}
+				}
+			}
+
+			// Grant a 60-minute grace period if the stock wakes up right at the decay boundary
+			if isSurging && holdMinutes < decayLimit+60.0 {
+				continue // Bypass the kill switch
+			}
+			
 			// Trade is going nowhere — exit to free up capital for better setups
 			log.Printf("[Exec] TIME_DECAY: %s (Strat: %s) held %.0f mins with flat PnL=%.0f — exiting", trade.Symbol, trade.Strategy, holdMinutes, gross)
 			e.forceExit(oid, trade, "TIME_DECAY_EXIT", ltp)

@@ -127,7 +127,30 @@ func (bt *Backtester) log(format string, v ...interface{}) {
 	}
 }
 
+// PreloadedData holds all data loaded from the database for reuse across multiple runs
+type PreloadedData struct {
+	DaysMap   map[string]*DayData
+	DailyBars map[uint32][]DailyBar
+	Dates     []string
+}
+
+// DayData holds all minute bars for a single trading day
+type DayData struct {
+	Date  string
+	Ticks map[string]map[uint32]MinuteBar // time -> token -> Bar
+}
+
 func (bt *Backtester) Run() (*BacktestResult, error) {
+	data, err := bt.PreloadData()
+	if err != nil {
+		return nil, err
+	}
+	return bt.RunWithData(data)
+}
+
+// PreloadData loads all minute and daily data from historical.db once.
+// The result can be reused across multiple RunWithData() calls with different configs.
+func (bt *Backtester) PreloadData() (*PreloadedData, error) {
 	if bt.HistDB == "" {
 		return nil, fmt.Errorf("no historical.db found")
 	}
@@ -160,18 +183,18 @@ func (bt *Backtester) Run() (*BacktestResult, error) {
 	// Load from 300 days before start for indicator warmup
 	warmupStart, _ := time.Parse("2006-01-02", bt.Config.StartDate)
 	warmupDate := warmupStart.AddDate(0, 0, -300).Format("2006-01-02")
+	dailyBars := make(map[uint32][]DailyBar)
 	rowsD, err := db.Query(queryD, warmupDate)
 	if err == nil {
-		bt.DailyBars = make(map[uint32][]DailyBar)
 		for rowsD.Next() {
 			var dtk uint32
 			var dbb DailyBar
 			rowsD.Scan(&dtk, &dbb.Date, &dbb.Open, &dbb.High, &dbb.Low, &dbb.Close, &dbb.Volume)
-			bt.DailyBars[dtk] = append(bt.DailyBars[dtk], dbb)
+			dailyBars[dtk] = append(dailyBars[dtk], dbb)
 		}
 		rowsD.Close()
 	}
-	bt.log("Daily cache loaded: %d tokens", len(bt.DailyBars))
+	bt.log("Daily cache loaded: %d tokens", len(dailyBars))
 
 	// The stored timestamps have timezone suffixes like "+05:30".
 	// Use LIKE-based match to handle both "2026-04-08 09:15:00" and "2026-04-08 09:15:00+05:30" formats.
@@ -197,13 +220,6 @@ func (bt *Backtester) Run() (*BacktestResult, error) {
 		}
 	}
 	defer rows.Close()
-
-	// Organize ticks chronologically by day
-	// date -> token -> []minuteBars
-	type DayData struct {
-		Date  string
-		Ticks map[string]map[uint32]MinuteBar // time -> token -> Bar
-	}
 
 	daysMap := make(map[string]*DayData)
 	totalLoaded := 0
@@ -251,14 +267,21 @@ func (bt *Backtester) Run() (*BacktestResult, error) {
 	}
 	sort.Strings(dates)
 
+	return &PreloadedData{DaysMap: daysMap, DailyBars: dailyBars, Dates: dates}, nil
+}
+
+// RunWithData runs the simulation using pre-loaded data (avoids re-reading from DB)
+func (bt *Backtester) RunWithData(data *PreloadedData) (*BacktestResult, error) {
+	bt.DailyBars = data.DailyBars
+
 	result := &BacktestResult{}
 	capital := bt.Config.InitialCapital
 	peakCapital := capital
 	maxDD := 0.0
 
 	// ── Main Replay Loop ──
-	for _, date := range dates {
-		dayInfo := daysMap[date]
+	for _, date := range data.Dates {
+		dayInfo := data.DaysMap[date]
 
 		stratCount := 14
 		if len(bt.Config.Strategies) > 0 {
@@ -320,13 +343,45 @@ func (bt *Backtester) Run() (*BacktestResult, error) {
 		dayTradesCount := 0
 		dayPnl := 0.0
 
+		// --- Fast 5-Min Builder State ---
+		completedCandles := make(map[uint32][]agents.Candle)
+		activeCandles := make(map[uint32]*agents.Candle)
+		currentBucketStr := ""
+
 		for _, timeStr := range times {
 			isEOD := timeStr > "15:20"
 
-			// Push ticks to mock store
+			// Determine bucket for THIS minute
+			bucketHr := timeStr[:2]
+			bucketMins := timeStr[3:5]
+			bMinInt := int(bucketMins[0]-'0')*10 + int(bucketMins[1]-'0')
+			bMinInt = (bMinInt / 5) * 5
+			bucketStr := fmt.Sprintf("%s:%02d", bucketHr, bMinInt)
+
+			if currentBucketStr != "" && bucketStr != currentBucketStr {
+				for token, cand := range activeCandles {
+					if cand != nil {
+						completedCandles[token] = append(completedCandles[token], *cand)
+						activeCandles[token] = nil
+					}
+				}
+			}
+			currentBucketStr = bucketStr
+
+			// Push ticks to mock store and aggregate 5m
 			for token, bar := range dayInfo.Ticks[timeStr] {
 				// We simply inject the closed 1-minute close as the LTS
 				mockTickStore.SetSimulatorState(token, bar.Close, bar.Volume, bar.Open)
+				
+				cand := activeCandles[token]
+				if cand == nil {
+					activeCandles[token] = &agents.Candle{Open: bar.Open, High: bar.High, Low: bar.Low, Close: bar.Close, Volume: bar.Volume}
+				} else {
+					if bar.High > cand.High { cand.High = bar.High }
+					if bar.Low < cand.Low { cand.Low = bar.Low }
+					cand.Close = bar.Close
+					cand.Volume += bar.Volume 
+				}
 			}
 
 			// Square off logic if near EOD
@@ -403,38 +458,13 @@ func (bt *Backtester) Run() (*BacktestResult, error) {
 
 			// Only scan on 5-min boundaries to exactly match live Engine
 			if strings.HasSuffix(timeStr, "0") || strings.HasSuffix(timeStr, "5") {
-				// Inject 5min candles
-				// To do so perfectly, we scan all previous minutes today and rebuild them
+				// Fast O(1) 5min array injection
 				for token := range universeMap {
-					var mergedCandles []agents.Candle
-					var current *agents.Candle
-					var currentBucket string
-					
-					for _, stepTime := range times {
-						if stepTime > timeStr { break }
-						bar, pk := dayInfo.Ticks[stepTime][token]
-						if !pk { continue }
-						bucketHr := bar.Time[:2]
-						bucketMins := bar.Time[3:5] // "05", "10", "15"
-						// Round down to nearest 5
-						bMinInt := int(bucketMins[0]-'0')*10 + int(bucketMins[1]-'0')
-						bMinInt = (bMinInt / 5) * 5
-						bucketStr := fmt.Sprintf("%s:%02d", bucketHr, bMinInt)
-
-						if currentBucket != bucketStr {
-							if current != nil { mergedCandles = append(mergedCandles, *current) }
-							currentBucket = bucketStr
-							current = &agents.Candle{ Open: bar.Open, High: bar.High, Low: bar.Low, Close: bar.Close, Volume: bar.Volume }
-						} else {
-							if bar.High > current.High { current.High = bar.High }
-							if bar.Low < current.Low { current.Low = bar.Low }
-							current.Close = bar.Close
-							current.Volume += bar.Volume 
-						}
+					merged := append([]agents.Candle{}, completedCandles[token]...)
+					if cand := activeCandles[token]; cand != nil {
+						merged = append(merged, *cand)
 					}
-					if current != nil { mergedCandles = append(mergedCandles, *current) }
-					
-					mockTickStore.SetCandles5Min(token, mergedCandles)
+					mockTickStore.SetCandles5Min(token, merged)
 				}
 
 				if dayTradesCount < bt.Config.MaxPositions {

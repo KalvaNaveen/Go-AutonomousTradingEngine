@@ -2,8 +2,10 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"log"
 	"math"
+	"os"
 	"path/filepath"
 	"time"
 
@@ -73,6 +75,9 @@ func main() {
 
 	var allResults []strategyOptResult
 
+	// Suppress Go's default logger during optimization (scanner DIAG + ChargeFilter spam)
+	log.SetOutput(io.Discard)
+
 	for _, stratName := range strategies {
 		fmt.Printf("\n\n▶ OPTIMIZING: %s\n", stratName)
 		start := time.Now()
@@ -81,6 +86,9 @@ func main() {
 		allResults = append(allResults, result)
 		printResult(result)
 	}
+
+	// Restore logging for summary
+	log.SetOutput(os.Stderr)
 
 	// Final summary
 	fmt.Println("\n\n══════════════════════════════════════════════════════════")
@@ -103,10 +111,29 @@ func main() {
 func optimizeStrategy(stratName string) strategyOptResult {
 	grid := buildGrid(stratName)
 
+	// Pre-load data ONCE for this strategy — the heaviest operation
+	fmt.Printf("  [%s] Loading 180 days of historical data...\n", stratName)
+	preloader := createBacktester(stratName)
+	preloader.LogOutput = func(format string, v ...interface{}) {
+		// Show loading progress
+		msg := fmt.Sprintf(format, v...)
+		if len(msg) > 0 {
+			fmt.Printf("    %s\n", msg)
+		}
+	}
+	preloadedData, err := preloader.PreloadData()
+	if err != nil {
+		fmt.Printf("  [%s] ⚠ Data load error: %v\n", stratName, err)
+		return strategyOptResult{Strategy: stratName}
+	}
+	fmt.Printf("  [%s] Data loaded: %d trading days\n", stratName, len(preloadedData.Dates))
+
 	if len(grid.combos) == 0 {
 		// No tunable params (S10, S11, S12, S13) — just run once with defaults
 		fmt.Printf("  [%s] No tunable config params — running single baseline backtest\n", stratName)
-		res, err := runBacktest(stratName)
+		bt := createBacktester(stratName)
+		bt.LogOutput = func(format string, v ...interface{}) {}
+		res, err := bt.RunWithData(preloadedData)
 		if err != nil {
 			log.Printf("  [%s] Backtest error: %v\n", stratName, err)
 			return strategyOptResult{Strategy: stratName}
@@ -131,7 +158,9 @@ func optimizeStrategy(stratName string) strategyOptResult {
 		// Apply this parameter combination
 		combo.apply()
 
-		res, err := runBacktest(stratName)
+		bt := createBacktester(stratName)
+		bt.LogOutput = func(format string, v ...interface{}) {}
+		res, err := bt.RunWithData(preloadedData)
 		if err != nil {
 			if i == 0 {
 				fmt.Printf("    ⚠ First combo error: %v\n", err)
@@ -176,11 +205,11 @@ func optimizeStrategy(stratName string) strategyOptResult {
 	}
 }
 
-func runBacktest(stratName string) (*simulator.BacktestResult, error) {
+func createBacktester(stratName string) *simulator.Backtester {
 	endDate := config.TodayIST().Format("2006-01-02")
 	startDate := config.TodayIST().AddDate(0, 0, -LookbackDays).Format("2006-01-02")
 
-	bt := simulator.NewBacktester(simulator.BacktestConfig{
+	return simulator.NewBacktester(simulator.BacktestConfig{
 		StartDate:      startDate,
 		EndDate:        endDate,
 		InitialCapital: config.TotalCapital,
@@ -188,11 +217,6 @@ func runBacktest(stratName string) (*simulator.BacktestResult, error) {
 		RiskPerTrade:   config.MaxRiskPerTradePct,
 		Strategies:     []string{stratName},
 	})
-
-	// Suppress verbose logs during optimization
-	bt.LogOutput = func(format string, v ...interface{}) {}
-
-	return bt.Run()
 }
 
 func computeMonthly(res *simulator.BacktestResult) float64 {
