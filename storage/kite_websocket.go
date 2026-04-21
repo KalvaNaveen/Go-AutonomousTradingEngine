@@ -39,12 +39,16 @@ func NewKiteWebSocket(store *TickStore, tokens []uint32) *KiteWebSocket {
 
 // Connect establishes WebSocket connection and starts reading
 func (kws *KiteWebSocket) Connect() error {
+	kws.mu.Lock()
+	currentToken := kws.accessToken
+	kws.mu.Unlock()
+
 	u := url.URL{
 		Scheme: "wss",
 		Host:   "ws.kite.trade",
 		Path:   "/",
 		RawQuery: fmt.Sprintf("api_key=%s&access_token=%s",
-			kws.apiKey, kws.accessToken),
+			kws.apiKey, currentToken),
 	}
 
 	log.Printf("[WS] Connecting to %s", u.Host)
@@ -278,6 +282,12 @@ func (kws *KiteWebSocket) Close() {
 		kws.conn.Close()
 		kws.connected = false
 	}
+}
+
+func (kws *KiteWebSocket) UpdateToken(newToken string) {
+	kws.mu.Lock()
+	kws.accessToken = newToken
+	kws.mu.Unlock()
 }
 
 func min(a, b int) int {

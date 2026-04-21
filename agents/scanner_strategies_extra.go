@@ -46,7 +46,7 @@ func (s *ScannerAgent) ScanS6TrendShort(regime string) []*Signal {
 		if s.GetDayOpen != nil {
 			dayOpen = s.GetDayOpen(token)
 		}
-		if current <= 0 || dayOpen <= 0 {
+		if current <= 0 || current < config.S6_MIN_PRICE || dayOpen <= 0 {
 			continue
 		}
 
@@ -55,16 +55,16 @@ func (s *ScannerAgent) ScanS6TrendShort(regime string) []*Signal {
 			continue
 		}
 
-		// Must be below VWAP
+		// Must be below VWAP (VWAP breakdown core logic)
 		vwap := 0.0
 		if s.GetVWAP != nil {
 			vwap = s.GetVWAP(token)
 		}
-		if vwap > 0 && current >= vwap {
+		if vwap <= 0 || current >= vwap {
 			continue
 		}
 
-		// Relative weakness check
+		// Relative weakness check (Must be significantly weaker than Nifty)
 		stockChg := (current - dayOpen) / dayOpen
 		relativeWeakness := niftyChg - stockChg
 		if relativeWeakness < config.S6_RELATIVE_WEAKNESS {
@@ -76,27 +76,33 @@ func (s *ScannerAgent) ScanS6TrendShort(regime string) []*Signal {
 			continue
 		}
 
-		// RSI(4) check
-		closes := s.DailyCache.Closes[token]
-		if len(closes) < 10 {
-			continue
-		}
-		liveCloses := make([]float64, len(closes))
-		copy(liveCloses, closes)
-		liveCloses = append(liveCloses, current)
-		rsiSlice := data.ComputeRSI(liveCloses, config.S6_RSI_PERIOD)
-		rsi4 := rsiSlice[len(rsiSlice)-1]
-		if rsi4 < float64(config.S6_RSI_ENTRY_LOW) || rsi4 > float64(config.S6_RSI_ENTRY_HIGH) {
+		// EMA Trend Confirmation and RSI Filter
+		candles := s.getCandles5m(token)
+		if len(candles) < config.S6_EMA_SLOW+5 {
 			continue
 		}
 
-		// 5-min low breakout check
-		candles := s.getCandles5m(token)
-		if len(candles) >= 3 {
-			prevLow := candles[len(candles)-2].Low
-			if prevLow > 0 && current > prevLow {
-				continue
-			}
+		closes := make([]float64, len(candles))
+		for i, c := range candles {
+			closes[i] = c.Close
+		}
+
+		// 9-EMA and 20-EMA for trend confirmation
+		ema9 := data.ComputeEMA(closes, config.S6_EMA_FAST)
+		ema20 := data.ComputeEMA(closes, config.S6_EMA_SLOW)
+		valEMA9 := ema9[len(ema9)-1]
+		valEMA20 := ema20[len(ema20)-1]
+
+		// Strong downtrend confirmed: 9 EMA < 20 EMA, and Price < 9 EMA
+		if valEMA9 >= valEMA20 || current >= valEMA9 {
+			continue
+		}
+
+		// RSI(14) filter: avoid shorting into extreme oversold bottoms
+		rsiSlice := data.ComputeRSI(closes, config.S6_RSI_PERIOD)
+		rsi14 := rsiSlice[len(rsiSlice)-1]
+		if rsi14 < float64(config.S6_RSI_ENTRY_LOW) || rsi14 > float64(config.S6_RSI_ENTRY_HIGH) {
+			continue
 		}
 
 		atr := s.DailyCache.ATR[token]
@@ -104,12 +110,20 @@ func (s *ScannerAgent) ScanS6TrendShort(regime string) []*Signal {
 			atr = current * 0.02
 		}
 
-		// Order book filter (block shorts against buy walls)
+		// Order book filter (block shorts against massive buy walls)
 		if !s.checkOrderBook(token, true) {
 			continue
 		}
 
-		stopPrice := math.Round((current+atr*0.4)*100) / 100
+		// Wider Stop Loss (1.0 ATR or 20 EMA, whichever is higher, but capped at 1.5 ATR)
+		stopPriceATR := math.Round((current+atr*1.0)*100) / 100
+		stopPriceEMA := math.Round((valEMA20)*100) / 100
+		
+		stopPrice := stopPriceATR
+		if stopPriceEMA > stopPriceATR && (stopPriceEMA-current) <= atr*1.5 {
+			stopPrice = stopPriceEMA
+		}
+
 		risk := stopPrice - current
 		if risk <= 0 {
 			continue
@@ -126,13 +140,14 @@ func (s *ScannerAgent) ScanS6TrendShort(regime string) []*Signal {
 			StopPrice:     stopPrice,
 			PartialTarget: target1,
 			TargetPrice:   target2,
-			RSI:           math.Round(rsi4*100) / 100,
+			RSI:           math.Round(rsi14*100) / 100,
 			ATR:           math.Round(atr*100) / 100,
 			RVol:          math.Round(rvol*100) / 100,
 			VWAP:          math.Round(vwap*100) / 100,
 			Product:       "MIS",
 			IsShort:       true,
-			SortKey:       relativeWeakness,
+			MaxHoldMins:   120, // Give trend time to work
+			SortKey:       relativeWeakness * rvol, // Rank by weakness backed by volume
 		})
 	}
 

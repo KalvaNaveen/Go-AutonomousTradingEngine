@@ -23,6 +23,9 @@ type ExecutionAgent struct {
 	ActiveTrades map[string]*core.Trade
 	Mu           sync.RWMutex // Protects ActiveTrades from concurrent API/trading access
 
+	// Per-symbol re-entry cooldown to prevent revenge trading
+	lastExitTime map[string]time.Time
+
 	// Broker interface (abstracted for paper/live switching)
 	PlaceOrder   func(symbol string, qty int, isShort bool, orderType string, price float64) (string, error)
 	CancelOrder  func(orderID string) error
@@ -35,6 +38,7 @@ func NewExecutionAgent(risk *RiskAgent, journal *core.Journal, state *core.State
 		Journal:      journal,
 		State:        state,
 		ActiveTrades: make(map[string]*core.Trade),
+		lastExitTime: make(map[string]time.Time),
 	}
 }
 
@@ -63,6 +67,14 @@ func (e *ExecutionAgent) Execute(sig *Signal, regime string) bool {
 		if t.Symbol == sym {
 			e.Mu.RUnlock()
 			log.Printf("[Exec] REJECTED %s: Already holding position", sym)
+			return false
+		}
+	}
+	// Per-symbol re-entry cooldown (15 minutes after last exit)
+	if lastExit, ok := e.lastExitTime[sym]; ok {
+		if time.Since(lastExit).Minutes() < 15 {
+			e.Mu.RUnlock()
+			log.Printf("[Exec] REJECTED %s: Cooldown active (%.0fm since last exit)", sym, time.Since(lastExit).Minutes())
 			return false
 		}
 	}
@@ -276,11 +288,11 @@ func (e *ExecutionAgent) MonitorPositions(regime string) {
 		}
 
 		// Decay limits depend heavily on the strategy paradigm
+		// S10_ and S13_ are mean-reversion/rotation — they need 120m+ to work.
+		// Only true momentum strategies (breakout/scalp) get the short 30m decay.
 		isMomentum := strings.HasPrefix(trade.Strategy, "S1_") || 
 					  strings.HasPrefix(trade.Strategy, "S3_") || 
 					  strings.HasPrefix(trade.Strategy, "S6_") ||
-					  strings.HasPrefix(trade.Strategy, "S10_") ||
-                      strings.HasPrefix(trade.Strategy, "S13_") ||
 					  strings.HasPrefix(trade.Strategy, "S14_") ||
 					  strings.HasPrefix(trade.Strategy, "S15_")
 
@@ -446,6 +458,8 @@ func (e *ExecutionAgent) forceExit(oid string, trade *core.Trade, reason string,
 		"*FORCE EXIT*\n`%s` | `%s`\nEst. PnL: Rs.`%+.0f`%s",
 		trade.Symbol, reason, pnl, streakMsg))
 
+	// Record exit time for per-symbol cooldown
+	e.lastExitTime[trade.Symbol] = config.NowIST()
 	delete(e.ActiveTrades, oid)
 }
 

@@ -999,6 +999,17 @@ func (s *ScannerAgent) ScanS10GapFill(regime string) []*Signal {
 		return nil
 	}
 
+	// Nifty trend filter: don't fade gaps in the direction of the market
+	niftyLTP := s.GetLTP(config.Nifty50Token)
+	niftyOpen := 0.0
+	if s.GetDayOpen != nil {
+		niftyOpen = s.GetDayOpen(config.Nifty50Token)
+	}
+	niftyChgPct := 0.0
+	if niftyLTP > 0 && niftyOpen > 0 {
+		niftyChgPct = (niftyLTP - niftyOpen) / niftyOpen * 100
+	}
+
 	var signals []*Signal
 	for token, symbol := range s.Universe {
 		current := s.GetLTP(token)
@@ -1025,8 +1036,8 @@ func (s *ScannerAgent) ScanS10GapFill(regime string) []*Signal {
 
 		gapPct := (dayOpen - prevClose) / prevClose * 100
 
-		// Only trade significant gaps: 1.5% - 5% (too small = noise, too large = news-driven)
-		if math.Abs(gapPct) < 1.5 || math.Abs(gapPct) > 5.0 {
+		// Only trade significant gaps: 2.0% - 5% (too small = noise, too large = news-driven)
+		if math.Abs(gapPct) < 2.0 || math.Abs(gapPct) > 5.0 {
 			continue
 		}
 
@@ -1041,7 +1052,21 @@ func (s *ScannerAgent) ScanS10GapFill(regime string) []*Signal {
 		}
 
 		// GAP UP → SHORT (fade the gap, target = prev close)
-		if gapPct > 1.5 && current > prevClose*1.005 {
+		if gapPct > 2.0 && current > prevClose*1.005 {
+			// Don't fade gap-ups when Nifty is strongly up (market momentum)
+			if niftyChgPct > 0.3 {
+				continue
+			}
+			// RSI(14) confirmation: only short if RSI > 65 (overbought)
+			candles := s.getCandles5m(token)
+			if len(candles) >= 14 {
+				closes := make([]float64, len(candles))
+				for ci, c := range candles { closes[ci] = c.Close }
+				rsiSlice := data.ComputeRSI(closes, 14)
+				if rsiSlice[len(rsiSlice)-1] < 65 {
+					continue
+				}
+			}
 			// Price still above prev close, gap hasn't filled yet
 			targetPrice := math.Round(prevClose*100) / 100
 			stopPrice := math.Round((dayOpen+0.5*atr)*100) / 100
@@ -1060,7 +1085,21 @@ func (s *ScannerAgent) ScanS10GapFill(regime string) []*Signal {
 		}
 
 		// GAP DOWN → LONG (fade the gap, target = prev close)
-		if gapPct < -1.5 && current < prevClose*0.995 {
+		if gapPct < -2.0 && current < prevClose*0.995 {
+			// Don't fade gap-downs when Nifty is strongly down
+			if niftyChgPct < -0.3 {
+				continue
+			}
+			// RSI(14) confirmation: only buy if RSI < 35 (oversold)
+			candles := s.getCandles5m(token)
+			if len(candles) >= 14 {
+				closes := make([]float64, len(candles))
+				for ci, c := range candles { closes[ci] = c.Close }
+				rsiSlice := data.ComputeRSI(closes, 14)
+				if rsiSlice[len(rsiSlice)-1] > 35 {
+					continue
+				}
+			}
 			targetPrice := math.Round(prevClose*100) / 100
 			stopPrice := math.Round((dayOpen-0.5*atr)*100) / 100
 			risk := current - stopPrice
@@ -1152,7 +1191,7 @@ func (s *ScannerAgent) ScanS11VWAPRevert(regime string) []*Signal {
 		rsi := rsiSlice[len(rsiSlice)-1]
 
 		// LONG: Price far below VWAP + RSI oversold
-		if deviation < -0.015 && rsi < 40 {
+		if deviation < -0.015 && rsi < 30 {
 			targetPrice := math.Round((vwap-0.002*vwap)*100) / 100 // Target slightly below VWAP
 			stopPrice := math.Round((current-0.8*atr)*100) / 100
 			risk := current - stopPrice
@@ -1174,7 +1213,7 @@ func (s *ScannerAgent) ScanS11VWAPRevert(regime string) []*Signal {
 		}
 
 		// SHORT: Price far above VWAP + RSI overbought
-		if deviation > 0.015 && rsi > 60 {
+		if deviation > 0.015 && rsi > 70 {
 			targetPrice := math.Round((vwap+0.002*vwap)*100) / 100
 			stopPrice := math.Round((current+0.8*atr)*100) / 100
 			risk := stopPrice - current
@@ -1237,8 +1276,8 @@ func (s *ScannerAgent) ScanS12EODReversion(regime string) []*Signal {
 		deviation := (current - vwap) / vwap
 		absDevPct := math.Abs(deviation) * 100
 
-		// Need >2% deviation for EOD reversion
-		if absDevPct < 2.0 {
+		// Need >2.5% deviation for EOD reversion
+		if absDevPct < 2.5 {
 			continue
 		}
 
@@ -1250,10 +1289,20 @@ func (s *ScannerAgent) ScanS12EODReversion(regime string) []*Signal {
 		rvol := s.computeRVol(token)
 		// Low volume is actually GOOD for EOD reversion (means the move is exhausted)
 
-		// LONG: Stock beaten down >2% from VWAP in afternoon → snap back
-		if deviation < -0.02 {
+		// RSI(14) confirmation for EOD reversion
+		candles := s.getCandles5m(token)
+		rsi := 50.0
+		if len(candles) >= 14 {
+			closes := make([]float64, len(candles))
+			for ci, c := range candles { closes[ci] = c.Close }
+			rsiSlice := data.ComputeRSI(closes, 14)
+			rsi = rsiSlice[len(rsiSlice)-1]
+		}
+
+		// LONG: Stock beaten down >2.5% from VWAP in afternoon → snap back
+		if deviation < -0.025 && rsi < 30 {
 			targetPrice := math.Round((vwap-0.005*vwap)*100) / 100 // Partial fill toward VWAP
-			stopPrice := math.Round((current-0.5*atr)*100) / 100
+			stopPrice := math.Round((current-1.0*atr)*100) / 100 // Widened from 0.5 to 1.0 ATR
 			risk := current - stopPrice
 			if risk <= 0 {
 				continue
@@ -1262,16 +1311,16 @@ func (s *ScannerAgent) ScanS12EODReversion(regime string) []*Signal {
 			signals = append(signals, &Signal{
 				Strategy: "S12_EOD_REVERT", Symbol: symbol, Token: token, Regime: regime,
 				EntryPrice: current, StopPrice: stopPrice, TargetPrice: targetPrice,
-				VWAP: vwap, RVol: rvol, ATR: atr,
+				VWAP: vwap, RVol: rvol, ATR: atr, RSI: rsi,
 				Product: "MIS", IsShort: false, MaxHoldMins: 45,
 				SortKey: absDevPct,
 			})
 		}
 
-		// SHORT: Stock pumped >2% above VWAP → MIS squareoff will pull it down
-		if deviation > 0.02 {
+		// SHORT: Stock pumped >2.5% above VWAP → MIS squareoff will pull it down
+		if deviation > 0.025 && rsi > 70 {
 			targetPrice := math.Round((vwap+0.005*vwap)*100) / 100
-			stopPrice := math.Round((current+0.5*atr)*100) / 100
+			stopPrice := math.Round((current+1.0*atr)*100) / 100 // Widened from 0.5 to 1.0 ATR
 			risk := stopPrice - current
 			if risk <= 0 {
 				continue
@@ -1280,7 +1329,7 @@ func (s *ScannerAgent) ScanS12EODReversion(regime string) []*Signal {
 			signals = append(signals, &Signal{
 				Strategy: "S12_EOD_REVERT", Symbol: symbol, Token: token, Regime: regime,
 				EntryPrice: current, StopPrice: stopPrice, TargetPrice: targetPrice,
-				VWAP: vwap, RVol: rvol, ATR: atr,
+				VWAP: vwap, RVol: rvol, ATR: atr, RSI: rsi,
 				Product: "MIS", IsShort: true, MaxHoldMins: 45,
 				SortKey: absDevPct,
 			})
@@ -1322,7 +1371,7 @@ func (s *ScannerAgent) ScanS13SectorRotation(regime string) []*Signal {
 	var allStocks []symbolStrength
 	for token, symbol := range s.Universe {
 		current := s.GetLTP(token)
-		if current <= 0 {
+		if current <= 0 || current < 200 { // Min price filter: no penny stocks
 			continue
 		}
 		dayOpen := 0.0
@@ -1353,7 +1402,7 @@ func (s *ScannerAgent) ScanS13SectorRotation(regime string) []*Signal {
 	// Top 3 strongest + high volume → LONG (momentum continuation)
 	for i := 0; i < 3 && i < len(allStocks); i++ {
 		ss := allStocks[i]
-		if ss.changePct < 1.5 || ss.rvol < 1.5 {
+		if ss.changePct < 2.5 || ss.rvol < 1.5 {
 			continue
 		}
 
@@ -1367,6 +1416,17 @@ func (s *ScannerAgent) ScanS13SectorRotation(regime string) []*Signal {
 			continue // Don't buy below 200SMA
 		}
 
+		// RSI(14) confirmation: only buy if RSI > 60 (momentum confirmed)
+		candles := s.getCandles5m(ss.token)
+		if len(candles) >= 14 {
+			closes := make([]float64, len(candles))
+			for ci, c := range candles { closes[ci] = c.Close }
+			rsiSlice := data.ComputeRSI(closes, 14)
+			if rsiSlice[len(rsiSlice)-1] < 60 {
+				continue
+			}
+		}
+
 		stopPrice := math.Round((current-1.0*atr)*100) / 100
 		risk := current - stopPrice
 		if risk <= 0 {
@@ -1378,7 +1438,7 @@ func (s *ScannerAgent) ScanS13SectorRotation(regime string) []*Signal {
 			Strategy: "S13_SECTOR_ROT", Symbol: ss.symbol, Token: ss.token, Regime: regime,
 			EntryPrice: current, StopPrice: stopPrice, TargetPrice: targetPrice,
 			RVol: ss.rvol, ATR: atr,
-			Product: "MIS", IsShort: false,
+			Product: "MIS", IsShort: false, MaxHoldMins: 180,
 			SortKey: ss.changePct * ss.rvol,
 		})
 	}
@@ -1386,7 +1446,7 @@ func (s *ScannerAgent) ScanS13SectorRotation(regime string) []*Signal {
 	// Bottom 3 weakest + high volume → SHORT (momentum continuation)
 	for i := len(allStocks) - 1; i >= len(allStocks)-3 && i >= 0; i-- {
 		ss := allStocks[i]
-		if ss.changePct > -1.5 || ss.rvol < 1.5 {
+		if ss.changePct > -2.5 || ss.rvol < 1.5 {
 			continue
 		}
 
@@ -1400,6 +1460,17 @@ func (s *ScannerAgent) ScanS13SectorRotation(regime string) []*Signal {
 			continue // Don't short above 200SMA
 		}
 
+		// RSI(14) confirmation: only short if RSI < 40 (weakness confirmed)
+		candles := s.getCandles5m(ss.token)
+		if len(candles) >= 14 {
+			closes := make([]float64, len(candles))
+			for ci, c := range candles { closes[ci] = c.Close }
+			rsiSlice := data.ComputeRSI(closes, 14)
+			if rsiSlice[len(rsiSlice)-1] > 40 {
+				continue
+			}
+		}
+
 		stopPrice := math.Round((current+1.0*atr)*100) / 100
 		risk := stopPrice - current
 		if risk <= 0 {
@@ -1411,7 +1482,7 @@ func (s *ScannerAgent) ScanS13SectorRotation(regime string) []*Signal {
 			Strategy: "S13_SECTOR_ROT", Symbol: ss.symbol, Token: ss.token, Regime: regime,
 			EntryPrice: current, StopPrice: stopPrice, TargetPrice: targetPrice,
 			RVol: ss.rvol, ATR: atr,
-			Product: "MIS", IsShort: true,
+			Product: "MIS", IsShort: true, MaxHoldMins: 180,
 			SortKey: math.Abs(ss.changePct) * ss.rvol,
 		})
 	}

@@ -167,8 +167,8 @@ var (
 	S2_BB_PERIOD      = 20
 	S2_BB_SD          = 2.0
 	S2_RSI_PERIOD     = 14
-	S2_RSI_OVERSOLD   = 32
-	S2_RSI_OVERBOUGHT = 68
+	S2_RSI_OVERSOLD   = 30  // Standard 30 (was 32)
+	S2_RSI_OVERBOUGHT = 70  // Standard 70 (was 68)
 	S2_ATR_SL_MULT    = 1.0
 	S2_RR             = 1.2
 	S2_RISK_PCT       = 0.005
@@ -185,17 +185,20 @@ var (
 	S3_TARGET_MULT = 1.0
 )
 
-// S6 Trend Short
+// S6 Trend Short (Intraday VWAP Breakdown)
 var (
-	S6_RSI_PERIOD        = 4
-	S6_RSI_ENTRY_LOW     = 60
-	S6_RSI_ENTRY_HIGH    = 90
+	S6_EMA_FAST          = 9
+	S6_EMA_SLOW          = 20
+	S6_RSI_PERIOD        = 14
+	S6_RSI_ENTRY_LOW     = 35
+	S6_RSI_ENTRY_HIGH    = 60
 	S6_RSI_EXIT          = 25
-	S6_COOLDOWN_DAYS     = 2
+	S6_COOLDOWN_DAYS     = 1
 	S6_MIN_TURNOVER_CR   = 30.0
-	S6_RELATIVE_WEAKNESS = 0.0075
-	S6_RVOL_MIN          = 1.3
+	S6_RELATIVE_WEAKNESS = 0.005 // 0.5% weaker than Nifty
+	S6_RVOL_MIN          = 1.5
 	S6_VWAP_FILTER       = true
+	S6_MIN_PRICE         = 200.0
 )
 
 // S6 VWAP Band
@@ -234,8 +237,8 @@ var (
 // S14: RSI Scalper (RSI-2 on 5min — Larry Connors adapted for intraday)
 var (
 	S14_RSI_PERIOD     = 2
-	S14_RSI_OVERSOLD   = 10
-	S14_RSI_OVERBOUGHT = 90
+	S14_RSI_OVERSOLD   = 5   // Connors research: <5 for high-probability entries (was 10)
+	S14_RSI_OVERBOUGHT = 95  // Connors research: >95 for high-probability entries (was 90)
 	S14_RSI_EXIT       = 50
 	S14_STOP_PCT       = 0.005 // 0.5% tight scalp stop
 	S14_MAX_HOLD_MINS  = 30
@@ -245,8 +248,8 @@ var (
 // S15: RSI Swing (RSI-14 pullback with EMA20 trend confirmation)
 var (
 	S15_RSI_PERIOD     = 14
-	S15_RSI_OVERSOLD   = 35
-	S15_RSI_OVERBOUGHT = 65
+	S15_RSI_OVERSOLD   = 30  // Standard 30 (was 35)
+	S15_RSI_OVERBOUGHT = 70  // Standard 70 (was 65)
 	S15_EMA_TREND      = 20
 	S15_ATR_SL_MULT    = 1.0
 	S15_RR             = 2.0
@@ -295,7 +298,7 @@ func init() {
 	JournalDB = BaseDir + string(os.PathSeparator) + "data" + string(os.PathSeparator) + "journal.db"
 }
 
-// DisabledStrategies — empty: all strategies active
+// DisabledStrategies — empty: all strategies active (S6 enabled after rework)
 var DisabledStrategies = map[string]bool{}
 
 // ParseTime parses "HH:MM" into hour, minute

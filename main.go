@@ -256,6 +256,34 @@ func main() {
 	}
 
 	// ══════════════════════════════════════════════════════════════
+	//  PHASE 4.5: Scheduled Daily Token Refresh (24/7 Continuity)
+	// ══════════════════════════════════════════════════════════════
+	go func() {
+		for {
+			now := config.NowIST()
+			// Zerodha resets tokens around 8:00 AM. We refresh exactly at 8:30 AM before market open.
+			// This fixes the issue when engine is started before 8:30 AM or runs multi-day 24/7.
+			if now.Hour() == 8 && now.Minute() == 30 {
+				log.Println("[Engine] Executing scheduled 8:30 AM Auto-Login...")
+				login := core.NewAutoLogin()
+				if login.Run() {
+					agents.SendTelegram("✅ *SCHEDULED AUTO LOGIN SUCCESS* — Token refreshed")
+					if ws != nil {
+						// Update WebSocket's token and force a reconnect
+						ws.UpdateToken(config.KiteAccessToken)
+						ws.Close() 
+						log.Println("[Engine] Reset WebSocket to use new token.")
+					}
+				} else {
+					agents.SendTelegram("🚨 *SCHEDULED AUTO LOGIN FAILED* — Check credentials")
+				}
+				time.Sleep(61 * time.Second) // Prevent multiple triggers in same minute
+			}
+			time.Sleep(20 * time.Second)
+		}
+	}()
+
+	// ══════════════════════════════════════════════════════════════
 	//  PHASE 5: Crash Recovery
 	// ══════════════════════════════════════════════════════════════
 	exec.RestoreFromState()
