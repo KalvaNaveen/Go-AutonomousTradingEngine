@@ -114,11 +114,11 @@ func (r *RiskAgent) ApproveTrade(signal map[string]interface{}) (bool, string) {
 
 	// Capital availability (MIS margin)
 	newSymbol, _ := signal["symbol"].(string)
-	newLeverage := r.getMISLeverage(newSymbol)
+	newLeverage := r.GetMISLeverage(newSymbol)
 
 	deployedMargin := 0.0
 	for _, pos := range r.OpenPositions {
-		posLev := r.getMISLeverage(pos.Symbol)
+		posLev := r.GetMISLeverage(pos.Symbol)
 		deployedMargin += (pos.EntryPrice * float64(pos.Qty)) / posLev
 	}
 
@@ -224,7 +224,7 @@ func (r *RiskAgent) CalculatePositionSize(entry, stop float64, regime, strategy,
 		scale *= ms
 	}
 
-	leverage := r.getMISLeverage(symbol)
+	leverage := r.GetMISLeverage(symbol)
 
 	riskRs := r.TotalCapital * config.MaxRiskPerTradePct * scale * config.STTBuffer
 	rps := math.Abs(entry - stop)
@@ -245,7 +245,7 @@ func (r *RiskAgent) CalculatePositionSize(entry, stop float64, regime, strategy,
 	// Available margin cap
 	deployedMargin := 0.0
 	for _, pos := range r.OpenPositions {
-		posLev := r.getMISLeverage(pos.Symbol)
+		posLev := r.GetMISLeverage(pos.Symbol)
 		deployedMargin += (pos.EntryPrice * float64(pos.Qty)) / posLev
 	}
 	freeMargin := math.Max(r.ActiveCapital-deployedMargin, 0)
@@ -271,7 +271,7 @@ func (r *RiskAgent) CalculatePositionSize(entry, stop float64, regime, strategy,
 	return qty
 }
 
-func (r *RiskAgent) getMISLeverage(symbol string) float64 {
+func (r *RiskAgent) GetMISLeverage(symbol string) float64 {
 	today := time.Now().Format("2006-01-02")
 	if r.misCacheDate != today {
 		r.misMarginCache = make(map[string]float64)

@@ -24,12 +24,13 @@ type ExecutionAgent struct {
 	Mu           sync.RWMutex // Protects ActiveTrades from concurrent API/trading access
 
 	// Per-symbol re-entry cooldown to prevent revenge trading
-	lastExitTime map[string]time.Time
+	lastExitTime   map[string]time.Time
+	lastExitReason map[string]string
 
 	// Broker interface (abstracted for paper/live switching)
-	PlaceOrder   func(symbol string, qty int, isShort bool, orderType string, price float64) (string, error)
-	CancelOrder  func(orderID string) error
-	GetLTP       func(uint32) float64
+	PlaceOrder  func(symbol string, qty int, isShort bool, orderType string, price float64) (string, error)
+	CancelOrder func(orderID string) error
+	GetLTP      func(uint32) float64
 }
 
 func NewExecutionAgent(risk *RiskAgent, journal *core.Journal, state *core.StateManager) *ExecutionAgent {
@@ -37,8 +38,9 @@ func NewExecutionAgent(risk *RiskAgent, journal *core.Journal, state *core.State
 		Risk:         risk,
 		Journal:      journal,
 		State:        state,
-		ActiveTrades: make(map[string]*core.Trade),
-		lastExitTime: make(map[string]time.Time),
+		ActiveTrades:   make(map[string]*core.Trade),
+		lastExitTime:   make(map[string]time.Time),
+		lastExitReason: make(map[string]string),
 	}
 }
 
@@ -70,11 +72,20 @@ func (e *ExecutionAgent) Execute(sig *Signal, regime string) bool {
 			return false
 		}
 	}
-	// Per-symbol re-entry cooldown (15 minutes after last exit)
+	// Smart per-symbol cooldown: 5m for winners, 30m for losers, 15m for neutral
 	if lastExit, ok := e.lastExitTime[sym]; ok {
-		if time.Since(lastExit).Minutes() < 15 {
+		cooldownMins := 15.0 // default
+		if reason, exists := e.lastExitReason[sym]; exists {
+			switch reason {
+			case "NET_PROFIT_EXIT", "TARGET_HIT", "PROFIT_LOCK_EXIT":
+				cooldownMins = 5.0 // Winners: allow quick re-entry
+			case "STOP_HIT":
+				cooldownMins = 30.0 // Losers: prevent revenge trading
+			}
+		}
+		if time.Since(lastExit).Minutes() < cooldownMins {
 			e.Mu.RUnlock()
-			log.Printf("[Exec] REJECTED %s: Cooldown active (%.0fm since last exit)", sym, time.Since(lastExit).Minutes())
+			log.Printf("[Exec] REJECTED %s: Cooldown active (%.0fm/%.0fm since %s)", sym, time.Since(lastExit).Minutes(), cooldownMins, e.lastExitReason[sym])
 			return false
 		}
 	}
@@ -179,9 +190,11 @@ func (e *ExecutionAgent) Execute(sig *Signal, regime string) bool {
 		direction = "SHORT"
 	}
 
+	leverage := e.Risk.GetMISLeverage(sym)
+
 	SendTelegram(fmt.Sprintf(
-		"*EXECUTED %s (%s) -- Qty:%d | R:R %.2f*\n`%s` | `%s`\nEntry: Rs.`%.2f` | Qty: `%d`\nTarget: Rs.`%.2f` | Stop: Rs.`%.2f`",
-		sig.Strategy, direction, qty, rr,
+		"*EXECUTED %s (%s) -- Qty:%d | Lev: %.1fx | R:R %.2f*\n`%s` | `%s`\nEntry: Rs.`%.2f` | Qty: `%d`\nTarget: Rs.`%.2f` | Stop: Rs.`%.2f`",
+		sig.Strategy, direction, qty, leverage, rr,
 		sym, regime, sig.EntryPrice, qty,
 		sig.TargetPrice, sig.StopPrice))
 
@@ -190,11 +203,11 @@ func (e *ExecutionAgent) Execute(sig *Signal, regime string) bool {
 
 // MonitorPositions checks all open positions for exits.
 // Implements 5 layers of position management:
-//   1. Trailing stop loss — locks in profits as price moves
-//   2. Breakeven stop — once at 1R profit, stop moves to entry
-//   3. Time decay exit — stale trades that go nowhere after 30 mins
-//   4. Dynamic net-profit exit — exit when net profit (after charges) meets threshold
-//   5. Fixed stop/target hit — original SL/TP from entry
+//  1. Trailing stop loss — locks in profits as price moves
+//  2. Breakeven stop — once at 1R profit, stop moves to entry
+//  3. Time decay exit — stale trades that go nowhere after 30 mins
+//  4. Dynamic net-profit exit — exit when net profit (after charges) meets threshold
+//  5. Fixed stop/target hit — original SL/TP from entry
 func (e *ExecutionAgent) MonitorPositions(regime string) {
 	now := config.NowIST()
 	h, m := now.Hour(), now.Minute()
@@ -227,6 +240,37 @@ func (e *ExecutionAgent) MonitorPositions(regime string) {
 		}
 		charges := core.ComputeChargesFromTrade(trade.EntryPrice, ltp, actQty, trade.IsShort, "MIS", 0)
 		netPnl := gross - charges
+
+		// ═══ LAYER 0: PROFIT-LOCK / HIGH-WATER MARK ═══
+		// Track the peak net P&L this trade has ever reached.
+		// Once peak crosses stepped thresholds, lock in a minimum guaranteed profit.
+		// If P&L drops below the locked floor, force-exit to prevent giving back gains.
+		if netPnl > trade.PeakPnl {
+			trade.PeakPnl = netPnl
+		}
+
+		// Determine locked-in floor based on highest profit ever reached
+		// Floors include a ₹30 slippage buffer so exit market orders don't turn breakeven into a loss
+		lockedFloor := -999999.0 // No floor by default
+		switch {
+		case trade.PeakPnl >= 400:
+			lockedFloor = 280.0 // Reached ₹400+ → lock ₹280 (after slippage ~₹250+)
+		case trade.PeakPnl >= 300:
+			lockedFloor = 180.0 // Reached ₹300+ → lock ₹180 (after slippage ~₹150+)
+		case trade.PeakPnl >= 200:
+			lockedFloor = 130.0 // Reached ₹200+ → lock ₹130 (after slippage ~₹100+)
+		case trade.PeakPnl >= 100:
+			lockedFloor = 30.0 // Reached ₹100+ → lock ₹30 (after slippage still net positive)
+		}
+
+		if lockedFloor > -999999.0 && netPnl <= lockedFloor {
+			log.Printf("[Exec] PROFIT_LOCK: %s peak=₹%.0f now=₹%.0f floor=₹%.0f — locking gains",
+				trade.Symbol, trade.PeakPnl, netPnl, lockedFloor)
+			SendTelegram(fmt.Sprintf("🔒 *PROFIT LOCK* `%s` Peak ₹%.0f → Now ₹%.0f (floor ₹%.0f). Exiting to protect gains.",
+				trade.Symbol, trade.PeakPnl, netPnl, lockedFloor))
+			e.forceExit(oid, trade, "PROFIT_LOCK_EXIT", ltp)
+			continue
+		}
 
 		// ═══ LAYER 1: TRAILING STOP LOSS ═══
 		// Once trade moves >1R in our favor, trail the stop at 50% of max favorable excursion
@@ -290,11 +334,11 @@ func (e *ExecutionAgent) MonitorPositions(regime string) {
 		// Decay limits depend heavily on the strategy paradigm
 		// S10_ and S13_ are mean-reversion/rotation — they need 120m+ to work.
 		// Only true momentum strategies (breakout/scalp) get the short 30m decay.
-		isMomentum := strings.HasPrefix(trade.Strategy, "S1_") || 
-					  strings.HasPrefix(trade.Strategy, "S3_") || 
-					  strings.HasPrefix(trade.Strategy, "S6_") ||
-					  strings.HasPrefix(trade.Strategy, "S14_") ||
-					  strings.HasPrefix(trade.Strategy, "S15_")
+		isMomentum := strings.HasPrefix(trade.Strategy, "S1_") ||
+			strings.HasPrefix(trade.Strategy, "S3_") ||
+			strings.HasPrefix(trade.Strategy, "S6_") ||
+			strings.HasPrefix(trade.Strategy, "S14_") ||
+			strings.HasPrefix(trade.Strategy, "S15_")
 
 		decayLimit := 30.0
 		if !isMomentum {
@@ -303,14 +347,14 @@ func (e *ExecutionAgent) MonitorPositions(regime string) {
 
 		// Stale trade: held > decayLimit mins and P&L is near zero (< ₹100)
 		if holdMinutes > decayLimit && gross > -100 && gross < 100 {
-			
+
 			// --- SMART DECAY ENHANCEMENT ---
 			// If the timer runs out, check if favorable momentum is suddenly returning.
 			isSurging := false
 			if e.Scanner != nil && e.Scanner.ComputeRVol != nil && e.Scanner.GetVWAP != nil {
 				rvol := e.Scanner.ComputeRVol(token)
 				vwap := e.Scanner.GetVWAP(token)
-				
+
 				if rvol > 1.3 { // Relative volume is highly active
 					if !trade.IsShort && ltp > vwap { // Long trade trending above VWAP
 						isSurging = true
@@ -324,7 +368,7 @@ func (e *ExecutionAgent) MonitorPositions(regime string) {
 			if isSurging && holdMinutes < decayLimit+60.0 {
 				continue // Bypass the kill switch
 			}
-			
+
 			// Trade is going nowhere — exit to free up capital for better setups
 			log.Printf("[Exec] TIME_DECAY: %s (Strat: %s) held %.0f mins with flat PnL=%.0f — exiting", trade.Symbol, trade.Strategy, holdMinutes, gross)
 			e.forceExit(oid, trade, "TIME_DECAY_EXIT", ltp)
@@ -339,12 +383,9 @@ func (e *ExecutionAgent) MonitorPositions(regime string) {
 
 		// ═══ LAYER 4: DYNAMIC NET-PROFIT EXIT ═══
 		// Exit when net profit (after ALL charges) reaches a meaningful threshold
-		// Scaled by position size: min(₹100, 1.5% of position value)
+		// Scaled by position size: max(₹500, 1.5% of position value)
 		positionValue := trade.EntryPrice * float64(actQty)
-		minNetTarget := min64(100.0, positionValue*0.015)
-		if minNetTarget < 30 {
-			minNetTarget = 30 // Absolute minimum ₹30 net
-		}
+		minNetTarget := max64(500.0, positionValue*0.015)
 
 		if netPnl >= minNetTarget {
 			log.Printf("[Exec] NET_PROFIT_EXIT: %s net=₹%.0f (gross=₹%.0f charges=₹%.0f)",
@@ -458,8 +499,9 @@ func (e *ExecutionAgent) forceExit(oid string, trade *core.Trade, reason string,
 		"*FORCE EXIT*\n`%s` | `%s`\nEst. PnL: Rs.`%+.0f`%s",
 		trade.Symbol, reason, pnl, streakMsg))
 
-	// Record exit time for per-symbol cooldown
+	// Record exit time + reason for smart per-symbol cooldown
 	e.lastExitTime[trade.Symbol] = config.NowIST()
+	e.lastExitReason[trade.Symbol] = reason
 	delete(e.ActiveTrades, oid)
 }
 

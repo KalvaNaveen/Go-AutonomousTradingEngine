@@ -122,6 +122,7 @@ type Trade struct {
 	EntryCancelled bool
 	RealisedPnl    float64
 	MaxHoldMins    int
+	PeakPnl        float64 // High-water mark: maximum net P&L reached during trade lifetime
 }
 
 func (sm *StateManager) Save(entryOID string, t *Trade) {

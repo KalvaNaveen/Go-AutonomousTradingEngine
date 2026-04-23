@@ -384,6 +384,17 @@ func (s *ScannerAgent) ScanS1(regime string) []*Signal {
 			ema21SlopeDown = ema21[len(ema21)-1] < ema21[len(ema21)-3]
 		}
 
+		// MACD(12,26,9) histogram confirmation — filters false crossovers
+		macdVal, signalVal, _ := data.ComputeMACD(c15, 12, 26, 9)
+		macdHist := macdVal - signalVal
+		if crossUp && macdHist < 0 {
+			continue // Bullish crossover but MACD bearish — skip
+		}
+		if crossDown && macdHist > 0 {
+			continue // Bearish crossover but MACD bullish — skip
+		}
+		_ = signalVal
+
 		if crossUp && isAbove200 && ema21SlopeUp {
 			stopPrice := math.Round((current-config.S1_ATR_SL_MULT*atr)*100) / 100
 			risk := current - stopPrice
@@ -568,6 +579,20 @@ func (s *ScannerAgent) ScanS3(regime string) []*Signal {
 		atr := s.DailyCache.ATR[token]
 		if atr <= 0 {
 			atr = current * 0.015
+		}
+
+		// Volume confirmation: breakout candle must have above-average volume
+		candles := s.getCandles5m(token)
+		if len(candles) >= 4 {
+			currVol := candles[len(candles)-1].Volume
+			var avgVol int64
+			for _, c := range candles[:len(candles)-1] {
+				avgVol += c.Volume
+			}
+			avgVol /= int64(len(candles) - 1)
+			if avgVol > 0 && currVol < int64(float64(avgVol)*1.5) {
+				continue // Breakout on thin volume = likely fakeout
+			}
 		}
 
 		// LONG
@@ -1058,13 +1083,16 @@ func (s *ScannerAgent) ScanS10GapFill(regime string) []*Signal {
 				continue
 			}
 			// RSI(14) confirmation: only short if RSI > 65 (overbought)
-			candles := s.getCandles5m(token)
-			if len(candles) >= 14 {
-				closes := make([]float64, len(candles))
-				for ci, c := range candles { closes[ci] = c.Close }
-				rsiSlice := data.ComputeRSI(closes, 14)
-				if rsiSlice[len(rsiSlice)-1] < 65 {
-					continue
+			// Skip before 10:00 — not enough 5-min candles for reliable RSI(14)
+			if t >= 1000 {
+				candles := s.getCandles5m(token)
+				if len(candles) >= 14 {
+					closes := make([]float64, len(candles))
+					for ci, c := range candles { closes[ci] = c.Close }
+					rsiSlice := data.ComputeRSI(closes, 14)
+					if rsiSlice[len(rsiSlice)-1] < 65 {
+						continue
+					}
 				}
 			}
 			// Price still above prev close, gap hasn't filled yet
@@ -1091,13 +1119,16 @@ func (s *ScannerAgent) ScanS10GapFill(regime string) []*Signal {
 				continue
 			}
 			// RSI(14) confirmation: only buy if RSI < 35 (oversold)
-			candles := s.getCandles5m(token)
-			if len(candles) >= 14 {
-				closes := make([]float64, len(candles))
-				for ci, c := range candles { closes[ci] = c.Close }
-				rsiSlice := data.ComputeRSI(closes, 14)
-				if rsiSlice[len(rsiSlice)-1] > 35 {
-					continue
+			// Skip before 10:00 — not enough 5-min candles for reliable RSI(14)
+			if t >= 1000 {
+				candles := s.getCandles5m(token)
+				if len(candles) >= 14 {
+					closes := make([]float64, len(candles))
+					for ci, c := range candles { closes[ci] = c.Close }
+					rsiSlice := data.ComputeRSI(closes, 14)
+					if rsiSlice[len(rsiSlice)-1] > 35 {
+						continue
+					}
 				}
 			}
 			targetPrice := math.Round(prevClose*100) / 100
@@ -1427,7 +1458,7 @@ func (s *ScannerAgent) ScanS13SectorRotation(regime string) []*Signal {
 			}
 		}
 
-		stopPrice := math.Round((current-1.0*atr)*100) / 100
+		stopPrice := math.Round((current-0.5*atr)*100) / 100
 		risk := current - stopPrice
 		if risk <= 0 {
 			continue
@@ -1438,7 +1469,7 @@ func (s *ScannerAgent) ScanS13SectorRotation(regime string) []*Signal {
 			Strategy: "S13_SECTOR_ROT", Symbol: ss.symbol, Token: ss.token, Regime: regime,
 			EntryPrice: current, StopPrice: stopPrice, TargetPrice: targetPrice,
 			RVol: ss.rvol, ATR: atr,
-			Product: "MIS", IsShort: false, MaxHoldMins: 180,
+			Product: "MIS", IsShort: false, MaxHoldMins: 45,
 			SortKey: ss.changePct * ss.rvol,
 		})
 	}
@@ -1471,7 +1502,7 @@ func (s *ScannerAgent) ScanS13SectorRotation(regime string) []*Signal {
 			}
 		}
 
-		stopPrice := math.Round((current+1.0*atr)*100) / 100
+		stopPrice := math.Round((current+0.5*atr)*100) / 100
 		risk := stopPrice - current
 		if risk <= 0 {
 			continue
@@ -1482,7 +1513,7 @@ func (s *ScannerAgent) ScanS13SectorRotation(regime string) []*Signal {
 			Strategy: "S13_SECTOR_ROT", Symbol: ss.symbol, Token: ss.token, Regime: regime,
 			EntryPrice: current, StopPrice: stopPrice, TargetPrice: targetPrice,
 			RVol: ss.rvol, ATR: atr,
-			Product: "MIS", IsShort: true, MaxHoldMins: 180,
+			Product: "MIS", IsShort: true, MaxHoldMins: 45,
 			SortKey: math.Abs(ss.changePct) * ss.rvol,
 		})
 	}
@@ -1537,8 +1568,12 @@ func (s *ScannerAgent) ScanS14RSIScalp(regime string) []*Signal {
 			atr = current * 0.015
 		}
 
-		// LONG: RSI(2) < 10 (extreme oversold) + price above VWAP (uptrend)
-		if rsi2 < float64(config.S14_RSI_OVERSOLD) && (vwap <= 0 || current > vwap) {
+		// LONG: RSI(2) < 5 (extreme oversold) + price near or above VWAP (support zone)
+		vwapProximity := 0.0
+		if vwap > 0 {
+			vwapProximity = (current - vwap) / vwap
+		}
+		if rsi2 < float64(config.S14_RSI_OVERSOLD) && (vwap <= 0 || vwapProximity > -0.003) {
 			stopPrice := math.Round(current*(1-config.S14_STOP_PCT)*100) / 100
 			risk := current - stopPrice
 			if risk <= 0 {
@@ -1555,8 +1590,8 @@ func (s *ScannerAgent) ScanS14RSIScalp(regime string) []*Signal {
 			})
 		}
 
-		// SHORT: RSI(2) > 90 (extreme overbought) + price below VWAP (downtrend)
-		if rsi2 > float64(config.S14_RSI_OVERBOUGHT) && (vwap <= 0 || current < vwap) {
+		// SHORT: RSI(2) > 95 (extreme overbought) + price near or below VWAP (resistance zone)
+		if rsi2 > float64(config.S14_RSI_OVERBOUGHT) && (vwap <= 0 || vwapProximity < 0.003) {
 			stopPrice := math.Round(current*(1+config.S14_STOP_PCT)*100) / 100
 			risk := stopPrice - current
 			if risk <= 0 {
