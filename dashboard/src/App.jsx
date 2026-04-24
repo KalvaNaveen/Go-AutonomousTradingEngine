@@ -653,7 +653,6 @@ function App() {
             { id: 'dashboard', icon: '📊', label: 'Dashboard' },
             { id: 'scanner', icon: '🔍', label: 'Scanner Feed' },
             { id: 'history', icon: '📋', label: 'Trade Journal' },
-
             { id: 'simulator', icon: '🧪', label: 'Quantum Simulator' },
           ].map(item => (
             <button key={item.id} className={`nav-item ${activeTab === item.id ? 'active' : ''}`} onClick={() => setActiveTab(item.id)}>
@@ -754,7 +753,6 @@ function App() {
 
         {activeTab === 'scanner' && <TabScanner logs={state.activity_log || []} />}
         {activeTab === 'history' && <TabJournal />}
-
         {activeTab === 'simulator' && <TabSimulator />}
 
         {activeTab === 'dashboard' && (

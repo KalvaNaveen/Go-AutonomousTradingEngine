@@ -58,8 +58,6 @@ type ScannerAgent struct {
 	s6Cooldown       map[string]time.Time
 	s3TradesToday    int
 	s3TradeDate      time.Time
-	dailyTradeCount  int
-	dailyTradeDate   time.Time
 	s6vTradesToday   int
 	s6vTradeDate     time.Time
 	s6vLastLossTime  time.Time
@@ -173,21 +171,7 @@ func (s *ScannerAgent) checkDailyTradeLimit() bool {
 	if s.CircuitBreakerTripped() {
 		return false
 	}
-	today := config.TodayIST()
-	if !s.dailyTradeDate.Equal(today) {
-		s.dailyTradeCount = 0
-		s.dailyTradeDate = today
-	}
-	return s.dailyTradeCount < config.MaxTradesPerDay
-}
-
-func (s *ScannerAgent) RegisterTrade() {
-	today := config.TodayIST()
-	if !s.dailyTradeDate.Equal(today) {
-		s.dailyTradeCount = 0
-		s.dailyTradeDate = today
-	}
-	s.dailyTradeCount++
+	return true
 }
 
 func (s *ScannerAgent) CircuitBreakerTripped() bool {
@@ -956,7 +940,7 @@ func (s *ScannerAgent) computeRVol(token uint32) float64 {
 
 // MinNetProfitPerTrade is the minimum expected net profit after ALL charges.
 // Trades that can't clear this hurdle are rejected — they create churn, not wealth.
-const MinNetProfitPerTrade = 15.0 // Rs. 15 minimum net profit (lowered from 50 to allow scalps)
+const MinNetProfitPerTrade = 50.0 // Rs. 50 minimum net profit (raised from 15 — with 0.5% risk, positions are large enough)
 
 // FilterByNetProfit rejects signals whose expected profit at target doesn't cover charges.
 // This single filter eliminates 60-70% of marginal trades that historically lost money.
@@ -1568,12 +1552,12 @@ func (s *ScannerAgent) ScanS14RSIScalp(regime string) []*Signal {
 			atr = current * 0.015
 		}
 
-		// LONG: RSI(2) < 5 (extreme oversold) + price near or above VWAP (support zone)
+		// LONG: RSI(2) < 5 (extreme oversold) + price near or BELOW VWAP (buy the dip)
 		vwapProximity := 0.0
 		if vwap > 0 {
 			vwapProximity = (current - vwap) / vwap
 		}
-		if rsi2 < float64(config.S14_RSI_OVERSOLD) && (vwap <= 0 || vwapProximity > -0.003) {
+		if rsi2 < float64(config.S14_RSI_OVERSOLD) && (vwap <= 0 || vwapProximity < 0.003) {
 			stopPrice := math.Round(current*(1-config.S14_STOP_PCT)*100) / 100
 			risk := current - stopPrice
 			if risk <= 0 {
@@ -1590,8 +1574,8 @@ func (s *ScannerAgent) ScanS14RSIScalp(regime string) []*Signal {
 			})
 		}
 
-		// SHORT: RSI(2) > 95 (extreme overbought) + price near or below VWAP (resistance zone)
-		if rsi2 > float64(config.S14_RSI_OVERBOUGHT) && (vwap <= 0 || vwapProximity < 0.003) {
+		// SHORT: RSI(2) > 95 (extreme overbought) + price near or ABOVE VWAP (short the pump)
+		if rsi2 > float64(config.S14_RSI_OVERBOUGHT) && (vwap <= 0 || vwapProximity > -0.003) {
 			stopPrice := math.Round(current*(1+config.S14_STOP_PCT)*100) / 100
 			risk := stopPrice - current
 			if risk <= 0 {
@@ -1716,8 +1700,17 @@ func (s *ScannerAgent) ScanS15RSISwing(regime string) []*Signal {
 
 // RunAllScans executes all strategies and returns combined signals
 // FILTERED by net profitability — no signal reaches execution unless it
-// can produce ≥₹15 net profit after ALL Zerodha charges.
+// can produce ≥₹50 net profit after ALL Zerodha charges.
 func (s *ScannerAgent) RunAllScans(regime string) []*Signal {
+	// Last entry time enforcement: no new signals after 14:50
+	if !s.SimulatorMode {
+		now := config.NowIST()
+		t := now.Hour()*100 + now.Minute()
+		leh, lem := config.ParseTime(config.LastEntryTime)
+		if t > leh*100+lem {
+			return nil
+		}
+	}
 	return s.RunStrategyScans(regime, nil)
 }
 
@@ -1727,19 +1720,26 @@ func (s *ScannerAgent) RunStrategyScans(regime string, strategies []string) []*S
 	var all []*Signal
 
 	// Mapping of strategy names to their execution functions
+	// Pruned based on ACTUAL P&L data from journal.db (not gut feel):
+	//   S8_MACRO: +₹232 (ONLY profitable strategy) → KEEP
+	//   S12_EOD:  -₹76  → DISABLE (marginal loss, low conviction)
+	//   S10_GAP:  -₹885 → DISABLE (high loss)
+	//   S13_ROT:  -₹688 → DISABLE (consistent loser)
+	//   S6_TREND: -₹1855 (WORST strategy, 22% WR) → DISABLE
+	//   S1, S2, S9: never traded → DISABLE (unproven)
 	strategyMap := map[string]func(string) []*Signal{
-		"S1_MA_CROSS":      s.ScanS1,
-		"S2_BB_MEAN_REV":   s.ScanS2,
+		// "S1_MA_CROSS":      s.ScanS1,            // Never traded — unproven
+		// "S2_BB_MEAN_REV":   s.ScanS2,            // Never traded — unproven
 		"S3_ORB":           s.ScanS3,
-		"S6_TREND_SHORT":   s.ScanS6TrendShort,
+		// "S6_TREND_SHORT":   s.ScanS6TrendShort,  // -₹1855, 22% WR — WORST strategy
 		"S6_VWAP_BAND":     s.ScanS6VWAP,
 		"S7_MEAN_REV_LONG": s.ScanS7,
-		"S8_VOL_PIVOT":     s.ScanS8,
-		"S9_MTF_MOMENTUM":  s.ScanS9,
-		"S10_GAP_FILL":     s.ScanS10GapFill,
+		"S8_VOL_PIVOT":     s.ScanS8,               // +₹232 — ONLY profitable strategy
+		// "S9_MTF_MOMENTUM":  s.ScanS9,            // Never traded — unproven
+		// "S10_GAP_FILL":     s.ScanS10GapFill,    // -₹885, 44% WR
 		"S11_VWAP_REVERT":  s.ScanS11VWAPRevert,
-		"S12_EOD_REVERT":   s.ScanS12EODReversion,
-		"S13_SECTOR_ROT":   s.ScanS13SectorRotation,
+		// "S12_EOD_REVERT":   s.ScanS12EODReversion, // -₹76
+		// "S13_SECTOR_ROT":   s.ScanS13SectorRotation, // -₹688, 36% WR
 		"S14_RSI_SCALP":    s.ScanS14RSIScalp,
 		"S15_RSI_SWING":    s.ScanS15RSISwing,
 	}

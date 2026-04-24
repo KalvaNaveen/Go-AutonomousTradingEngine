@@ -16,13 +16,13 @@ func main() {
 	}
 	defer db.Close()
 
-	fmt.Println("=== ALL TRADES FOR 2026-04-22 ===")
+	fmt.Println("=== ALL TRADES FOR 2026-04-24 ===")
 	fmt.Printf("%-4s %-14s %-8s %-15s %-10s %-10s %-10s %-4s %-20s %-10s\n",
 		"ID", "SYMBOL", "STRATEGY", "ENTRY TIME", "ENTRY", "EXIT", "PnL", "QTY", "EXIT_REASON", "MINS")
 	fmt.Println("---- -------------- -------- --------------- ---------- ---------- ---------- ---- -------------------- ----------")
 
 	rows, _ := db.Query(`SELECT id, symbol, strategy, entry_time, entry_price, full_exit_price, gross_pnl, qty, exit_reason, hold_minutes
-		FROM trades WHERE date = '2026-04-22' ORDER BY entry_time`)
+		FROM trades WHERE date = '2026-04-24' ORDER BY entry_time`)
 	if rows == nil {
 		fmt.Println("No rows returned from query")
 		return

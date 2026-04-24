@@ -52,11 +52,19 @@ func (j *Journal) initDB() {
 			stop_hit          INTEGER DEFAULT 0,
 			time_stop_hit     INTEGER DEFAULT 0,
 			exit_reason       TEXT, hold_minutes REAL,
-			daily_pnl_after   REAL
+			daily_pnl_after   REAL,
+			rsi               REAL DEFAULT 0,
+			adx               REAL DEFAULT 0,
+			vix               REAL DEFAULT 0,
+			ad_ratio          REAL DEFAULT 0
 		)
 	`)
 
 	db.Exec("ALTER TABLE trades ADD COLUMN entry_time TEXT")
+	db.Exec("ALTER TABLE trades ADD COLUMN rsi REAL DEFAULT 0")
+	db.Exec("ALTER TABLE trades ADD COLUMN adx REAL DEFAULT 0")
+	db.Exec("ALTER TABLE trades ADD COLUMN vix REAL DEFAULT 0")
+	db.Exec("ALTER TABLE trades ADD COLUMN ad_ratio REAL DEFAULT 0")
 
 	db.Exec("CREATE INDEX IF NOT EXISTS idx_trades_date ON trades(date)")
 	db.Exec("CREATE INDEX IF NOT EXISTS idx_trades_strategy ON trades(strategy, date)")
@@ -99,6 +107,10 @@ type TradeLog struct {
 	Regime           string
 	RVol             float64
 	DeviationPct     float64
+	RSI              float64
+	ADX              float64
+	VIX              float64
+	ADRatio          float64
 	EntryPrice       float64
 	PartialExitPrice float64
 	PartialExitQty   int
@@ -137,8 +149,8 @@ func (j *Journal) LogTrade(t *TradeLog) {
 		(timestamp, date, entry_time, symbol, strategy, regime, rvol, deviation_pct,
 		 entry_price, partial_exit_price, partial_exit_qty,
 		 full_exit_price, qty, gross_pnl, stop_hit, time_stop_hit,
-		 exit_reason, hold_minutes, daily_pnl_after)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+		 exit_reason, hold_minutes, daily_pnl_after, rsi, adx, vix, ad_ratio)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 	`,
 		now.Format(time.RFC3339), now.Format("2006-01-02"),
 		t.EntryTime.Format(time.RFC3339),
@@ -146,6 +158,7 @@ func (j *Journal) LogTrade(t *TradeLog) {
 		t.EntryPrice, t.PartialExitPrice, t.PartialExitQty,
 		t.FullExitPrice, t.Qty, t.GrossPnl,
 		stopHit, timeStopHit, t.ExitReason, hold, t.DailyPnlAfter,
+		t.RSI, t.ADX, t.VIX, t.ADRatio,
 	)
 }
 
@@ -166,6 +179,10 @@ func (j *Journal) LogExit(trade *Trade, exitPrice float64, reason string) {
 		Regime:        trade.Regime,
 		RVol:          trade.RVol,
 		DeviationPct:  trade.DeviationPct,
+		RSI:           trade.RSI,
+		ADX:           trade.ADX,
+		VIX:           trade.VIX,
+		ADRatio:       trade.ADRatio,
 		EntryPrice:    trade.EntryPrice,
 		FullExitPrice: exitPrice,
 		Qty:           qty,

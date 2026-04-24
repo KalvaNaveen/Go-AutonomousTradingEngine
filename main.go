@@ -313,10 +313,7 @@ func main() {
 			scanner.RecordPnl(pnl) // Ensure scanner circuit breaker is aware
 		}
 		if trades, ok := summary["total_trades"].(int); ok {
-			// Register previously taken trades on Scanner to respect MaxTradesPerDay
-			for i := 0; i < trades; i++ {
-				scanner.RegisterTrade()
-			}
+			_ = trades // Previously tracked MaxTradesPerDay here
 		}
 		if stopped, ok := summary["engine_stopped"].(bool); ok && stopped {
 			risk.EngineStopped = true

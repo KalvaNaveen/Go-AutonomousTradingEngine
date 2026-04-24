@@ -50,7 +50,7 @@ func NewVaREngine(capital float64) *VaREngine {
 	return &VaREngine{
 		DailyReturns: make(map[uint32][]float64),
 		Capital:      capital,
-		Enabled:      true,
+		Enabled:      false,
 	}
 }
 
@@ -86,9 +86,9 @@ func (v *VaREngine) LoadHistoricalReturns(closesMap map[uint32][]float64) {
 // ComputePortfolioVaR calculates the current portfolio's 1-day 95% VaR
 func (v *VaREngine) ComputePortfolioVaR(positions []VaRPosition) (varRs float64, varPct float64) {
 	v.mu.RLock()
-	defer v.mu.RUnlock()
 
 	if len(positions) == 0 || len(v.DailyReturns) == 0 {
+		v.mu.RUnlock()
 		return 0, 0
 	}
 
@@ -114,6 +114,7 @@ func (v *VaREngine) ComputePortfolioVaR(positions []VaRPosition) (varRs float64,
 	}
 
 	if totalNotional == 0 {
+		v.mu.RUnlock()
 		return 0, 0
 	}
 
@@ -131,6 +132,7 @@ func (v *VaREngine) ComputePortfolioVaR(positions []VaRPosition) (varRs float64,
 	}
 
 	if minObs < 5 {
+		v.mu.RUnlock()
 		return 0, 0
 	}
 
@@ -147,6 +149,8 @@ func (v *VaREngine) ComputePortfolioVaR(positions []VaRPosition) (varRs float64,
 			portfolioReturns[i] += weight * returns[offset+i]
 		}
 	}
+
+	v.mu.RUnlock() // Release read lock before sorting (no shared state accessed below)
 
 	// Step 3: Sort and find VaR percentile
 	sorted := make([]float64, len(portfolioReturns))
@@ -169,12 +173,11 @@ func (v *VaREngine) ComputePortfolioVaR(positions []VaRPosition) (varRs float64,
 	varRs = math.Abs(varReturn * totalNotional)
 	varPct = varRs / v.Capital * 100
 
-	v.mu.RUnlock()
+	// Store results under write lock (separate scope — no lock upgrade)
 	v.mu.Lock()
 	v.LastVaR = varRs
 	v.LastVaRPct = varPct
 	v.mu.Unlock()
-	v.mu.RLock()
 
 	return varRs, varPct
 }

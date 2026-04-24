@@ -314,6 +314,10 @@ func (s *Server) handlePnlSummary(w http.ResponseWriter, r *http.Request) {
 	monthStart := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, now.Location()).Format("2006-01-02")
 	monthlyBreakdown := s.journal.GetPnlBreakdown(monthStart, today)
 
+	// Yearly: 1st of January of current year → today
+	yearStart := time.Date(now.Year(), 1, 1, 0, 0, 0, 0, now.Location()).Format("2006-01-02")
+	yearlyBreakdown := s.journal.GetPnlBreakdown(yearStart, today)
+
 	// Aggregate weekly totals
 	wPnl, wTrades, wWins := 0.0, 0, 0
 	for _, d := range weeklyBreakdown {
@@ -330,6 +334,14 @@ func (s *Server) handlePnlSummary(w http.ResponseWriter, r *http.Request) {
 		mWins += d["wins"].(int)
 	}
 
+	// Aggregate yearly totals
+	yPnl, yTrades, yWins := 0.0, 0, 0
+	for _, d := range yearlyBreakdown {
+		yPnl += d["pnl"].(float64)
+		yTrades += d["trades"].(int)
+		yWins += d["wins"].(int)
+	}
+
 	writeJSON(w, map[string]interface{}{
 		"weekly": map[string]interface{}{
 			"pnl": wPnl, "trades": wTrades, "wins": wWins, "losses": wTrades - wWins,
@@ -340,6 +352,11 @@ func (s *Server) handlePnlSummary(w http.ResponseWriter, r *http.Request) {
 			"pnl": mPnl, "trades": mTrades, "wins": mWins, "losses": mTrades - mWins,
 			"from": monthStart, "to": today,
 			"breakdown": monthlyBreakdown,
+		},
+		"yearly": map[string]interface{}{
+			"pnl": yPnl, "trades": yTrades, "wins": yWins, "losses": yTrades - yWins,
+			"from": yearStart, "to": today,
+			"breakdown": yearlyBreakdown,
 		},
 	})
 }

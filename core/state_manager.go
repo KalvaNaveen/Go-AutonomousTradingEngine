@@ -12,27 +12,32 @@ import (
 )
 
 // StateManager persists all active trade state to SQLite.
-// Exact port of Python core/state_manager.py
+// Uses a persistent connection pool for performance.
 type StateManager struct {
 	dbPath string
+	db     *sql.DB
 }
 
 func NewStateManager() *StateManager {
 	sm := &StateManager{dbPath: config.StateDB}
+	db, err := sql.Open("sqlite", sm.dbPath)
+	if err != nil {
+		log.Printf("[StateManager] DB open error: %v", err)
+	} else {
+		db.SetMaxOpenConns(1) // SQLite only supports one writer
+		db.Exec("PRAGMA journal_mode=WAL")
+		db.Exec("PRAGMA busy_timeout=5000")
+		sm.db = db
+	}
 	sm.initDB()
 	return sm
 }
 
 func (sm *StateManager) initDB() {
-	db, err := sql.Open("sqlite", sm.dbPath)
-	if err != nil {
-		log.Printf("[StateManager] DB open error: %v", err)
+	if sm.db == nil {
 		return
 	}
-	defer db.Close()
-
-	db.Exec("PRAGMA journal_mode=WAL")
-	db.Exec("PRAGMA busy_timeout=3000")
+	db := sm.db
 
 	db.Exec(`
 		CREATE TABLE IF NOT EXISTS active_positions (
@@ -64,7 +69,11 @@ func (sm *StateManager) initDB() {
 			market_status   TEXT DEFAULT '',
 			weeks_no_progress INTEGER DEFAULT 0,
 			token           INTEGER DEFAULT 0,
-			is_short        INTEGER DEFAULT 0
+			is_short        INTEGER DEFAULT 0,
+			rsi             REAL DEFAULT 0,
+			adx             REAL DEFAULT 0,
+			vix             REAL DEFAULT 0,
+			ad_ratio        REAL DEFAULT 0
 		)
 	`)
 
@@ -84,6 +93,10 @@ func (sm *StateManager) initDB() {
 		{"weeks_no_progress", "INTEGER DEFAULT 0"},
 		{"token", "INTEGER DEFAULT 0"},
 		{"is_short", "INTEGER DEFAULT 0"},
+		{"rsi", "REAL DEFAULT 0"},
+		{"adx", "REAL DEFAULT 0"},
+		{"vix", "REAL DEFAULT 0"},
+		{"ad_ratio", "REAL DEFAULT 0"},
 	}
 	for _, m := range migrations {
 		db.Exec(fmt.Sprintf("ALTER TABLE active_positions ADD COLUMN %s %s", m.col, m.def))
@@ -112,6 +125,10 @@ type Trade struct {
 	EntryDate     time.Time
 	RVol          float64
 	DeviationPct  float64
+	RSI           float64
+	ADX           float64
+	VIX           float64
+	ADRatio       float64
 	TrailStop     float64
 	PyramidAdded  int
 	RSScore       int
@@ -126,11 +143,9 @@ type Trade struct {
 }
 
 func (sm *StateManager) Save(entryOID string, t *Trade) {
-	db, err := sql.Open("sqlite", sm.dbPath)
-	if err != nil {
+	if sm.db == nil {
 		return
 	}
-	defer db.Close()
 
 	now := config.NowIST().Format(time.RFC3339)
 	pf := 0
@@ -143,9 +158,9 @@ func (sm *StateManager) Save(entryOID string, t *Trade) {
 		isShortInt = 1
 	}
 
-	db.Exec(`
+	sm.db.Exec(`
 		INSERT OR REPLACE INTO active_positions VALUES
-		(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+		(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 	`,
 		entryOID, t.Symbol, t.Strategy, t.Product, t.Regime,
 		t.EntryPrice, t.StopPrice, t.PartialTarget, t.TargetPrice,
@@ -154,18 +169,16 @@ func (sm *StateManager) Save(entryOID string, t *Trade) {
 		t.EntryTime.Format(time.RFC3339), t.EntryDate.Format("2006-01-02"),
 		t.RVol, t.DeviationPct, "OPEN", now,
 		t.TrailStop, t.PyramidAdded, t.RSScore, t.MarketStatus,
-		t.WeeksNoProg, t.Token, isShortInt,
+		t.WeeksNoProg, t.Token, isShortInt, t.RSI, t.ADX, t.VIX, t.ADRatio,
 	)
 }
 
 func (sm *StateManager) MarkPartialFilled(entryOID string, remainingQty int) {
-	db, err := sql.Open("sqlite", sm.dbPath)
-	if err != nil {
+	if sm.db == nil {
 		return
 	}
-	defer db.Close()
 
-	db.Exec(`
+	sm.db.Exec(`
 		UPDATE active_positions
 		SET partial_filled=1, remaining_qty=?, last_updated=?
 		WHERE entry_oid=?
@@ -173,13 +186,11 @@ func (sm *StateManager) MarkPartialFilled(entryOID string, remainingQty int) {
 }
 
 func (sm *StateManager) Close(entryOID string) {
-	db, err := sql.Open("sqlite", sm.dbPath)
-	if err != nil {
+	if sm.db == nil {
 		return
 	}
-	defer db.Close()
 
-	db.Exec(`
+	sm.db.Exec(`
 		UPDATE active_positions
 		SET status='CLOSED', last_updated=?
 		WHERE entry_oid=?
@@ -187,23 +198,19 @@ func (sm *StateManager) Close(entryOID string) {
 }
 
 func (sm *StateManager) SetKV(key, value string) {
-	db, err := sql.Open("sqlite", sm.dbPath)
-	if err != nil {
+	if sm.db == nil {
 		return
 	}
-	defer db.Close()
-	db.Exec("INSERT OR REPLACE INTO kv_store VALUES (?,?)", key, value)
+	sm.db.Exec("INSERT OR REPLACE INTO kv_store VALUES (?,?)", key, value)
 }
 
 func (sm *StateManager) GetKV(key, defaultVal string) string {
-	db, err := sql.Open("sqlite", sm.dbPath)
-	if err != nil {
+	if sm.db == nil {
 		return defaultVal
 	}
-	defer db.Close()
 
 	var val string
-	err = db.QueryRow("SELECT value FROM kv_store WHERE key=?", key).Scan(&val)
+	err := sm.db.QueryRow("SELECT value FROM kv_store WHERE key=?", key).Scan(&val)
 	if err != nil {
 		return defaultVal
 	}
@@ -211,14 +218,12 @@ func (sm *StateManager) GetKV(key, defaultVal string) string {
 }
 
 func (sm *StateManager) LoadOpenPositions() []*Trade {
-	db, err := sql.Open("sqlite", sm.dbPath)
-	if err != nil {
+	if sm.db == nil {
 		return nil
 	}
-	defer db.Close()
 
 	cutoff := config.TodayIST().AddDate(0, 0, -1).Format("2006-01-02")
-	rows, err := db.Query(`
+	rows, err := sm.db.Query(`
 		SELECT entry_oid, symbol, strategy, product, COALESCE(regime,''),
 		       entry_price, stop_price, COALESCE(partial_target,0), target_price,
 		       qty, partial_qty, remaining_qty, partial_filled,
@@ -228,7 +233,9 @@ func (sm *StateManager) LoadOpenPositions() []*Trade {
 		       CAST(COALESCE(NULLIF(trail_stop,''),0) AS REAL), CAST(COALESCE(NULLIF(pyramid_added,''),0) AS INTEGER),
 		       CAST(COALESCE(NULLIF(rs_score,''),0) AS INTEGER), COALESCE(market_status,''),
 		       CAST(COALESCE(NULLIF(weeks_no_progress,''),0) AS INTEGER), CAST(COALESCE(NULLIF(token,''),0) AS INTEGER),
-		       CAST(COALESCE(NULLIF(is_short,''),0) AS INTEGER)
+		       CAST(COALESCE(NULLIF(is_short,''),0) AS INTEGER),
+		       CAST(COALESCE(NULLIF(rsi,''),0) AS REAL), CAST(COALESCE(NULLIF(adx,''),0) AS REAL),
+		       CAST(COALESCE(NULLIF(vix,''),0) AS REAL), CAST(COALESCE(NULLIF(ad_ratio,''),0) AS REAL)
 		FROM active_positions
 		WHERE status='OPEN' AND entry_date >= ?
 		ORDER BY entry_time ASC
@@ -252,6 +259,7 @@ func (sm *StateManager) LoadOpenPositions() []*Trade {
 			&t.RVol, &t.DeviationPct,
 			&t.TrailStop, &t.PyramidAdded, &t.RSScore, &t.MarketStatus,
 			&t.WeeksNoProg, &t.Token, &isShortInt,
+			&t.RSI, &t.ADX, &t.VIX, &t.ADRatio,
 		)
 		if err != nil {
 			continue

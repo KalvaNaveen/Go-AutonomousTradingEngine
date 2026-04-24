@@ -91,8 +91,10 @@ func (e *ExecutionAgent) Execute(sig *Signal, regime string) bool {
 	}
 	e.Mu.RUnlock()
 
-	// ═══ ENFORCE 50-POINT MAX STOP LOSS ═══
-	maxSL := 50.0
+	// ═══ ENFORCE PERCENTAGE-BASED MAX STOP LOSS ═══
+	// Use 2% of entry price or ₹50, whichever is larger.
+	// A flat 50-pt cap causes false stop-outs on stocks above ₹2500.
+	maxSL := max64(sig.EntryPrice*0.02, 50.0)
 	if sig.IsShort {
 		if sig.StopPrice - sig.EntryPrice > maxSL {
 			sig.StopPrice = sig.EntryPrice + maxSL
@@ -176,6 +178,10 @@ func (e *ExecutionAgent) Execute(sig *Signal, regime string) bool {
 		EntryTime:     now,
 		EntryDate:     config.TodayIST(),
 		RVol:          sig.RVol,
+		RSI:           sig.RSI,
+		ADX:           sig.ADX,
+		VIX:           e.Scanner.GetCurrentVIX(),
+		ADRatio:       e.Scanner.GetCurrentADRatio(),
 		MaxHoldMins:   sig.MaxHoldMins,
 	}
 
@@ -352,7 +358,7 @@ func (e *ExecutionAgent) MonitorPositions(regime string) {
 			strings.HasPrefix(trade.Strategy, "S14_") ||
 			strings.HasPrefix(trade.Strategy, "S15_")
 
-		decayLimit := 30.0
+		decayLimit := 60.0 // 60 minutes for momentum strategies (was 30 — too aggressive, cuts breakouts)
 		if !isMomentum {
 			decayLimit = 120.0 // Give mean reverting / sectoral trades 2 hours to breathe
 		}
@@ -395,9 +401,12 @@ func (e *ExecutionAgent) MonitorPositions(regime string) {
 
 		// ═══ LAYER 4: DYNAMIC NET-PROFIT EXIT ═══
 		// Exit when net profit (after ALL charges) reaches a meaningful threshold
-		// Scaled by position size: max(₹500, 1.5% of position value)
-		positionValue := trade.EntryPrice * float64(actQty)
-		minNetTarget := max64(500.0, positionValue*0.015)
+		// Scaled by risk: max(₹150, 2× the initial risk amount)
+		initRiskAmt := initialRisk * float64(actQty)
+		if initRiskAmt <= 0 {
+			initRiskAmt = 150.0
+		}
+		minNetTarget := max64(150.0, initRiskAmt*2.0)
 
 		if netPnl >= minNetTarget {
 			log.Printf("[Exec] NET_PROFIT_EXIT: %s net=₹%.0f (gross=₹%.0f charges=₹%.0f)",

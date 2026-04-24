@@ -102,13 +102,12 @@ var TotalCapital = envFloat("TRADING_CAPITAL", 100000)
 
 // ── Risk — Adaptive Intraday System ─────────────────────────
 const (
-	MaxRiskPerTradePct = 0.005
-	DailyLossLimitPct  = 0.06
-	MaxConsecutiveLosses = 15
-	MaxOpenPositions   = 20
-	MaxPositionsPerStrat = 5
+	MaxRiskPerTradePct = 0.005  // 0.5% of capital per trade (was 0.05% — too small to cover charges)
+	DailyLossLimitPct  = 0.04  // 4% daily loss limit (was 6% — tighter circuit breaker with larger sizing)
+	MaxConsecutiveLosses = 8   // Stop after 8 consecutive losses (was 15)
+	MaxOpenPositions   = 10    // Max 10 concurrent positions (was 20 — focus capital on best setups)
+	MaxPositionsPerStrat = 3   // Max 3 per strategy (was 5)
 	MaxPositionPct     = 0.15
-	MaxTradesPerDay    = 100
 	EODSquareoffTime   = "15:15"
 	EODSquareoffFinal  = "15:15"
 	PreemptiveExitTime = "14:50"
