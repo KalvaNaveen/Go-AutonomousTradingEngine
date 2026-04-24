@@ -389,7 +389,7 @@ func main() {
 		config.NowIST().Format("15:04:05"))
 
 	agents.SendTelegram(fmt.Sprintf(
-		"🚀 *BNF GO ENGINE v2.0*\nMode: `%s`\nCapital: `₹%.0f`\nUniverse: `%d stocks`\nStrategies: `12 (S1-S13)`\nML Filter: `%v (acc=%.0f%%)`\nMin Net Profit: `₹50/trade`\nInit: `%dμs`",
+		"🚀 *QUANTIX ENGINE v2.0*\nMode: `%s`\nCapital: `₹%.0f`\nUniverse: `%d stocks`\nStrategies: `12 (S1-S13)`\nML Filter: `%v (acc=%.0f%%)`\nMin Net Profit: `₹50/trade`\nInit: `%dμs`",
 		map[bool]string{true: "PAPER", false: "LIVE"}[config.PaperMode],
 		risk.TotalCapital, len(dataAgent.Universe),
 		mlFilter.Trained, mlFilter.Accuracy, initTime))

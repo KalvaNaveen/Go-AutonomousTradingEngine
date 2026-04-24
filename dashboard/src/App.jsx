@@ -638,9 +638,9 @@ function App() {
       {/* ─── SIDEBAR ────────────────────────── */}
       <div className="sidebar">
         <div className="sidebar-brand">
-          <div className="brand-icon">₿NF</div>
+          <div className="brand-icon">QTX</div>
           <div>
-            <h1>BNF Engine</h1>
+            <h1>Quantix Engine</h1>
             <span>Quantum Terminal v2.0</span>
           </div>
         </div>

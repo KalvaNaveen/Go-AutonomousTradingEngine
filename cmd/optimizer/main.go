@@ -57,7 +57,7 @@ func main() {
 	config.Reload()
 
 	fmt.Println("══════════════════════════════════════════════════════════")
-	fmt.Println("  BNF STRATEGY OPTIMIZER — Grid Search Over 180 Days")
+	fmt.Println("  QUANTIX STRATEGY OPTIMIZER — Grid Search Over 180 Days")
 	fmt.Printf("  Capital: ₹%.0f | Target: ≥%.1f%% monthly return\n", config.TotalCapital, TargetMonthlyPct)
 	fmt.Printf("  BaseDir: %s\n", config.BaseDir)
 	fmt.Printf("  Date Range: %s to %s\n",

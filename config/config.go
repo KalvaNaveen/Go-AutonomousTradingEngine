@@ -314,7 +314,7 @@ func ParseTime(s string) (int, int) {
 
 func PrintBanner() {
 	fmt.Println("═══════════════════════════════════════════")
-	fmt.Println("  BNF GO ENGINE v1.0 — Full Native Golang")
+	fmt.Println("  QUANTIX ENGINE v2.0 — Full Native Golang")
 	fmt.Println("  Ultra HFT Nanosecond Trading Platform")
 	fmt.Println("═══════════════════════════════════════════")
 	if PaperMode {

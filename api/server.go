@@ -143,7 +143,7 @@ func (s *Server) buildHealthData() map[string]interface{} {
 
 	return map[string]interface{}{
 		"status":       "running",
-		"engine":       "BNF Go Engine v1.0",
+		"engine":       "Quantix Engine v2.0",
 		"uptime":       fmt.Sprintf("%dh %dm %ds", int(time.Since(s.startTime).Hours()), int(time.Since(s.startTime).Minutes())%60, int(time.Since(s.startTime).Seconds())%60),
 		"paper_mode":   config.PaperMode,
 		"ws_connected": wsConnected,
