@@ -61,8 +61,7 @@ func (r *RiskAgent) ApproveTrade(signal map[string]interface{}) (bool, string) {
 	}
 
 	strategy, _ := signal["strategy"].(string)
-	// regime unused but extracted for parity
-	//regime, _ := signal["regime"].(string)
+	regime, _ := signal["regime"].(string)
 
 	// Cooldown file check
 	cooldownFile := config.BaseDir + string(os.PathSeparator) + "data" + string(os.PathSeparator) + "cooldown.txt"
@@ -183,6 +182,9 @@ func (r *RiskAgent) ApproveTrade(signal map[string]interface{}) (bool, string) {
 		if rr < 0.5 {
 			return false, fmt.Sprintf("MR_RR_%.2f_BELOW_0.5", rr)
 		}
+	} else if regime == "CHOP" && rr < 1.5 {
+		// Strict RR enforcement in sideways markets
+		return false, fmt.Sprintf("CHOP_RR_%.2f_BELOW_1.5", rr)
 	} else if rr < 1.0 {
 		return false, fmt.Sprintf("RR_%.2f_BELOW_1.0", rr)
 	}
@@ -193,7 +195,7 @@ func (r *RiskAgent) ApproveTrade(signal map[string]interface{}) (bool, string) {
 func (r *RiskAgent) CalculatePositionSize(entry, stop float64, regime, strategy, symbol string) int {
 	baseScale := map[string]float64{
 		"BULL": 1.0, "NORMAL": 1.0, "VOLATILE": 0.75,
-		"BEAR_PANIC": 0.45, "EXTREME_PANIC": 0.25, "CHOP": 0.80,
+		"BEAR_PANIC": 0.45, "EXTREME_PANIC": 0.25, "CHOP": 0.30,
 	}
 	scale := baseScale[regime]
 	if scale == 0 {

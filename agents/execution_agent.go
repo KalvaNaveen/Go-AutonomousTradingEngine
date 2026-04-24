@@ -35,9 +35,9 @@ type ExecutionAgent struct {
 
 func NewExecutionAgent(risk *RiskAgent, journal *core.Journal, state *core.StateManager) *ExecutionAgent {
 	return &ExecutionAgent{
-		Risk:         risk,
-		Journal:      journal,
-		State:        state,
+		Risk:           risk,
+		Journal:        journal,
+		State:          state,
 		ActiveTrades:   make(map[string]*core.Trade),
 		lastExitTime:   make(map[string]time.Time),
 		lastExitReason: make(map[string]string),
@@ -90,6 +90,18 @@ func (e *ExecutionAgent) Execute(sig *Signal, regime string) bool {
 		}
 	}
 	e.Mu.RUnlock()
+
+	// ═══ ENFORCE 50-POINT MAX STOP LOSS ═══
+	maxSL := 50.0
+	if sig.IsShort {
+		if sig.StopPrice - sig.EntryPrice > maxSL {
+			sig.StopPrice = sig.EntryPrice + maxSL
+		}
+	} else {
+		if sig.EntryPrice - sig.StopPrice > maxSL {
+			sig.StopPrice = sig.EntryPrice - maxSL
+		}
+	}
 
 	approved, reason := e.Risk.ApproveTrade(map[string]interface{}{
 		"strategy":     sig.Strategy,
@@ -254,13 +266,13 @@ func (e *ExecutionAgent) MonitorPositions(regime string) {
 		lockedFloor := -999999.0 // No floor by default
 		switch {
 		case trade.PeakPnl >= 400:
-			lockedFloor = 280.0 // Reached ₹400+ → lock ₹280 (after slippage ~₹250+)
+			lockedFloor = 380.0 // Reached ₹400+ → lock ₹280 (after slippage ~₹250+)
 		case trade.PeakPnl >= 300:
-			lockedFloor = 180.0 // Reached ₹300+ → lock ₹180 (after slippage ~₹150+)
+			lockedFloor = 280.0 // Reached ₹300+ → lock ₹180 (after slippage ~₹150+)
 		case trade.PeakPnl >= 200:
-			lockedFloor = 130.0 // Reached ₹200+ → lock ₹130 (after slippage ~₹100+)
+			lockedFloor = 180.0 // Reached ₹200+ → lock ₹130 (after slippage ~₹100+)
 		case trade.PeakPnl >= 100:
-			lockedFloor = 30.0 // Reached ₹100+ → lock ₹30 (after slippage still net positive)
+			lockedFloor = 80.0 // Reached ₹100+ → lock ₹30 (after slippage still net positive)
 		}
 
 		if lockedFloor > -999999.0 && netPnl <= lockedFloor {
