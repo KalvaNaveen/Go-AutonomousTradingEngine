@@ -4,9 +4,6 @@ import (
 	"fmt"
 	"log"
 	"math"
-	"os"
-	"strconv"
-	"strings"
 	"time"
 
 	"bnf_go_engine/config"
@@ -60,55 +57,35 @@ func (r *RiskAgent) ApproveTrade(signal map[string]interface{}) (bool, string) {
 		return false, fmt.Sprintf("ENGINE_STOPPED: %s", r.StopReason)
 	}
 
-	strategy, _ := signal["strategy"].(string)
-	regime, _ := signal["regime"].(string)
-
-	// Cooldown file check
-	cooldownFile := config.BaseDir + string(os.PathSeparator) + "data" + string(os.PathSeparator) + "cooldown.txt"
-	if data, err := os.ReadFile(cooldownFile); err == nil {
-		if expiry, err := strconv.ParseFloat(strings.TrimSpace(string(data)), 64); err == nil {
-			if float64(time.Now().Unix()) < expiry {
-				r.EngineStopped = true
-				return false, "ENFORCED_3_DAY_COOLDOWN"
-			}
-		}
-	}
-
-	// Weekly drawdown
-	weeklyDrawdownPct := 0.08
-	if r.WeeklyPnl <= -(r.ActiveCapital * weeklyDrawdownPct) {
-		r.EngineStopped = true
-		r.StopReason = "WEEKLY_DRAWDOWN_8%"
-		os.MkdirAll(config.BaseDir+string(os.PathSeparator)+"data", 0755)
-		os.WriteFile(cooldownFile,
-			[]byte(strconv.FormatFloat(float64(time.Now().Unix())+3*24*3600, 'f', 0, 64)),
-			0644)
-		return false, r.StopReason
-	}
-
-	// Sector check (simplified — full implementation requires DataAgent reference)
-	// TODO: port sector check when DataAgent is fully integrated
-
-	// VIX check would go here when data agent is connected
-	// Skipped for now — will be wired once DataAgent is ported
-
-	// Daily loss limit
-	if r.DailyPnl <= -(r.ActiveCapital * config.DailyLossLimitPct) {
-		r.EngineStopped = true
-		r.StopReason = fmt.Sprintf("DAILY_LOSS_LIMIT Rs.%.0f", math.Abs(r.DailyPnl))
-		return false, r.StopReason
-	}
-
-	// Consecutive losses
+	// Consecutive loss circuit breaker
 	if r.ConsecutiveLosses >= config.MaxConsecutiveLosses {
 		r.EngineStopped = true
-		r.StopReason = fmt.Sprintf("%d_CONSECUTIVE_LOSSES", config.MaxConsecutiveLosses)
+		r.StopReason = fmt.Sprintf("%d_CONSECUTIVE_LOSSES", r.ConsecutiveLosses)
+		return false, r.StopReason
+	}
+
+	// Daily loss circuit breaker
+	if r.DailyPnl < -(r.TotalCapital * config.DailyLossLimitPct) {
+		r.EngineStopped = true
+		r.StopReason = fmt.Sprintf("DAILY_LOSS_LIMIT_%.0f", r.DailyPnl)
 		return false, r.StopReason
 	}
 
 	// Max open positions
 	if len(r.OpenPositions) >= config.MaxOpenPositions {
-		return false, fmt.Sprintf("MAX_%d_POSITIONS", config.MaxOpenPositions)
+		return false, "MAX_OPEN_POSITIONS"
+	}
+
+	// Max positions per strategy
+	strategy, _ := signal["strategy"].(string)
+	stratCount := 0
+	for _, pos := range r.OpenPositions {
+		if pos.Strategy == strategy {
+			stratCount++
+		}
+	}
+	if stratCount >= config.MaxPositionsPerStrat {
+		return false, fmt.Sprintf("MAX_PER_STRAT_%s", strategy)
 	}
 
 	// Capital availability (MIS margin)
@@ -142,88 +119,89 @@ func (r *RiskAgent) ApproveTrade(signal map[string]interface{}) (bool, string) {
 	}
 
 	isShort, _ := signal["is_short"].(bool)
-	targetPrice, _ := signal["target_price"].(float64)
-
-	var reward, risk float64
 	if isShort {
 		if stopPrice <= entryPrice {
 			return false, "STOP_BELOW_ENTRY_SHORT"
 		}
-		if targetPrice >= entryPrice {
-			return false, "TARGET_ABOVE_ENTRY_SHORT"
-		}
-		reward = entryPrice - targetPrice
-		risk = stopPrice - entryPrice
 	} else {
 		if stopPrice >= entryPrice {
 			return false, "STOP_ABOVE_ENTRY"
 		}
-		if targetPrice <= entryPrice {
-			return false, "TARGET_BELOW_ENTRY"
-		}
-		reward = targetPrice - entryPrice
-		risk = entryPrice - stopPrice
-	}
-
-	rr := 0.0
-	if risk > 0 {
-		rr = reward / risk
-	}
-
-	// Strategy-aware RR minimums
-	meanRevStrategies := map[string]bool{
-		"S2_BB_MEAN_REV": true, "S6_VWAP_BAND": true, "S7_MEAN_REV_LONG": true,
-		"S14_RSI_SCALP": true, "S15_RSI_SWING": true,
-	}
-
-	if strategy == "S3_ORB" && rr < 1.0 {
-		return false, fmt.Sprintf("S3_RR_%.2f_BELOW_1.0", rr)
-	} else if meanRevStrategies[strategy] {
-		if rr < 0.5 {
-			return false, fmt.Sprintf("MR_RR_%.2f_BELOW_0.5", rr)
-		}
-	} else if regime == "CHOP" && rr < 1.5 {
-		// Strict RR enforcement in sideways markets
-		return false, fmt.Sprintf("CHOP_RR_%.2f_BELOW_1.5", rr)
-	} else if rr < 1.0 {
-		return false, fmt.Sprintf("RR_%.2f_BELOW_1.0", rr)
 	}
 
 	return true, "APPROVED"
 }
 
 func (r *RiskAgent) CalculatePositionSize(entry, stop float64, regime, strategy, symbol string) int {
-	baseScale := map[string]float64{
-		"BULL": 1.0, "NORMAL": 1.0, "VOLATILE": 0.75,
-		"BEAR_PANIC": 0.45, "EXTREME_PANIC": 0.25, "CHOP": 0.30,
-	}
-	scale := baseScale[regime]
-	if scale == 0 {
-		scale = 1.0
-	}
+	// ═══ STRATEGY-AWARE REGIME SCALING ═══
+	// Key insight: Mean reversion LOVES volatility (bigger swings = better entries).
+	// Momentum/trend HATES chop (false breakouts, whipsaws).
+	// Scaling must match strategy type to regime, not apply one-size-fits-all.
 
-	// Mean-reversion strategies scaling
-	meanRev := map[string]bool{
+	meanRevStrategies := map[string]bool{
 		"S2_BB_MEAN_REV": true, "S6_VWAP_BAND": true, "S7_MEAN_REV_LONG": true,
-	}
-	if meanRev[strategy] {
-		if regime == "CHOP" {
-			scale *= 0.60
-		} else {
-			scale *= 0.85
-		}
+		"S11_VWAP_REVERT": true, "S12_EOD_REVERT": true, "S14_RSI_SCALP": true,
+		"S15_RSI_SWING": true,
 	}
 
-	// Macro strategy scaling
-	if strategy == "S8_MACRO_LONG" || strategy == "S8_MACRO_SHORT" {
-		macroScale := map[string]float64{
-			"VOLATILE": 0.60, "CHOP": 0.50, "BEAR_PANIC": 0.50, "EXTREME_PANIC": 0.30,
+	momentumStrategies := map[string]bool{
+		"S1_MA_CROSS": true, "S3_ORB": true, "S9_MTF_MOMENTUM": true,
+		"S13_SECTOR_ROT": true, "S6_TREND_SHORT": true,
+	}
+
+	var scale float64
+	if meanRevStrategies[strategy] {
+		// Mean reversion: SCALE UP in volatile (more reversion), DOWN in trend
+		switch regime {
+		case "BULL":
+			scale = 0.85 // Trending market — reversion less reliable
+		case "NORMAL":
+			scale = 1.0
+		case "VOLATILE":
+			scale = 1.15 // Bigger swings = better reversion entries
+		case "CHOP":
+			scale = 1.0 // Choppy = good for mean reversion
+		case "BEAR_PANIC":
+			scale = 0.70 // Extreme moves may not revert intraday
+		case "EXTREME_PANIC":
+			scale = 0.25
+		default:
+			scale = 1.0
 		}
-		ms := macroScale[regime]
-		if ms == 0 {
-			ms = 0.85
+	} else if momentumStrategies[strategy] {
+		// Momentum: SCALE UP in trends, BLOCK in chop/panic
+		switch regime {
+		case "BULL":
+			scale = 1.0
+		case "NORMAL":
+			scale = 1.0
+		case "VOLATILE":
+			scale = 0.50 // Volatile = risky for momentum
+		case "CHOP":
+			scale = 0.0 // BLOCK: chop kills momentum — S13 lost ₹2,347 in chop on Apr 29
+		case "BEAR_PANIC":
+			scale = 0.0 // BLOCK: panic reverses too fast for momentum
+		case "EXTREME_PANIC":
+			scale = 0.0
+		default:
+			scale = 1.0
 		}
-		scale *= ms
+	} else {
+		// Default (S8_VOL_PIVOT, macro, etc.)
+		switch regime {
+		case "BULL", "NORMAL":
+			scale = 1.0
+		case "VOLATILE":
+			scale = 0.85
+		case "CHOP":
+			scale = 0.60
+		case "BEAR_PANIC":
+			scale = 0.50
+		case "EXTREME_PANIC":
+			scale = 0.25
+		default:
+			scale = 1.0
+		}
 	}
 
 	leverage := r.GetMISLeverage(symbol)

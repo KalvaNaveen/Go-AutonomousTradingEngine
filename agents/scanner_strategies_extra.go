@@ -72,7 +72,7 @@ func (s *ScannerAgent) ScanS6TrendShort(regime string) []*Signal {
 		}
 
 		rvol := s.computeRVol(token)
-		if rvol < config.S6_RVOL_MIN {
+		if rvol < 1.0 {
 			continue
 		}
 
@@ -233,7 +233,7 @@ func (s *ScannerAgent) ScanS7(regime string) []*Signal {
 		}
 
 		rvol := s.computeRVol(token)
-		if rvol < config.S7_RVOL_MIN {
+		if rvol < 0.8 {
 			continue
 		}
 

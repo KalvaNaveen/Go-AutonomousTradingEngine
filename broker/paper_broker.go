@@ -61,7 +61,8 @@ type RealisticPaperBroker struct {
 	TradesCompleted int
 
 	// Data feed for realistic fill prices
-	GetLTP func(symbol string) float64
+	GetLTP   func(symbol string) float64
+	GetDepth func(symbol string) (bidPrice, askPrice float64) // Spread-aware pricing
 
 	// Background fill loop control
 	running bool
@@ -228,12 +229,33 @@ func (pb *RealisticPaperBroker) fillOrder(oid string, fillPrice float64) {
 		return
 	}
 
-	// Apply slippage: buys cost more, sells receive less
+	// Smart Execution: use real bid/ask spread when available
+	// Buys fill at ASK price (what sellers demand), sells fill at BID price (what buyers offer)
+	// This is MORE realistic than flat slippage — it's how real orders work
 	execPrice := fillPrice
-	if o.TransactionType == "BUY" {
-		execPrice = fillPrice * (1 + SlippagePct)
+	if pb.GetDepth != nil {
+		bidPrice, askPrice := pb.GetDepth(o.Symbol)
+		if bidPrice > 0 && askPrice > 0 {
+			if o.TransactionType == "BUY" {
+				execPrice = askPrice // Pay the ask
+			} else {
+				execPrice = bidPrice // Receive the bid
+			}
+		} else {
+			// Fallback to slippage model
+			if o.TransactionType == "BUY" {
+				execPrice = fillPrice * (1 + SlippagePct)
+			} else {
+				execPrice = fillPrice * (1 - SlippagePct)
+			}
+		}
 	} else {
-		execPrice = fillPrice * (1 - SlippagePct)
+		// No depth data — use slippage model
+		if o.TransactionType == "BUY" {
+			execPrice = fillPrice * (1 + SlippagePct)
+		} else {
+			execPrice = fillPrice * (1 - SlippagePct)
+		}
 	}
 
 	o.Status = "COMPLETE"

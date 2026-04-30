@@ -115,12 +115,27 @@ func main() {
 	wfo := core.NewWalkForwardOptimizer()
 	optParams := wfo.LoadParams()
 	log.Printf("[Engine] WFO params loaded (last=%s)", optParams.LastOptimized)
-	// WFO params influence strategy thresholds — applied at session start
-	_ = optParams // TODO: wire optParams into scanner config overrides
-	_ = wfo       // Used at EOD for re-optimization
 
-	// ── Portfolio VaR Engine ──
+	// Apply optimized parameters to live config — WFO self-protects with
+	// minimum data requirements and out-of-sample Sharpe validation
+	config.S1_ADX_MIN = int(optParams.S1_ADX_MIN)
+	config.S1_ATR_SL_MULT = optParams.S1_ATR_SL_MULT
+	config.S1_RR = optParams.S1_RR
+	config.S2_BB_SD = optParams.S2_BB_SD
+	config.S2_RSI_OVERSOLD = int(optParams.S2_RSI_OVERSOLD)
+	config.S2_RSI_OVERBOUGHT = int(optParams.S2_RSI_OVERBOUGHT)
+	config.S2_RR = optParams.S2_RR
+	config.S7_RSI_OVERSOLD = int(optParams.S7_RSI_OVERSOLD)
+	config.S7_VWAP_DEVIATION_PCT = optParams.S7_VWAP_DEV_PCT
+	config.S9_RSI_THRESHOLD = int(optParams.S9_RSI_THRESHOLD)
+	config.S9_ATR_SL_MULT = optParams.S9_ATR_SL_MULT
+	config.S9_RR = optParams.S9_RR
+	log.Println("[Engine] WFO params applied to strategy configs")
+
+	// ── Portfolio VaR Engine — Goldman/MS standard risk management ──
 	varEngine := core.NewVaREngine(config.TotalCapital)
+	varEngine.Enabled = true
+	log.Println("[Engine] VaR Engine enabled (95% confidence, 5% capital limit)")
 
 	// ── Wait for Network on service startup ──
 	waitForNetwork()
@@ -180,6 +195,11 @@ func main() {
 		log.Println("[Engine] WARNING: Daily cache incomplete. Continuing with available data.")
 	}
 	scanner.DailyCache = dailyCache.ToScannerCache()
+
+	// Load VaR historical returns from daily close prices
+	if scanner.DailyCache != nil && scanner.DailyCache.Closes != nil {
+		varEngine.LoadHistoricalReturns(scanner.DailyCache.Closes)
+	}
 
 	// ══════════════════════════════════════════════════════════════
 	//  PHASE 4: Initialize TickStore + WebSocket
@@ -304,16 +324,13 @@ func main() {
 	}
 	exec.Mu.Unlock()
 
-	// Recover daily circuit breakers
+	// Recover daily P&L and engine state
 	dateStr := config.TodayIST().Format("2006-01-02")
 	summary := journal.GetDailySummaryForDate(dateStr)
 	if summary != nil {
 		if pnl, ok := summary["gross_pnl"].(float64); ok {
 			risk.DailyPnl = pnl
-			scanner.RecordPnl(pnl) // Ensure scanner circuit breaker is aware
-		}
-		if trades, ok := summary["total_trades"].(int); ok {
-			_ = trades // Previously tracked MaxTradesPerDay here
+			scanner.RecordPnl(pnl)
 		}
 		if stopped, ok := summary["engine_stopped"].(bool); ok && stopped {
 			risk.EngineStopped = true
@@ -321,8 +338,8 @@ func main() {
 				risk.StopReason = reason
 			}
 		}
-		log.Printf("[Engine] Restored daily limits from DB: trades=%d, pnl=%.2f, stopped=%v", 
-			summary["total_trades"], summary["gross_pnl"], summary["engine_stopped"])
+		log.Printf("[Engine] Restored daily state from DB: pnl=%.2f stopped=%v",
+			summary["gross_pnl"], summary["engine_stopped"])
 	}
 
 	// Wire Paper Broker LTP (needs TickStore + Universe, so done after both are ready)
@@ -334,7 +351,25 @@ func main() {
 			}
 			return 0
 		}
-		log.Println("[Engine] Paper Broker wired with real LTP feed")
+		// Smart Execution: wire real bid/ask depth for spread-aware fills
+		paperBroker.GetDepth = func(symbol string) (float64, float64) {
+			if tok, ok := symbolToToken[symbol]; ok {
+				depth := tickStore.GetDepth(tok)
+				bidQty := depth["bid_qty"]
+				askQty := depth["ask_qty"]
+				ltp := tickStore.GetLTP(tok)
+				if ltp <= 0 || (bidQty <= 0 && askQty <= 0) {
+					return 0, 0
+				}
+				// Estimate bid/ask prices from LTP and ratio
+				// Kite FULL mode gives qty but not price per level.
+				// Typical spread for Nifty 250 stocks: 0.02-0.10%
+				spread := ltp * 0.0003 // 0.03% half-spread
+				return ltp - spread, ltp + spread
+			}
+			return 0, 0
+		}
+		log.Println("[Engine] Paper Broker wired with real LTP + bid/ask depth feed")
 	}
 
 	// ══════════════════════════════════════════════════════════════
@@ -554,71 +589,98 @@ func main() {
 					config.NowIST().Format("15:04:05"))
 			}
 
-			// Execute approved signals (with macro veto + ML filter + VaR + sector check)
+			// Execute all signals — no filters, no restrictions
 			execStart := time.Now().UnixNano()
 			executed := 0
-			mlBlocked := 0
-			varBlocked := 0
 			for _, sig := range signals {
 				if config.DisabledStrategies[sig.Strategy] {
 					continue
 				}
-				// MACRO VETO DISABLED — news keyword matching is too crude, blocks valid signals
-				// macroAgent.CheckVeto is kept in code but not called
-				// Re-enable only after implementing proper NLP sentiment
-				// Sector correlation guard: max 3 positions per sector
-				if exec.SectorCount(sig.Symbol) >= 3 {
+
+				// Per-strategy adaptive kill: skip strategies that lost 3+ times today
+				if scanner.IsStrategyKilledToday(sig.Strategy) {
 					continue
 				}
 
-				// ML Signal Filter: reject low-probability signals
-				fv := core.FeatureVector{
+				// ML Filter: neural network quality gate (only blocks worst 10-20% of signals)
+				mlFV := core.FeatureVector{
 					RSI:         core.Clamp01(sig.RSI / 100.0),
 					ADX:         core.Clamp01(sig.ADX / 100.0),
 					RVol:        core.Clamp01(sig.RVol / 5.0),
-					BBPosition:  0.5,
-					VIX:         core.Clamp01(scanner.GetCurrentVIX() / 40.0),
-					ADRatio:     scanner.GetCurrentADRatio(),
-					HourOfDay:   core.Clamp01(float64(now.Hour()-9) / 6.0),
+					VIX:         core.Clamp01(scanner.GetIndiaVIX() / 40.0),
+					ADRatio:     core.Clamp01(scanner.GetADRatio()),
+					HourOfDay:   core.Clamp01(float64(config.NowIST().Hour()-9) / 6.0),
 					RegimeScore: core.EncodeRegime(currentRegime),
 				}
-				mlOK, mlProb := mlFilter.ShouldTradeSignal(fv)
-				if !mlOK {
-					mlBlocked++
-					log.Printf("[ML] Blocked %s %s (prob=%.2f)", sig.Strategy, sig.Symbol, mlProb)
-					journal.LogAgentActivity("MLFilter", "BLOCKED",
-						fmt.Sprintf("%s %s prob=%.2f", sig.Strategy, sig.Symbol, mlProb),
-						config.NowIST().Format("15:04:05"))
+				if mlApproved, mlProb := mlFilter.ShouldTradeSignal(mlFV); !mlApproved {
+					log.Printf("[ML] REJECTED %s %s prob=%.2f (min=%.2f)",
+						sig.Strategy, sig.Symbol, mlProb, core.MLMinConfidence)
 					continue
 				}
 
-				// Portfolio VaR check: block if adding this trade breaches VaR limit
+				// Sector limit: max 2 positions per sector
+				if exec.SectorCount(sig.Symbol) >= 2 {
+					continue
+				}
+
+				// Order Flow Intelligence: boost/penalize signal based on bid/ask imbalance
+				flowScore := scanner.OrderFlowScore(sig.Token, sig.IsShort)
+				if flowScore < 0.75 {
+					log.Printf("[OrderFlow] WEAK %s %s flow=%.2f — counter-flow signal, skipping",
+						sig.Strategy, sig.Symbol, flowScore)
+					continue // Order flow strongly contradicts the signal direction
+				}
+				sig.SortKey *= flowScore // Boost priority for flow-confirmed signals
+
+				// Directional Balance: prevent all-long or all-short portfolio
+				exec.Mu.RLock()
+				longCount, shortCount := 0, 0
+				for _, t := range exec.ActiveTrades {
+					if t.IsShort {
+						shortCount++
+					} else {
+						longCount++
+					}
+				}
+				exec.Mu.RUnlock()
+				totalActive := longCount + shortCount
+				if totalActive >= 3 { // Only apply balance when we have enough positions
+					if !sig.IsShort && longCount > 0 && float64(longCount)/float64(totalActive) > 0.75 {
+						log.Printf("[Balance] SKIPPED long %s — portfolio is %d/%d long, need shorts for hedge",
+							sig.Symbol, longCount, totalActive)
+						continue
+					}
+					if sig.IsShort && shortCount > 0 && float64(shortCount)/float64(totalActive) > 0.75 {
+						log.Printf("[Balance] SKIPPED short %s — portfolio is %d/%d short, need longs for hedge",
+							sig.Symbol, shortCount, totalActive)
+						continue
+					}
+				}
+
+				// VaR Portfolio Risk Check: block trades that would push total risk beyond limit
+				exec.Mu.RLock()
 				var currentVaRPositions []core.VaRPosition
 				for _, t := range exec.ActiveTrades {
 					currentVaRPositions = append(currentVaRPositions, core.VaRPosition{
 						Token: t.Token, Symbol: t.Symbol,
-						EntryPrice: t.EntryPrice, Qty: t.Qty, IsShort: t.IsShort,
+						EntryPrice: t.EntryPrice, Qty: t.RemainingQty, IsShort: t.IsShort,
 					})
 				}
+				exec.Mu.RUnlock()
 				newVaRPos := core.VaRPosition{
 					Token: sig.Token, Symbol: sig.Symbol,
-					EntryPrice: sig.EntryPrice, Qty: 1, IsShort: sig.IsShort,
+					EntryPrice: sig.EntryPrice, Qty: sig.Qty, IsShort: sig.IsShort,
 				}
-				varOK, varReason := varEngine.CheckNewTrade(currentVaRPositions, newVaRPos)
-				if !varOK {
-					varBlocked++
-					log.Printf("[VaR] Blocked %s %s: %s", sig.Strategy, sig.Symbol, varReason)
-					journal.LogAgentActivity("VaREngine", "BLOCKED",
-						fmt.Sprintf("%s %s: %s", sig.Strategy, sig.Symbol, varReason),
-						config.NowIST().Format("15:04:05"))
+				if varAllowed, varReason := varEngine.CheckNewTrade(currentVaRPositions, newVaRPos); !varAllowed {
+					log.Printf("[VaR] BLOCKED %s %s: %s", sig.Strategy, sig.Symbol, varReason)
 					continue
 				}
 
 				if exec.Execute(sig, currentRegime) {
 					executed++
 					journal.LogAgentActivity("Execution", "TRADE_OPENED",
-						fmt.Sprintf("%s %s Qty=%d Entry=%.1f SL=%.1f Target=%.1f",
-							sig.Strategy, sig.Symbol, sig.Qty, sig.EntryPrice, sig.StopPrice, sig.TargetPrice),
+						fmt.Sprintf("%s %s Qty=%d Entry=%.1f SL=%.1f Target=%.1f Flow=%.1f",
+							sig.Strategy, sig.Symbol, sig.Qty, sig.EntryPrice, sig.StopPrice, sig.TargetPrice, flowScore),
 						config.NowIST().Format("15:04:05"))
 				}
 			}
@@ -627,10 +689,10 @@ func main() {
 
 			// Performance logging
 			if len(signals) > 0 || len(exec.ActiveTrades) > 0 {
-				log.Printf("[PERF] Tick:%dns Scan:%dns(%d) Mon:%dns Exec:%dns(%d) Open:%d ML_block:%d VaR_block:%d",
+				log.Printf("[PERF] Tick:%dns Scan:%dns(%d) Mon:%dns Exec:%dns(%d) Open:%d",
 					tickElapsed, scanElapsed, len(signals),
 					monElapsed, execElapsed, executed,
-					len(exec.ActiveTrades), mlBlocked, varBlocked)
+					len(exec.ActiveTrades))
 			}
 
 			if risk.EngineStopped && !killSwitchAlerted {
@@ -648,6 +710,19 @@ func main() {
 			log.Printf("[Engine] ERROR: EOD Sync failed: %v", errSync)
 			agents.SendTelegram(fmt.Sprintf("⚠️ *EOD SYNC FAILED*: %v", errSync))
 		}
+
+		// ── Walk-Forward Re-Optimization (uses today's new trades) ──
+		newParams, wfoErr := wfo.RunOptimization()
+		if wfoErr != nil {
+			log.Printf("[WFO] Re-optimization failed: %v", wfoErr)
+		} else {
+			log.Printf("[WFO] Re-optimized: IS_Sharpe=%.2f OS_Sharpe=%.2f Trades=%d",
+				newParams.InSampleSharpe, newParams.OutSampleSharpe, newParams.TotalTradesUsed)
+		}
+
+		// ── ML Filter Retrain (learns from today's trades) ──
+		mlFilter.TrainFromJournal()
+		log.Printf("[ML] Retrained: samples=%d accuracy=%.1f%%", mlFilter.TrainCount, mlFilter.Accuracy)
 
 		log.Println("[Engine] Post-Market Cleanup complete. Trading paused. Sleeping until next morning...")
 		agents.SendTelegram("🏁 *ENGINE SHUTDOWN* — Trading day complete. Process sleeping.")

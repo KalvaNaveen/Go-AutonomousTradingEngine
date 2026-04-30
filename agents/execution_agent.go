@@ -23,9 +23,8 @@ type ExecutionAgent struct {
 	ActiveTrades map[string]*core.Trade
 	Mu           sync.RWMutex // Protects ActiveTrades from concurrent API/trading access
 
-	// Per-symbol re-entry cooldown to prevent revenge trading
-	lastExitTime   map[string]time.Time
-	lastExitReason map[string]string
+	// Per-symbol re-entry cooldown (3 minutes)
+	lastExitTime map[string]time.Time
 
 	// Broker interface (abstracted for paper/live switching)
 	PlaceOrder  func(symbol string, qty int, isShort bool, orderType string, price float64) (string, error)
@@ -38,9 +37,8 @@ func NewExecutionAgent(risk *RiskAgent, journal *core.Journal, state *core.State
 		Risk:           risk,
 		Journal:        journal,
 		State:          state,
-		ActiveTrades:   make(map[string]*core.Trade),
-		lastExitTime:   make(map[string]time.Time),
-		lastExitReason: make(map[string]string),
+		ActiveTrades: make(map[string]*core.Trade),
+		lastExitTime: make(map[string]time.Time),
 	}
 }
 
@@ -63,6 +61,14 @@ func (e *ExecutionAgent) RestoreFromState() {
 func (e *ExecutionAgent) Execute(sig *Signal, regime string) bool {
 	sym := sig.Symbol
 
+	// 3-minute per-symbol cooldown to prevent revenge trading
+	if exitTime, ok := e.lastExitTime[sym]; ok {
+		if time.Since(exitTime) < 3*time.Minute {
+			log.Printf("[Exec] COOLDOWN %s: exited %.0fs ago, need 180s", sym, time.Since(exitTime).Seconds())
+			return false
+		}
+	}
+
 	// Duplicate symbol guard
 	e.Mu.RLock()
 	for _, t := range e.ActiveTrades {
@@ -72,29 +78,11 @@ func (e *ExecutionAgent) Execute(sig *Signal, regime string) bool {
 			return false
 		}
 	}
-	// Smart per-symbol cooldown: 5m for winners, 30m for losers, 15m for neutral
-	if lastExit, ok := e.lastExitTime[sym]; ok {
-		cooldownMins := 15.0 // default
-		if reason, exists := e.lastExitReason[sym]; exists {
-			switch reason {
-			case "NET_PROFIT_EXIT", "TARGET_HIT", "PROFIT_LOCK_EXIT":
-				cooldownMins = 5.0 // Winners: allow quick re-entry
-			case "STOP_HIT":
-				cooldownMins = 30.0 // Losers: prevent revenge trading
-			}
-		}
-		if time.Since(lastExit).Minutes() < cooldownMins {
-			e.Mu.RUnlock()
-			log.Printf("[Exec] REJECTED %s: Cooldown active (%.0fm/%.0fm since %s)", sym, time.Since(lastExit).Minutes(), cooldownMins, e.lastExitReason[sym])
-			return false
-		}
-	}
 	e.Mu.RUnlock()
 
-	// ═══ ENFORCE PERCENTAGE-BASED MAX STOP LOSS ═══
-	// Use 2% of entry price or ₹50, whichever is larger.
-	// A flat 50-pt cap causes false stop-outs on stocks above ₹2500.
-	maxSL := max64(sig.EntryPrice*0.02, 50.0)
+	// Trust the scanner's stop price — it's computed from ATR/pivot/structure.
+	// Only sanity-check: stop must be within 5% of entry (prevents data errors).
+	maxSL := sig.EntryPrice * 0.05
 	if sig.IsShort {
 		if sig.StopPrice - sig.EntryPrice > maxSL {
 			sig.StopPrice = sig.EntryPrice + maxSL
@@ -219,13 +207,13 @@ func (e *ExecutionAgent) Execute(sig *Signal, regime string) bool {
 	return true
 }
 
-// MonitorPositions checks all open positions for exits.
-// Implements 5 layers of position management:
-//  1. Trailing stop loss — locks in profits as price moves
-//  2. Breakeven stop — once at 1R profit, stop moves to entry
-//  3. Time decay exit — stale trades that go nowhere after 30 mins
-//  4. Dynamic net-profit exit — exit when net profit (after charges) meets threshold
-//  5. Fixed stop/target hit — original SL/TP from entry
+// MonitorPositions — the core position management loop.
+// Rules:
+//  1. Hard stop: cut trade if gross PnL crosses -₹50
+//  2. Trailing stop: once gross hits +₹30, trail at 50% of peak
+//  3. Profit-lock: protect gains with 3-tier high-water mark
+//  4. EOD squareoff & preemptive loss exit
+//  5. Fixed target hit from original signal
 func (e *ExecutionAgent) MonitorPositions(regime string) {
 	now := config.NowIST()
 	h, m := now.Hour(), now.Minute()
@@ -256,163 +244,97 @@ func (e *ExecutionAgent) MonitorPositions(regime string) {
 		} else {
 			gross = (ltp - trade.EntryPrice) * float64(actQty)
 		}
-		charges := core.ComputeChargesFromTrade(trade.EntryPrice, ltp, actQty, trade.IsShort, "MIS", 0)
-		netPnl := gross - charges
 
-		// ═══ LAYER 0: PROFIT-LOCK / HIGH-WATER MARK ═══
-		// Track the peak net P&L this trade has ever reached.
-		// Once peak crosses stepped thresholds, lock in a minimum guaranteed profit.
-		// If P&L drops below the locked floor, force-exit to prevent giving back gains.
-		if netPnl > trade.PeakPnl {
-			trade.PeakPnl = netPnl
+		// Compute the original risk for this trade (entry-to-stop distance × qty)
+		var entryRiskPts float64
+		if trade.IsShort {
+			entryRiskPts = trade.StopPrice - trade.EntryPrice
+		} else {
+			entryRiskPts = trade.EntryPrice - trade.StopPrice
+		}
+		entryRisk := entryRiskPts * float64(actQty) // Total ₹ risk for this position
+		if entryRisk < 10 {
+			entryRisk = 10 // Safety floor
 		}
 
-		// Determine locked-in floor based on highest profit ever reached
-		// Floors include a ₹30 slippage buffer so exit market orders don't turn breakeven into a loss
-		lockedFloor := -999999.0 // No floor by default
+		// ═══ RULE 1: HARD STOP — 1.5× the original risk ═══
+		// Gives trades room to breathe past the scanner's stop before cutting.
+		// E.g., 20-share position with ₹15 stop = ₹300 risk → hard stop at -₹450
+		hardStopLimit := -1.5 * entryRisk
+		if gross <= hardStopLimit {
+			log.Printf("[Exec] HARD_STOP: %s gross=₹%.0f (limit=₹%.0f, risk=₹%.0f) — cutting loss",
+				trade.Symbol, gross, hardStopLimit, entryRisk)
+			SendTelegram(fmt.Sprintf("🛑 *HARD STOP* `%s` gross=₹%.0f — Cutting loss.", trade.Symbol, gross))
+			e.forceExit(oid, trade, "HARD_STOP", ltp)
+			continue
+		}
+
+		// Track peak gross P&L for trailing stop
+		if gross > trade.PeakPnl {
+			trade.PeakPnl = gross
+		}
+
+		// ═══ RULE 2: TRAILING STOP — activates at 1R profit, trails at 50% ═══
+		// Once you've made back your full risk amount, protect 50% of peak.
+		trailActivation := entryRisk * 0.8 // Activate trailing at 0.8R
+		if trade.PeakPnl >= trailActivation {
+			trailFloor := trade.PeakPnl * 0.50
+			if gross <= trailFloor {
+				log.Printf("[Exec] TRAIL_STOP: %s peak=₹%.0f now=₹%.0f trail=₹%.0f",
+					trade.Symbol, trade.PeakPnl, gross, trailFloor)
+				SendTelegram(fmt.Sprintf("📉 *TRAIL STOP* `%s` Peak ₹%.0f → Now ₹%.0f. Locking gains.",
+					trade.Symbol, trade.PeakPnl, gross))
+				e.forceExit(oid, trade, "TRAIL_STOP", ltp)
+				continue
+			}
+		}
+
+		// ═══ RULE 3: PROFIT-LOCK / HIGH-WATER MARK (scaled to risk) ═══
+		// Tiers based on R-multiples, not flat ₹ amounts
+		lockedFloor := -999999.0
 		switch {
-		case trade.PeakPnl >= 400:
-			lockedFloor = 380.0 // Reached ₹400+ → lock ₹280 (after slippage ~₹250+)
-		case trade.PeakPnl >= 300:
-			lockedFloor = 280.0 // Reached ₹300+ → lock ₹180 (after slippage ~₹150+)
-		case trade.PeakPnl >= 200:
-			lockedFloor = 180.0 // Reached ₹200+ → lock ₹130 (after slippage ~₹100+)
-		case trade.PeakPnl >= 100:
-			lockedFloor = 80.0 // Reached ₹100+ → lock ₹30 (after slippage still net positive)
+		case trade.PeakPnl >= 4.0*entryRisk: // 4R peak → lock 2.5R
+			lockedFloor = 2.5 * entryRisk
+		case trade.PeakPnl >= 2.0*entryRisk: // 2R peak → lock 1R
+			lockedFloor = 1.0 * entryRisk
+		case trade.PeakPnl >= 1.0*entryRisk: // 1R peak → lock 0.3R
+			lockedFloor = 0.3 * entryRisk
 		}
 
-		if lockedFloor > -999999.0 && netPnl <= lockedFloor {
-			log.Printf("[Exec] PROFIT_LOCK: %s peak=₹%.0f now=₹%.0f floor=₹%.0f — locking gains",
-				trade.Symbol, trade.PeakPnl, netPnl, lockedFloor)
-			SendTelegram(fmt.Sprintf("🔒 *PROFIT LOCK* `%s` Peak ₹%.0f → Now ₹%.0f (floor ₹%.0f). Exiting to protect gains.",
-				trade.Symbol, trade.PeakPnl, netPnl, lockedFloor))
+		if lockedFloor > -999999.0 && gross <= lockedFloor {
+			log.Printf("[Exec] PROFIT_LOCK: %s peak=₹%.0f now=₹%.0f floor=₹%.0f",
+				trade.Symbol, trade.PeakPnl, gross, lockedFloor)
+			SendTelegram(fmt.Sprintf("🔒 *PROFIT LOCK* `%s` Peak ₹%.0f → Now ₹%.0f (floor ₹%.0f).",
+				trade.Symbol, trade.PeakPnl, gross, lockedFloor))
 			e.forceExit(oid, trade, "PROFIT_LOCK_EXIT", ltp)
 			continue
 		}
 
-		// ═══ LAYER 1: TRAILING STOP LOSS ═══
-		// Once trade moves >1R in our favor, trail the stop at 50% of max favorable excursion
-		initialRisk := 0.0
-		if trade.IsShort {
-			initialRisk = trade.StopPrice - trade.EntryPrice
-		} else {
-			initialRisk = trade.EntryPrice - trade.StopPrice
-		}
-
-		if initialRisk > 0 {
-			var favorableMove float64
-			if trade.IsShort {
-				favorableMove = trade.EntryPrice - ltp // positive when price drops
-			} else {
-				favorableMove = ltp - trade.EntryPrice // positive when price rises
-			}
-
-			// Once at 1R profit: move stop to breakeven (LAYER 2)
-			if favorableMove >= initialRisk {
-				var newStop float64
-				if trade.IsShort {
-					// Trail at 30% of max favorable move from entry (loosened from 50%)
-					newStop = trade.EntryPrice - favorableMove*0.30
-					if newStop < trade.StopPrice { // Only tighten, never widen
-						trade.StopPrice = newStop
-					}
-				} else {
-					newStop = trade.EntryPrice + favorableMove*0.30
-					if newStop > trade.StopPrice {
-						trade.StopPrice = newStop
-					}
-				}
-			}
-
-			// Once at 2R profit: trail tighter at 65%
-			if favorableMove >= 2*initialRisk {
-				var newStop float64
-				if trade.IsShort {
-					newStop = trade.EntryPrice - favorableMove*0.50
-					if newStop < trade.StopPrice {
-						trade.StopPrice = newStop
-					}
-				} else {
-					newStop = trade.EntryPrice + favorableMove*0.50
-					if newStop > trade.StopPrice {
-						trade.StopPrice = newStop
-					}
-				}
-			}
-		}
-
-		// ═══ LAYER 3: TIME DECAY EXIT ═══
-		// If a trade hasn't moved meaningfully, exit at breakeven/small loss to free up capital
-		holdMinutes := now.Sub(trade.EntryTime).Minutes()
-		maxHold := 180.0 // Default 3 hours
-		if trade.MaxHoldMins > 0 {
-			maxHold = float64(trade.MaxHoldMins)
-		}
-
-		// Decay limits depend heavily on the strategy paradigm
-		// S10_ and S13_ are mean-reversion/rotation — they need 120m+ to work.
-		// Only true momentum strategies (breakout/scalp) get the short 30m decay.
-		isMomentum := strings.HasPrefix(trade.Strategy, "S1_") ||
-			strings.HasPrefix(trade.Strategy, "S3_") ||
-			strings.HasPrefix(trade.Strategy, "S6_") ||
-			strings.HasPrefix(trade.Strategy, "S14_") ||
-			strings.HasPrefix(trade.Strategy, "S15_")
-
-		decayLimit := 60.0 // 60 minutes for momentum strategies (was 30 — too aggressive, cuts breakouts)
-		if !isMomentum {
-			decayLimit = 120.0 // Give mean reverting / sectoral trades 2 hours to breathe
-		}
-
-		// Stale trade: held > decayLimit mins and P&L is near zero (< ₹100)
-		if holdMinutes > decayLimit && gross > -100 && gross < 100 {
-
-			// --- SMART DECAY ENHANCEMENT ---
-			// If the timer runs out, check if favorable momentum is suddenly returning.
-			isSurging := false
-			if e.Scanner != nil && e.Scanner.ComputeRVol != nil && e.Scanner.GetVWAP != nil {
-				rvol := e.Scanner.ComputeRVol(token)
-				vwap := e.Scanner.GetVWAP(token)
-
-				if rvol > 1.3 { // Relative volume is highly active
-					if !trade.IsShort && ltp > vwap { // Long trade trending above VWAP
-						isSurging = true
-					} else if trade.IsShort && ltp < vwap { // Short trade trending below VWAP
-						isSurging = true
-					}
-				}
-			}
-
-			// Grant a 60-minute grace period if the stock wakes up right at the decay boundary
-			if isSurging && holdMinutes < decayLimit+60.0 {
-				continue // Bypass the kill switch
-			}
-
-			// Trade is going nowhere — exit to free up capital for better setups
-			log.Printf("[Exec] TIME_DECAY: %s (Strat: %s) held %.0f mins with flat PnL=%.0f — exiting", trade.Symbol, trade.Strategy, holdMinutes, gross)
-			e.forceExit(oid, trade, "TIME_DECAY_EXIT", ltp)
+		// ═══ THESIS EXPIRED — 2hr max hold if losing ═══
+		// If the trade hasn't moved to profit in 2 hours, the setup is dead.
+		// Apr 29: LENSKART held 5.5hrs losing (-₹1,616), AUROPHARMA 4.3hrs (-₹1,516)
+		holdDuration := config.NowIST().Sub(trade.EntryTime)
+		if holdDuration > 2*time.Hour && gross < 0 {
+			log.Printf("[Exec] THESIS_EXPIRED: %s held %.1fhrs while losing ₹%.0f — cutting dead trade",
+				trade.Symbol, holdDuration.Hours(), gross)
+			SendTelegram(fmt.Sprintf("⏰ *THESIS EXPIRED* `%s` held %.1fhrs losing ₹%.0f — Dead trade cut.",
+				trade.Symbol, holdDuration.Hours(), gross))
+			e.forceExit(oid, trade, "THESIS_EXPIRED", ltp)
 			continue
 		}
 
-		// Max hold time exceeded
-		if holdMinutes >= maxHold {
-			e.forceExit(oid, trade, "MAX_HOLD_EXIT", ltp)
-			continue
-		}
-
-		// ═══ LAYER 4: DYNAMIC NET-PROFIT EXIT ═══
-		// Exit when net profit (after ALL charges) reaches a meaningful threshold
-		// Scaled by risk: max(₹150, 2× the initial risk amount)
-		initRiskAmt := initialRisk * float64(actQty)
-		if initRiskAmt <= 0 {
-			initRiskAmt = 150.0
-		}
-		minNetTarget := max64(150.0, initRiskAmt*2.0)
-
-		if netPnl >= minNetTarget {
-			log.Printf("[Exec] NET_PROFIT_EXIT: %s net=₹%.0f (gross=₹%.0f charges=₹%.0f)",
-				trade.Symbol, netPnl, gross, charges)
-			SendTelegram(fmt.Sprintf("💰 *NET PROFIT* `%s` net=₹%.0f — Exiting.", trade.Symbol, netPnl))
-			e.forceExit(oid, trade, "NET_PROFIT_EXIT", ltp)
+		// ═══ DAMAGE CONTROL — tighten stop at -1R ═══
+		// Once a trade is losing by 1× its original risk, the thesis is weak.
+		// Start a tight trailing stop: if it recovers to -0.7R from -1R, let it ride.
+		// If it deteriorates further past -1R, the hard stop at -1.5R catches it.
+		// This prevents the "slow bleed" where trades sit at -0.8R to -1.2R for hours.
+		if gross < -1.0*entryRisk && trade.PeakPnl < 0.3*entryRisk {
+			// The trade never really worked (peak was <0.3R) and now it's -1R deep
+			log.Printf("[Exec] DAMAGE_CONTROL: %s at -%.1fR (gross=₹%.0f, risk=₹%.0f) — never worked, cutting",
+				trade.Symbol, -gross/entryRisk, gross, entryRisk)
+			SendTelegram(fmt.Sprintf("🩹 *DAMAGE CTRL* `%s` at -%.1fR — Trade never worked, cutting.",
+				trade.Symbol, -gross/entryRisk))
+			e.forceExit(oid, trade, "DAMAGE_CONTROL", ltp)
 			continue
 		}
 
@@ -430,21 +352,13 @@ func (e *ExecutionAgent) MonitorPositions(regime string) {
 			continue
 		}
 
-		// ═══ LAYER 5: FIXED STOP/TARGET HIT ═══
+		// ═══ FIXED TARGET HIT ═══
 		if trade.IsShort {
-			if ltp >= trade.StopPrice {
-				e.forceExit(oid, trade, "STOP_HIT", ltp)
-				continue
-			}
 			if ltp <= trade.TargetPrice {
 				e.forceExit(oid, trade, "TARGET_HIT", ltp)
 				continue
 			}
 		} else {
-			if ltp <= trade.StopPrice {
-				e.forceExit(oid, trade, "STOP_HIT", ltp)
-				continue
-			}
 			if ltp >= trade.TargetPrice {
 				e.forceExit(oid, trade, "TARGET_HIT", ltp)
 				continue
@@ -507,6 +421,7 @@ func (e *ExecutionAgent) forceExit(oid string, trade *core.Trade, reason string,
 	// Track scanner state
 	if e.Scanner != nil {
 		e.Scanner.RecordPnl(pnl)
+		e.Scanner.RecordStrategyResult(trade.Strategy, pnl)
 		if reason == "STOP_HIT" {
 			e.Scanner.symbolCooldown[trade.Symbol] = 2
 		}
@@ -520,9 +435,8 @@ func (e *ExecutionAgent) forceExit(oid string, trade *core.Trade, reason string,
 		"*FORCE EXIT*\n`%s` | `%s`\nEst. PnL: Rs.`%+.0f`%s",
 		trade.Symbol, reason, pnl, streakMsg))
 
-	// Record exit time + reason for smart per-symbol cooldown
+	// Record exit time for per-symbol cooldown
 	e.lastExitTime[trade.Symbol] = config.NowIST()
-	e.lastExitReason[trade.Symbol] = reason
 	delete(e.ActiveTrades, oid)
 }
 
@@ -555,24 +469,53 @@ func (e *ExecutionAgent) DailySummaryAlert(regime string) {
 }
 
 // ── Telegram Alert ──────────────────────────────────────────
+// Rate-limited sender: Telegram enforces ~30 msg/sec but can silently drop
+// rapid-fire messages to the same chat. We serialize sends with a 300ms gap.
+var telegramMu sync.Mutex
+
 func SendTelegram(msg string) {
 	if config.TelegramBotToken == "" || len(config.TelegramChatIDs) == 0 {
 		log.Printf("[ALERT] %s", msg)
 		return
 	}
-	base := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", config.TelegramBotToken)
-	for _, chatID := range config.TelegramChatIDs {
-		go func(cid string) {
-			resp, err := http.PostForm(base, url.Values{
-				"chat_id":    {cid},
-				"text":       {msg},
-				"parse_mode": {"Markdown"},
-			})
-			if err == nil {
+	// Send in background but serialize to prevent rate-limit drops
+	go func() {
+		telegramMu.Lock()
+		defer telegramMu.Unlock()
+
+		base := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", config.TelegramBotToken)
+		for _, chatID := range config.TelegramChatIDs {
+			sent := false
+			for attempt := 0; attempt < 2; attempt++ {
+				resp, err := http.PostForm(base, url.Values{
+					"chat_id":    {chatID},
+					"text":       {msg},
+					"parse_mode": {"Markdown"},
+				})
+				if err != nil {
+					log.Printf("[Telegram] ERROR (attempt %d): %v", attempt+1, err)
+					time.Sleep(1 * time.Second) // Retry after 1s
+					continue
+				}
 				resp.Body.Close()
+				if resp.StatusCode == 200 {
+					sent = true
+					break
+				}
+				log.Printf("[Telegram] HTTP %d (attempt %d) for chat %s", resp.StatusCode, attempt+1, chatID)
+				time.Sleep(1 * time.Second)
 			}
-		}(chatID)
-	}
+			if !sent {
+				log.Printf("[Telegram] FAILED to send to chat %s: %s", chatID, msg[:min(len(msg), 80)])
+			}
+			time.Sleep(300 * time.Millisecond) // Rate limit gap between chats
+		}
+	}()
+}
+
+func min(a, b int) int {
+	if a < b { return a }
+	return b
 }
 
 // SectorCount returns how many active trades are in the same sector as the symbol.

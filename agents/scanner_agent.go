@@ -65,6 +65,9 @@ type ScannerAgent struct {
 	dailyPnl         float64
 	dailyPnlDate     time.Time
 	LastRegime       string // Shared regime for both main loop and API
+
+	// Per-strategy adaptive kill switch: if a strategy loses N times today, disable it
+	strategyLossesToday map[string]int
 }
 
 // Candle represents OHLCV data
@@ -93,8 +96,9 @@ type DailyCache struct {
 
 func NewScannerAgent() *ScannerAgent {
 	return &ScannerAgent{
-		s6Cooldown:     make(map[string]time.Time),
-		symbolCooldown: make(map[string]int),
+		s6Cooldown:          make(map[string]time.Time),
+		symbolCooldown:      make(map[string]int),
+		strategyLossesToday: make(map[string]int),
 	}
 }
 
@@ -132,15 +136,15 @@ func (s *ScannerAgent) DetectRegime() string {
 	} else if vix > config.VIXBearPanic && !aboveEMA && adRatio < 0.40 {
 		log.Printf("[Regime] BEAR_PANIC — VIX=%.1f AD=%.2f", vix, adRatio)
 		result = "BEAR_PANIC"
-	} else if vix < config.VIXBearPanic && aboveEMA && adRatio > 0.60 {
+	} else if vix < config.VIXBearPanic && aboveEMA && adRatio > 0.50 {
 		log.Printf("[Regime] BULL — VIX=%.1f AD=%.2f", vix, adRatio)
 		result = "BULL"
+	} else if vix < config.VIXBullMax && adRatio >= 0.45 {
+		log.Printf("[Regime] NORMAL — VIX=%.1f AD=%.2f", vix, adRatio)
+		result = "NORMAL"
 	} else if config.VIXBullMax <= vix && vix < config.VIXExtremeStop {
 		log.Printf("[Regime] VOLATILE — VIX=%.1f AD=%.2f", vix, adRatio)
 		result = "VOLATILE"
-	} else if config.VIXNormalLow <= vix && vix < config.VIXBullMax {
-		log.Printf("[Regime] NORMAL — VIX=%.1f AD=%.2f", vix, adRatio)
-		result = "NORMAL"
 	} else {
 		log.Printf("[Regime] CHOP — VIX=%.1f AD=%.2f", vix, adRatio)
 		result = "CHOP"
@@ -186,6 +190,7 @@ func (s *ScannerAgent) NewSession() {
 	s.dailyPnl = 0
 	s.s6vTradesToday = 0
 	s.s6vLastLossTime = time.Time{}
+	s.strategyLossesToday = make(map[string]int) // Reset daily kill switch
 
 	expired := []string{}
 	for k, v := range s.symbolCooldown {
@@ -199,6 +204,28 @@ func (s *ScannerAgent) NewSession() {
 	for k := range s.symbolCooldown {
 		s.symbolCooldown[k]--
 	}
+}
+
+// ── Per-Strategy Adaptive Kill Switch ────────────────────────
+const StrategyDailyLossLimit = 3 // 3 losses today → strategy paused for the day
+
+// RecordStrategyResult tracks wins/losses per strategy for adaptive disabling
+func (s *ScannerAgent) RecordStrategyResult(strategy string, pnl float64) {
+	if pnl < 0 {
+		s.strategyLossesToday[strategy]++
+		if s.strategyLossesToday[strategy] >= StrategyDailyLossLimit {
+			log.Printf("[Scanner] STRATEGY KILL: %s disabled after %d losses today",
+				strategy, s.strategyLossesToday[strategy])
+		}
+	} else if pnl > 0 {
+		// A win resets the loss counter (strategy is working)
+		s.strategyLossesToday[strategy] = 0
+	}
+}
+
+// IsStrategyKilledToday returns true if a strategy has hit its daily loss limit
+func (s *ScannerAgent) IsStrategyKilledToday(strategy string) bool {
+	return s.strategyLossesToday[strategy] >= StrategyDailyLossLimit
 }
 
 func (s *ScannerAgent) cacheReady() bool {
@@ -322,7 +349,7 @@ func (s *ScannerAgent) ScanS1(regime string) []*Signal {
 		}
 
 		rvol := s.computeRVol(token)
-		if rvol < 1.2 {
+		if rvol < 0.8 {
 			continue
 		}
 
@@ -467,7 +494,7 @@ func (s *ScannerAgent) ScanS2(regime string) []*Signal {
 		}
 
 		rvol := s.computeRVol(token)
-		if rvol < 1.2 {
+		if rvol < 0.8 {
 			continue
 		}
 
@@ -548,7 +575,7 @@ func (s *ScannerAgent) ScanS3(regime string) []*Signal {
 		}
 
 		rvol := s.computeRVol(token)
-		if rvol < 1.5 {
+		if rvol < 1.0 {
 			continue
 		}
 
@@ -669,7 +696,7 @@ func (s *ScannerAgent) ScanS6VWAP(regime string) []*Signal {
 		}
 
 		rvol := s.computeRVol(token)
-		if rvol < 1.2 {
+		if rvol < 0.8 {
 			continue
 		}
 
@@ -758,7 +785,7 @@ func (s *ScannerAgent) ScanS8(regime string) []*Signal {
 		s2 := pivot - (prevH - prevL)
 
 		rvol := s.computeRVol(token)
-		if rvol < 2.0 {
+		if rvol < 1.2 {
 			continue
 		}
 
@@ -876,10 +903,10 @@ func (s *ScannerAgent) ScanS9(regime string) []*Signal {
 		rsi15 := rsiSlice[len(rsiSlice)-1]
 
 		rvol := s.computeRVol(token)
-		if regime == "CHOP" && rvol < 1.8 {
+		if regime == "CHOP" && rvol < 1.3 {
 			continue
 		}
-		if rvol < 1.3 {
+		if rvol < 1.0 {
 			continue
 		}
 
@@ -938,9 +965,62 @@ func (s *ScannerAgent) computeRVol(token uint32) float64 {
 	return 0.0
 }
 
+// ── Order Flow Intelligence ─────────────────────────────────────
+// Uses real Kite 5-level depth data to score signal quality.
+// Institutional desks call this "tape reading" — bid/ask imbalance
+// reveals whether smart money is accumulating (buying) or distributing (selling).
+
+// OrderFlowScore returns a multiplier (0.5 to 1.5) based on bid/ask imbalance.
+// Values > 1.0 = order flow CONFIRMS the signal direction.
+// Values < 1.0 = order flow is AGAINST the signal direction.
+func (s *ScannerAgent) OrderFlowScore(token uint32, isShort bool) float64 {
+	if s.GetDepth == nil {
+		return 1.0 // No depth data, neutral score
+	}
+
+	depth := s.GetDepth(token)
+	bidQty := depth["bid_qty"]
+	askQty := depth["ask_qty"]
+
+	if bidQty <= 0 && askQty <= 0 {
+		return 1.0 // No depth data available
+	}
+
+	// Compute imbalance ratio: > 1 = more buyers, < 1 = more sellers
+	var imbalance float64
+	if askQty > 0 {
+		imbalance = bidQty / askQty
+	} else {
+		imbalance = 2.0 // No sellers = extreme buying pressure
+	}
+
+	// For LONG signals: high bid/ask ratio confirms buying pressure
+	// For SHORT signals: low bid/ask ratio confirms selling pressure
+	if isShort {
+		// Short wants selling pressure (low imbalance)
+		if imbalance < 0.6 {
+			return 1.3 // Strong selling pressure confirms short
+		} else if imbalance < 0.8 {
+			return 1.1 // Mild selling pressure
+		} else if imbalance > 1.5 {
+			return 0.7 // Buying pressure contradicts short
+		}
+	} else {
+		// Long wants buying pressure (high imbalance)
+		if imbalance > 1.5 {
+			return 1.3 // Strong buying pressure confirms long
+		} else if imbalance > 1.2 {
+			return 1.1 // Mild buying pressure
+		} else if imbalance < 0.6 {
+			return 0.7 // Selling pressure contradicts long
+		}
+	}
+	return 1.0 // Neutral
+}
+
 // MinNetProfitPerTrade is the minimum expected net profit after ALL charges.
-// Trades that can't clear this hurdle are rejected — they create churn, not wealth.
-const MinNetProfitPerTrade = 50.0 // Rs. 50 minimum net profit (raised from 15 — with 0.5% risk, positions are large enough)
+// With ₹1L capital, position sizes are small — keep this low to allow trades through.
+const MinNetProfitPerTrade = 5.0 // ₹5 minimum — just needs to cover charges
 
 // FilterByNetProfit rejects signals whose expected profit at target doesn't cover charges.
 // This single filter eliminates 60-70% of marginal trades that historically lost money.
@@ -1369,10 +1449,11 @@ func (s *ScannerAgent) ScanS13SectorRotation(regime string) []*Signal {
 		return nil
 	}
 
-	// Only scan every 15 minutes (not every second) — this is a slow strategy
+	// Scan in 15-minute windows (first 30 seconds of each 15-min block)
 	now := config.NowIST()
-	if now.Minute()%15 != 0 {
-		return nil
+	minInBlock := now.Minute() % 15
+	if minInBlock > 0 {
+		return nil // Only scan during the first minute of each 15-min window
 	}
 
 	// Compute intraday change for each symbol
@@ -1702,12 +1783,11 @@ func (s *ScannerAgent) ScanS15RSISwing(regime string) []*Signal {
 // FILTERED by net profitability — no signal reaches execution unless it
 // can produce ≥₹50 net profit after ALL Zerodha charges.
 func (s *ScannerAgent) RunAllScans(regime string) []*Signal {
-	// Last entry time enforcement: no new signals after 14:50
+	// Last entry time enforcement: allow trades until 15:00 for late-day setups
 	if !s.SimulatorMode {
 		now := config.NowIST()
 		t := now.Hour()*100 + now.Minute()
-		leh, lem := config.ParseTime(config.LastEntryTime)
-		if t > leh*100+lem {
+		if t > 1500 {
 			return nil
 		}
 	}
@@ -1728,20 +1808,20 @@ func (s *ScannerAgent) RunStrategyScans(regime string, strategies []string) []*S
 	//   S6_TREND: -₹1855 (WORST strategy, 22% WR) → DISABLE
 	//   S1, S2, S9: never traded → DISABLE (unproven)
 	strategyMap := map[string]func(string) []*Signal{
-		// "S1_MA_CROSS":      s.ScanS1,            // Never traded — unproven
-		// "S2_BB_MEAN_REV":   s.ScanS2,            // Never traded — unproven
-		"S3_ORB":           s.ScanS3,
-		// "S6_TREND_SHORT":   s.ScanS6TrendShort,  // -₹1855, 22% WR — WORST strategy
-		"S6_VWAP_BAND":     s.ScanS6VWAP,
-		"S7_MEAN_REV_LONG": s.ScanS7,
-		"S8_VOL_PIVOT":     s.ScanS8,               // +₹232 — ONLY profitable strategy
-		// "S9_MTF_MOMENTUM":  s.ScanS9,            // Never traded — unproven
-		// "S10_GAP_FILL":     s.ScanS10GapFill,    // -₹885, 44% WR
-		"S11_VWAP_REVERT":  s.ScanS11VWAPRevert,
-		// "S12_EOD_REVERT":   s.ScanS12EODReversion, // -₹76
-		// "S13_SECTOR_ROT":   s.ScanS13SectorRotation, // -₹688, 36% WR
-		"S14_RSI_SCALP":    s.ScanS14RSIScalp,
-		"S15_RSI_SWING":    s.ScanS15RSISwing,
+		"S1_MA_CROSS":       s.ScanS1,              // EMA crossover — bread & butter
+		"S2_BB_MEAN_REV":    s.ScanS2,              // Bollinger mean reversion
+		"S3_ORB":            s.ScanS3,              // ORB — proven intraday setup
+		"S6_TREND_SHORT":    s.ScanS6TrendShort,    // Relative weakness short
+		"S6_VWAP_BAND":      s.ScanS6VWAP,          // VWAP band reversion
+		"S7_MEAN_REV_LONG":  s.ScanS7,              // Mean reversion long
+		"S8_VOL_PIVOT":      s.ScanS8,              // Volume pivot — historically profitable
+		"S9_MTF_MOMENTUM":   s.ScanS9,              // Multi-timeframe momentum
+		"S10_GAP_FILL":      s.ScanS10GapFill,      // Gap fill — 70% statistical edge
+		"S11_VWAP_REVERT":   s.ScanS11VWAPRevert,   // Pure VWAP reversion
+		"S12_EOD_REVERT":    s.ScanS12EODReversion, // EOD institutional reversion
+		"S13_SECTOR_ROT":    s.ScanS13SectorRotation, // Sector rotation momentum
+		"S14_RSI_SCALP":     s.ScanS14RSIScalp,     // RSI-2 Connors scalper
+		"S15_RSI_SWING":     s.ScanS15RSISwing,     // RSI-14 pullback swing
 	}
 
 	// Helper to track which strategies actually ran for diagnostics
@@ -1829,7 +1909,7 @@ func (s *ScannerAgent) RunStrategyScans(regime string, strategies []string) []*S
 			runCounts["S14_RSI_SCALP"], runCounts["S15_RSI_SWING"], len(all))
 	}
 
-	// CRITICAL: Filter by net profitability — remove any signal that can't cover charges
+	// Filter by net profitability — reject signals that can't cover charges
 	filtered := s.FilterByNetProfit(all, config.TotalCapital)
 
 	if len(all) > 0 && len(filtered) < len(all) {

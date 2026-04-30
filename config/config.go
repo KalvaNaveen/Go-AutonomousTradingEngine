@@ -98,23 +98,23 @@ func Reload() {
 }
 
 // ── Capital ─────────────────────────────────────────────────
-var TotalCapital = envFloat("TRADING_CAPITAL", 100000)
+var TotalCapital = envFloat("TRADING_CAPITAL", 500000)
 
-// ── Risk — Adaptive Intraday System ─────────────────────────
+// ── Risk — Balanced Intraday System ─────────────────────────
 const (
-	MaxRiskPerTradePct = 0.005  // 0.5% of capital per trade (was 0.05% — too small to cover charges)
-	DailyLossLimitPct  = 0.04  // 4% daily loss limit (was 6% — tighter circuit breaker with larger sizing)
-	MaxConsecutiveLosses = 8   // Stop after 8 consecutive losses (was 15)
-	MaxOpenPositions   = 10    // Max 10 concurrent positions (was 20 — focus capital on best setups)
-	MaxPositionsPerStrat = 3   // Max 3 per strategy (was 5)
-	MaxPositionPct     = 0.15
-	EODSquareoffTime   = "15:15"
-	EODSquareoffFinal  = "15:15"
-	PreemptiveExitTime = "14:50"
+	MaxRiskPerTradePct   = 0.01  // 1% of capital per trade — standard for active intraday
+	DailyLossLimitPct    = 0.03  // 3% daily loss limit (₹3000 on 1L) — room for recovery
+	MaxConsecutiveLosses = 6     // 6 losses in a row → pause engine
+	MaxOpenPositions     = 8     // Max 8 concurrent positions — more surface area
+	MaxPositionsPerStrat = 3     // Max 3 per strategy
+	MaxPositionPct       = 0.25  // 25% max notional per position — meaningful size
+	EODSquareoffTime     = "15:15"
+	EODSquareoffFinal    = "15:15"
+	PreemptiveExitTime   = "14:50"
 
-	STTBuffer         = 0.997
-	ActiveCapitalPct  = 0.80
-	RiskReservePct    = 0.20
+	STTBuffer        = 1.0   // No haircut — charges already computed precisely in charges.go
+	ActiveCapitalPct = 0.85  // Deploy more capital (was 80%)
+	RiskReservePct   = 0.15
 )
 
 // ── Instrument Tokens ───────────────────────────────────────
