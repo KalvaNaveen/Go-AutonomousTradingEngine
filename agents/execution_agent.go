@@ -312,9 +312,14 @@ func (e *ExecutionAgent) MonitorPositions(regime string) {
 
 		// ═══ THESIS EXPIRED — 2hr max hold if losing ═══
 		// If the trade hasn't moved to profit in 2 hours, the setup is dead.
-		// Apr 29: LENSKART held 5.5hrs losing (-₹1,616), AUROPHARMA 4.3hrs (-₹1,516)
+		// EXCEPTION: S10_GAP_FILL — gap fills statistically need up to 3 hours.
+		// S10 already has its own entry window (09:16-11:00) and exits at EOD.
 		holdDuration := config.NowIST().Sub(trade.EntryTime)
-		if holdDuration > 2*time.Hour && gross < 0 {
+		thesisMaxHold := 2 * time.Hour
+		if trade.Strategy == "S10_GAP_FILL" {
+			thesisMaxHold = 3 * time.Hour // Gap fills need more time
+		}
+		if holdDuration > thesisMaxHold && gross < 0 {
 			log.Printf("[Exec] THESIS_EXPIRED: %s held %.1fhrs while losing ₹%.0f — cutting dead trade",
 				trade.Symbol, holdDuration.Hours(), gross)
 			SendTelegram(fmt.Sprintf("⏰ *THESIS EXPIRED* `%s` held %.1fhrs losing ₹%.0f — Dead trade cut.",

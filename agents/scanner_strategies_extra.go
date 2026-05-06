@@ -16,15 +16,14 @@ func (s *ScannerAgent) ScanS6TrendShort(regime string) []*Signal {
 		return nil
 	}
 
-	niftyLTP := s.GetLTP(config.Nifty50Token)
-	niftyOpen := 0.0
-	if s.GetDayOpen != nil {
-		niftyOpen = s.GetDayOpen(config.Nifty50Token)
+	// Broad market direction from AD ratio of 250-stock universe
+	adRatio := 0.5
+	if s.GetADRatio != nil {
+		a := s.GetADRatio()
+		if a > 0 {
+			adRatio = a
+		}
 	}
-	if niftyLTP <= 0 || niftyOpen <= 0 {
-		return nil
-	}
-	niftyChg := (niftyLTP - niftyOpen) / niftyOpen
 
 	today := config.TodayIST()
 	var signals []*Signal
@@ -64,10 +63,11 @@ func (s *ScannerAgent) ScanS6TrendShort(regime string) []*Signal {
 			continue
 		}
 
-		// Relative weakness check (Must be significantly weaker than Nifty)
+		// Relative weakness check: stock must be falling while broad market is neutral/up
+		// AD ratio > 0.45 means market is not broadly selling — so this stock is weak
 		stockChg := (current - dayOpen) / dayOpen
-		relativeWeakness := niftyChg - stockChg
-		if relativeWeakness < config.S6_RELATIVE_WEAKNESS {
+		if stockChg >= 0 || adRatio < 0.40 {
+			// Stock isn't falling, or entire market is selling (not relative weakness)
 			continue
 		}
 
@@ -147,7 +147,7 @@ func (s *ScannerAgent) ScanS6TrendShort(regime string) []*Signal {
 			Product:       "MIS",
 			IsShort:       true,
 			MaxHoldMins:   120, // Give trend time to work
-			SortKey:       relativeWeakness * rvol, // Rank by weakness backed by volume
+			SortKey:       math.Abs(stockChg) * rvol, // Rank by weakness backed by volume
 		})
 	}
 

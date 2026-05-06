@@ -30,7 +30,6 @@ type Server struct {
 	tickStore  *storage.TickStore
 	dailyCache *storage.DailyCache
 	macro      *agents.MacroAgent
-	mlFilter   *core.MLFilter
 	startTime  time.Time
 }
 
@@ -42,9 +41,8 @@ func NewServer(
 	tickStore *storage.TickStore,
 	dailyCache *storage.DailyCache,
 	macro *agents.MacroAgent,
-	mlFilter *core.MLFilter,
 ) *Server {
-	return &Server{risk, journal, exec, scanner, tickStore, dailyCache, macro, mlFilter, time.Now()}
+	return &Server{risk, journal, exec, scanner, tickStore, dailyCache, macro, time.Now()}
 }
 
 func (s *Server) Start(addr string) {
@@ -237,12 +235,6 @@ func (s *Server) buildStatusData() map[string]interface{} {
 		"universe_count": len(s.scanner.Universe),
 		"index_data":     indexData,
 		"news_feed":      s.macro.GetNewsFeed(),
-		"ml_stats": map[string]interface{}{
-			"trained":  s.mlFilter.Trained,
-			"samples":  s.mlFilter.TrainCount,
-			"accuracy": s.mlFilter.Accuracy,
-			"bias":     s.mlFilter.Bias,
-		},
 	}
 }
 

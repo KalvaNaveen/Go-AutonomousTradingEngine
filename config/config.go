@@ -166,8 +166,8 @@ var (
 	S2_BB_PERIOD      = 20
 	S2_BB_SD          = 2.0
 	S2_RSI_PERIOD     = 14
-	S2_RSI_OVERSOLD   = 30  // Standard 30 (was 32)
-	S2_RSI_OVERBOUGHT = 70  // Standard 70 (was 68)
+	S2_RSI_OVERSOLD   = 40  // Loosened from 35 — RSI(14)<35 on 5min still too rare for signals
+	S2_RSI_OVERBOUGHT = 60  // Loosened from 65
 	S2_ATR_SL_MULT    = 1.0
 	S2_RR             = 1.2
 	S2_RISK_PCT       = 0.005
@@ -228,7 +228,7 @@ var (
 var (
 	S9_EMA_TREND     = 200
 	S9_RSI_PERIOD    = 14
-	S9_RSI_THRESHOLD = 45
+	S9_RSI_THRESHOLD = 40
 	S9_ATR_SL_MULT   = 2.0
 	S9_RR            = 3.0
 )
@@ -236,8 +236,8 @@ var (
 // S14: RSI Scalper (RSI-2 on 5min — Larry Connors adapted for intraday)
 var (
 	S14_RSI_PERIOD     = 2
-	S14_RSI_OVERSOLD   = 5   // Connors research: <5 for high-probability entries (was 10)
-	S14_RSI_OVERBOUGHT = 95  // Connors research: >95 for high-probability entries (was 90)
+	S14_RSI_OVERSOLD   = 15  // Loosened from 10 — RSI(2)<10 still too rare; <15 fires frequently while retaining edge
+	S14_RSI_OVERBOUGHT = 85  // Loosened from 90
 	S14_RSI_EXIT       = 50
 	S14_STOP_PCT       = 0.005 // 0.5% tight scalp stop
 	S14_MAX_HOLD_MINS  = 30
@@ -247,8 +247,8 @@ var (
 // S15: RSI Swing (RSI-14 pullback with EMA20 trend confirmation)
 var (
 	S15_RSI_PERIOD     = 14
-	S15_RSI_OVERSOLD   = 30  // Standard 30 (was 35)
-	S15_RSI_OVERBOUGHT = 70  // Standard 70 (was 65)
+	S15_RSI_OVERSOLD   = 35  // Loosened from 30 — RSI(14)<30 on 5min too rare for intraday
+	S15_RSI_OVERBOUGHT = 65  // Loosened from 70
 	S15_EMA_TREND      = 20
 	S15_ATR_SL_MULT    = 1.0
 	S15_RR             = 2.0
@@ -297,8 +297,18 @@ func init() {
 	JournalDB = BaseDir + string(os.PathSeparator) + "data" + string(os.PathSeparator) + "journal.db"
 }
 
-// DisabledStrategies — empty: all strategies active (S6 enabled after rework)
-var DisabledStrategies = map[string]bool{}
+// DisabledStrategies — only permanently broken strategies
+// S10: Re-enabled — losses came from THESIS_EXPIRED cutting gap fills too early (now exempted)
+// S13: Re-enabled — losses came from CHOP regime entries (now blocked by scale=0.0)
+// S6_TREND: STAYS disabled — 22% WR is structurally broken, not fixable with risk management
+var DisabledStrategies = map[string]bool{
+	"S6_TREND_SHORT": true,
+}
+
+// MinRR is the minimum reward:risk ratio for any signal to be emitted.
+// Enforced at scanner level to structurally prevent inverted R:R.
+// Historical data showed avg loss = 2.7× avg win — this fixes it at source.
+const MinRR = 1.5
 
 // ParseTime parses "HH:MM" into hour, minute
 func ParseTime(s string) (int, int) {

@@ -68,6 +68,12 @@ type ScannerAgent struct {
 
 	// Per-strategy adaptive kill switch: if a strategy loses N times today, disable it
 	strategyLossesToday map[string]int
+
+	// S13 per-symbol signal cooldown: prevents re-signaling same stock every 15 minutes
+	s13SignalCooldown map[string]time.Time
+
+	// Regime stability: count consecutive confirmations before switching
+	regimeConfirmCount int
 }
 
 // Candle represents OHLCV data
@@ -99,10 +105,14 @@ func NewScannerAgent() *ScannerAgent {
 		s6Cooldown:          make(map[string]time.Time),
 		symbolCooldown:      make(map[string]int),
 		strategyLossesToday: make(map[string]int),
+		s13SignalCooldown:   make(map[string]time.Time),
 	}
 }
 
-// ── Regime Detection ─────────────────────────────────────────
+// ── Regime Detection (VIX + AD Ratio of 250-stock universe) ──
+// No Nifty 50 dependency. AD ratio of our universe IS the broad market direction.
+// 3 states only: BULLISH / BEARISH / SIDEWAYS
+// Regime stability: requires 2 consecutive confirmations before switching (prevents flipping)
 func (s *ScannerAgent) DetectRegime() string {
 	vix := 16.0
 	if s.GetIndiaVIX != nil {
@@ -112,7 +122,6 @@ func (s *ScannerAgent) DetectRegime() string {
 		}
 	}
 
-	result := "UNKNOWN"
 	adRatio := 0.5
 	if s.GetADRatio != nil {
 		a := s.GetADRatio()
@@ -121,37 +130,45 @@ func (s *ScannerAgent) DetectRegime() string {
 		}
 	}
 
-	aboveEMA := false
-	if s.DailyCache != nil && s.DailyCache.Loaded {
-		ema25 := s.DailyCache.EMA25[config.Nifty50Token]
-		niftyLTP := 0.0
-		if s.GetLTP != nil {
-			niftyLTP = s.GetLTP(config.Nifty50Token)
+	// ═══ SIMPLE 3-STATE MODEL ═══
+	// VIX < 20 + majority stocks up = BULLISH
+	// VIX > 20 + majority stocks down = BEARISH
+	// Everything else = SIDEWAYS (most common — run all strategies)
+	candidate := "SIDEWAYS"
+	if vix >= 30 {
+		// Extreme VIX = always BEARISH regardless of AD ratio
+		candidate = "BEARISH"
+	} else if vix < 20 && adRatio > 0.55 {
+		candidate = "BULLISH"
+	} else if vix > 20 && adRatio < 0.45 {
+		candidate = "BEARISH"
+	}
+
+	// ═══ REGIME STABILITY ═══
+	// Only change regime after 2 consecutive confirmations of the NEW state.
+	// This prevents the CHOP↔NORMAL flipping (10 changes on May 6).
+	if candidate != s.LastRegime {
+		s.regimeConfirmCount++
+		if s.regimeConfirmCount >= 2 {
+			// Confirmed — switch regime
+			log.Printf("[Regime] %s → %s (VIX=%.1f AD=%.2f) — confirmed after %d checks",
+				s.LastRegime, candidate, vix, adRatio, s.regimeConfirmCount)
+			s.LastRegime = candidate
+			s.regimeConfirmCount = 0
+		} else {
+			log.Printf("[Regime] Candidate=%s (VIX=%.1f AD=%.2f) — need %d more confirmation(s), staying %s",
+				candidate, vix, adRatio, 2-s.regimeConfirmCount, s.LastRegime)
 		}
-		aboveEMA = niftyLTP > ema25 && niftyLTP > 0
-	}
-
-	if vix >= config.VIXExtremeStop {
-		result = "EXTREME_PANIC"
-	} else if vix > config.VIXBearPanic && !aboveEMA && adRatio < 0.40 {
-		log.Printf("[Regime] BEAR_PANIC — VIX=%.1f AD=%.2f", vix, adRatio)
-		result = "BEAR_PANIC"
-	} else if vix < config.VIXBearPanic && aboveEMA && adRatio > 0.50 {
-		log.Printf("[Regime] BULL — VIX=%.1f AD=%.2f", vix, adRatio)
-		result = "BULL"
-	} else if vix < config.VIXBullMax && adRatio >= 0.45 {
-		log.Printf("[Regime] NORMAL — VIX=%.1f AD=%.2f", vix, adRatio)
-		result = "NORMAL"
-	} else if config.VIXBullMax <= vix && vix < config.VIXExtremeStop {
-		log.Printf("[Regime] VOLATILE — VIX=%.1f AD=%.2f", vix, adRatio)
-		result = "VOLATILE"
 	} else {
-		log.Printf("[Regime] CHOP — VIX=%.1f AD=%.2f", vix, adRatio)
-		result = "CHOP"
+		s.regimeConfirmCount = 0 // Reset counter when candidate matches current
 	}
 
-	s.LastRegime = result
-	return result
+	// First-time initialization
+	if s.LastRegime == "" || s.LastRegime == "UNKNOWN" {
+		s.LastRegime = candidate
+	}
+
+	return s.LastRegime
 }
 
 // ── Time Enforcement ─────────────────────────────────────────
@@ -191,6 +208,7 @@ func (s *ScannerAgent) NewSession() {
 	s.s6vTradesToday = 0
 	s.s6vLastLossTime = time.Time{}
 	s.strategyLossesToday = make(map[string]int) // Reset daily kill switch
+	s.s13SignalCooldown = make(map[string]time.Time) // Reset S13 per-symbol cooldown
 
 	expired := []string{}
 	for k, v := range s.symbolCooldown {
@@ -321,11 +339,7 @@ func (s *ScannerAgent) ScanS1(regime string) []*Signal {
 			continue
 		}
 
-		sma200 := s.DailyCache.SMA200[token]
-		if sma200 <= 0 {
-			continue
-		}
-		isAbove200 := current > sma200
+		// SMA200 filter REMOVED — S1 now fires on EMA crossovers regardless of long-term trend
 
 		c15 := s.get15MinCloses(token)
 		if len(c15) < config.S1_EMA_SLOW+2 {
@@ -387,26 +401,12 @@ func (s *ScannerAgent) ScanS1(regime string) []*Signal {
 			atr = sum / 14.0
 		}
 
-		// EMA21 slope
-		ema21SlopeUp := false
-		ema21SlopeDown := false
-		if len(ema21) >= 4 {
-			ema21SlopeUp = ema21[len(ema21)-1] > ema21[len(ema21)-3]
-			ema21SlopeDown = ema21[len(ema21)-1] < ema21[len(ema21)-3]
-		}
+		// EMA21 slope check REMOVED — redundant with cross direction
 
-		// MACD(12,26,9) histogram confirmation — filters false crossovers
-		macdVal, signalVal, _ := data.ComputeMACD(c15, 12, 26, 9)
-		macdHist := macdVal - signalVal
-		if crossUp && macdHist < 0 {
-			continue // Bullish crossover but MACD bearish — skip
-		}
-		if crossDown && macdHist > 0 {
-			continue // Bearish crossover but MACD bullish — skip
-		}
-		_ = signalVal
+		// MACD confirmation REMOVED — was too restrictive, S1 never fired
+		// EMA crossover is already a trend signal; MACD adds redundant lag
 
-		if crossUp && isAbove200 && ema21SlopeUp {
+		if crossUp {
 			stopPrice := math.Round((current-config.S1_ATR_SL_MULT*atr)*100) / 100
 			risk := current - stopPrice
 			if risk <= 0 {
@@ -420,7 +420,7 @@ func (s *ScannerAgent) ScanS1(regime string) []*Signal {
 				TargetPrice: targetPrice, ATR: atr, ADX: adx, RVol: rvol,
 				Product: "MIS", IsShort: false, SortKey: adx,
 			})
-		} else if crossDown && !isAbove200 && ema21SlopeDown {
+		} else if crossDown {
 			stopPrice := math.Round((current+config.S1_ATR_SL_MULT*atr)*100) / 100
 			risk := stopPrice - current
 			if risk <= 0 {
@@ -486,7 +486,7 @@ func (s *ScannerAgent) ScanS2(regime string) []*Signal {
 		if vwap <= 0 {
 			continue
 		}
-		vwapDev := (current - vwap) / vwap
+		// vwapDev filter REMOVED — was too restrictive, prevented S2 from ever firing
 
 		atr := s.DailyCache.ATR[token]
 		if atr <= 0 {
@@ -504,10 +504,11 @@ func (s *ScannerAgent) ScanS2(regime string) []*Signal {
 		prevCandle := candles[len(candles)-2]
 		currCandle := candles[len(candles)-1]
 
-		sma200 := s.DailyCache.SMA200[token]
+		// SMA200 filter REMOVED for longs — mean reversion works at any price level
 
 		// LONG
-		if prevCandle.Close < bbLo && currCandle.Close > bbLo && rsiVal < float64(config.S2_RSI_OVERSOLD) && vwapDev > -0.03 && (sma200 <= 0 || current >= sma200) {
+		// LONG: BB lower touch + RSI confirmation (removed vwapDev + SMA200 filters — too restrictive)
+		if prevCandle.Close < bbLo && currCandle.Close > bbLo && rsiVal < float64(config.S2_RSI_OVERSOLD) {
 			stopPrice := math.Round((current-config.S2_ATR_SL_MULT*atr)*100) / 100
 			targetPrice := math.Round(bbMid*100) / 100
 			risk := current - stopPrice
@@ -525,7 +526,8 @@ func (s *ScannerAgent) ScanS2(regime string) []*Signal {
 		}
 
 		// SHORT
-		if prevCandle.Close > bbHi && currCandle.Close < bbHi && rsiVal > float64(config.S2_RSI_OVERBOUGHT) && vwapDev < 0.03 {
+		// SHORT: BB upper touch + RSI confirmation (removed vwapDev filter)
+		if prevCandle.Close > bbHi && currCandle.Close < bbHi && rsiVal > float64(config.S2_RSI_OVERBOUGHT) {
 			stopPrice := math.Round((current+config.S2_ATR_SL_MULT*atr)*100) / 100
 			targetPrice := math.Round(bbMid*100) / 100
 			risk := stopPrice - current
@@ -1088,15 +1090,14 @@ func (s *ScannerAgent) ScanS10GapFill(regime string) []*Signal {
 		return nil
 	}
 
-	// Nifty trend filter: don't fade gaps in the direction of the market
-	niftyLTP := s.GetLTP(config.Nifty50Token)
-	niftyOpen := 0.0
-	if s.GetDayOpen != nil {
-		niftyOpen = s.GetDayOpen(config.Nifty50Token)
-	}
-	niftyChgPct := 0.0
-	if niftyLTP > 0 && niftyOpen > 0 {
-		niftyChgPct = (niftyLTP - niftyOpen) / niftyOpen * 100
+	// Broad market direction filter: use AD ratio of 250-stock universe
+	// instead of Nifty 50. AD ratio > 0.6 = market bullish, < 0.4 = market bearish
+	adRatio := 0.5
+	if s.GetADRatio != nil {
+		a := s.GetADRatio()
+		if a > 0 {
+			adRatio = a
+		}
 	}
 
 	var signals []*Signal
@@ -1142,8 +1143,8 @@ func (s *ScannerAgent) ScanS10GapFill(regime string) []*Signal {
 
 		// GAP UP → SHORT (fade the gap, target = prev close)
 		if gapPct > 2.0 && current > prevClose*1.005 {
-			// Don't fade gap-ups when Nifty is strongly up (market momentum)
-			if niftyChgPct > 0.3 {
+			// Don't fade gap-ups when broad market is strongly bullish
+			if adRatio > 0.60 {
 				continue
 			}
 			// RSI(14) confirmation: only short if RSI > 65 (overbought)
@@ -1178,8 +1179,8 @@ func (s *ScannerAgent) ScanS10GapFill(regime string) []*Signal {
 
 		// GAP DOWN → LONG (fade the gap, target = prev close)
 		if gapPct < -2.0 && current < prevClose*0.995 {
-			// Don't fade gap-downs when Nifty is strongly down
-			if niftyChgPct < -0.3 {
+			// Don't fade gap-downs when broad market is strongly bearish
+			if adRatio < 0.40 {
 				continue
 			}
 			// RSI(14) confirmation: only buy if RSI < 35 (oversold)
@@ -1456,6 +1457,9 @@ func (s *ScannerAgent) ScanS13SectorRotation(regime string) []*Signal {
 		return nil // Only scan during the first minute of each 15-min window
 	}
 
+	// Per-symbol cooldown: don't re-signal same stock within 2 hours
+	// Prevents MRF/VEDL/TATASTEEL/ADANIPOWER spamming every 15 minutes
+
 	// Compute intraday change for each symbol
 	type symbolStrength struct {
 		token    uint32
@@ -1502,6 +1506,13 @@ func (s *ScannerAgent) ScanS13SectorRotation(regime string) []*Signal {
 			continue
 		}
 
+		// Per-symbol 2-hour cooldown: don't re-signal same stock
+		if lastSig, ok := s.s13SignalCooldown[ss.symbol]; ok {
+			if time.Since(lastSig) < 2*time.Hour {
+				continue
+			}
+		}
+
 		current := s.GetLTP(ss.token)
 		atr := s.DailyCache.ATR[ss.token]
 		if atr <= 0 {
@@ -1537,6 +1548,7 @@ func (s *ScannerAgent) ScanS13SectorRotation(regime string) []*Signal {
 			Product: "MIS", IsShort: false, MaxHoldMins: 45,
 			SortKey: ss.changePct * ss.rvol,
 		})
+		s.s13SignalCooldown[ss.symbol] = time.Now() // Record cooldown
 	}
 
 	// Bottom 3 weakest + high volume → SHORT (momentum continuation)
@@ -1544,6 +1556,13 @@ func (s *ScannerAgent) ScanS13SectorRotation(regime string) []*Signal {
 		ss := allStocks[i]
 		if ss.changePct > -2.5 || ss.rvol < 1.5 {
 			continue
+		}
+
+		// Per-symbol 2-hour cooldown: don't re-signal same stock
+		if lastSig, ok := s.s13SignalCooldown[ss.symbol]; ok {
+			if time.Since(lastSig) < 2*time.Hour {
+				continue
+			}
 		}
 
 		current := s.GetLTP(ss.token)
@@ -1581,6 +1600,7 @@ func (s *ScannerAgent) ScanS13SectorRotation(regime string) []*Signal {
 			Product: "MIS", IsShort: true, MaxHoldMins: 45,
 			SortKey: math.Abs(ss.changePct) * ss.rvol,
 		})
+		s.s13SignalCooldown[ss.symbol] = time.Now() // Record cooldown
 	}
 
 	return signals
@@ -1779,6 +1799,60 @@ func (s *ScannerAgent) ScanS15RSISwing(regime string) []*Signal {
 	return signals
 }
 
+// ══════════════════════════════════════════════════════════════
+//  REGIME-BASED STRATEGY ROUTER (3-STATE MODEL)
+//  BULLISH  = trend + momentum (market is clearly up)
+//  BEARISH  = shorts + mean reversion (market is clearly down)
+//  SIDEWAYS = ALL strategies (most common — let signals compete)
+// ══════════════════════════════════════════════════════════════
+func getStrategiesForRegime(regime string) []string {
+	switch regime {
+	case "BULLISH":
+		// 🟢 Market is up: trend-following + momentum + breakouts
+		return []string{
+			"S1_MA_CROSS",      // EMA crossover — rides the uptrend
+			"S3_ORB",           // ORB — breakouts extend in trending markets
+			"S8_VOL_PIVOT",     // Volume pivot — breakout confirmation
+			"S9_MTF_MOMENTUM",  // Multi-TF momentum — strongest in trends
+			"S10_GAP_FILL",     // Gap fill — universal
+			"S13_SECTOR_ROT",   // Sector rotation — buy the strongest
+			"S14_RSI_SCALP",    // RSI scalp — universal
+			"S15_RSI_SWING",    // RSI swing — pullback buying in uptrend
+		}
+
+	case "BEARISH":
+		// 🔴 Market is down: shorts + mean reversion for oversold bounces
+		return []string{
+			"S2_BB_MEAN_REV",   // BB mean reversion — catch oversold bounces
+			"S6_TREND_SHORT",   // Trend short — ride relative weakness
+			"S6_VWAP_BAND",     // VWAP band — reversion from extremes
+			"S10_GAP_FILL",     // Gap fill — gap-downs fill frequently
+			"S13_SECTOR_ROT",   // Sector rotation — short weakest
+			"S14_RSI_SCALP",    // RSI scalp — extremes in panic = scalps
+			"S15_RSI_SWING",    // RSI swing — oversold bounce plays
+		}
+
+	default: // "SIDEWAYS" and any other value
+		// 🟡 No clear direction — ALL strategies compete for best signals
+		// This is the most common state. The engine should trade freely here.
+		return []string{
+			"S1_MA_CROSS",
+			"S2_BB_MEAN_REV",
+			"S3_ORB",
+			"S6_VWAP_BAND",
+			"S7_MEAN_REV_LONG",
+			"S8_VOL_PIVOT",
+			"S9_MTF_MOMENTUM",
+			"S10_GAP_FILL",
+			"S11_VWAP_REVERT",
+			"S12_EOD_REVERT",
+			"S13_SECTOR_ROT",
+			"S14_RSI_SCALP",
+			"S15_RSI_SWING",
+		}
+	}
+}
+
 // RunAllScans executes all strategies and returns combined signals
 // FILTERED by net profitability — no signal reaches execution unless it
 // can produce ≥₹50 net profit after ALL Zerodha charges.
@@ -1795,26 +1869,20 @@ func (s *ScannerAgent) RunAllScans(regime string) []*Signal {
 }
 
 // RunStrategyScans executes specific strategies by string name. 
-// If strategies is nil or empty, all strategies will be run (backward compatible with RunAllScans).
+// If strategies is nil or empty, uses REGIME-BASED ROUTING to select appropriate strategies.
+// If strategies are explicitly specified (e.g., by backtester), runs exactly those.
 func (s *ScannerAgent) RunStrategyScans(regime string, strategies []string) []*Signal {
 	var all []*Signal
 
-	// Mapping of strategy names to their execution functions
-	// Pruned based on ACTUAL P&L data from journal.db (not gut feel):
-	//   S8_MACRO: +₹232 (ONLY profitable strategy) → KEEP
-	//   S12_EOD:  -₹76  → DISABLE (marginal loss, low conviction)
-	//   S10_GAP:  -₹885 → DISABLE (high loss)
-	//   S13_ROT:  -₹688 → DISABLE (consistent loser)
-	//   S6_TREND: -₹1855 (WORST strategy, 22% WR) → DISABLE
-	//   S1, S2, S9: never traded → DISABLE (unproven)
+	// Full strategy registry
 	strategyMap := map[string]func(string) []*Signal{
-		"S1_MA_CROSS":       s.ScanS1,              // EMA crossover — bread & butter
+		"S1_MA_CROSS":       s.ScanS1,              // EMA crossover — trend-following
 		"S2_BB_MEAN_REV":    s.ScanS2,              // Bollinger mean reversion
-		"S3_ORB":            s.ScanS3,              // ORB — proven intraday setup
+		"S3_ORB":            s.ScanS3,              // ORB — breakout setup
 		"S6_TREND_SHORT":    s.ScanS6TrendShort,    // Relative weakness short
 		"S6_VWAP_BAND":      s.ScanS6VWAP,          // VWAP band reversion
 		"S7_MEAN_REV_LONG":  s.ScanS7,              // Mean reversion long
-		"S8_VOL_PIVOT":      s.ScanS8,              // Volume pivot — historically profitable
+		"S8_VOL_PIVOT":      s.ScanS8,              // Volume pivot breakout
 		"S9_MTF_MOMENTUM":   s.ScanS9,              // Multi-timeframe momentum
 		"S10_GAP_FILL":      s.ScanS10GapFill,      // Gap fill — 70% statistical edge
 		"S11_VWAP_REVERT":   s.ScanS11VWAPRevert,   // Pure VWAP reversion
@@ -1830,12 +1898,15 @@ func (s *ScannerAgent) RunStrategyScans(regime string, strategies []string) []*S
 	// Determine which strategies to run
 	var toRun []string
 	if len(strategies) == 0 {
-		// Run all if none specified
-		for k := range strategyMap {
-			toRun = append(toRun, k)
-		}
+		// ═══ REGIME-BASED STRATEGY ROUTING ═══
+		// Different market conditions need different trading approaches.
+		// Momentum strategies THRIVE in trends but get KILLED in chop.
+		// Mean reversion strategies LOVE volatility but FAIL in strong trends.
+		// Running the wrong strategies in the wrong regime = guaranteed losses.
+		toRun = getStrategiesForRegime(regime)
+		log.Printf("[Router] Regime=%s → %d strategies active: %v", regime, len(toRun), toRun)
 	} else {
-		// Filter based on input
+		// Explicit strategy list (from backtester/simulator) — run exactly those
 		for _, name := range strategies {
 			if _, exists := strategyMap[name]; exists {
 				toRun = append(toRun, name)
@@ -1909,12 +1980,41 @@ func (s *ScannerAgent) RunStrategyScans(regime string, strategies []string) []*S
 			runCounts["S14_RSI_SCALP"], runCounts["S15_RSI_SWING"], len(all))
 	}
 
-	// Filter by net profitability — reject signals that can't cover charges
-	filtered := s.FilterByNetProfit(all, config.TotalCapital)
+	// ═══ MINIMUM R:R ENFORCEMENT (structural fix for inverted R:R) ═══
+	// Historical data: avg loss = 2.7× avg win. This rejects signals where
+	// reward < 1.5× risk, ensuring positive expectancy at any win rate > 40%.
+	var rrFiltered []*Signal
+	for _, sig := range all {
+		var risk, reward float64
+		if sig.IsShort {
+			risk = sig.StopPrice - sig.EntryPrice
+			reward = sig.EntryPrice - sig.TargetPrice
+		} else {
+			risk = sig.EntryPrice - sig.StopPrice
+			reward = sig.TargetPrice - sig.EntryPrice
+		}
+		if risk <= 0 {
+			continue
+		}
+		rr := reward / risk
+		if rr < config.MinRR {
+			log.Printf("[RR_FILTER] REJECTED %s %s R:R=%.2f (min=%.1f) reward=%.1f risk=%.1f",
+				sig.Strategy, sig.Symbol, rr, config.MinRR, reward, risk)
+			continue
+		}
+		rrFiltered = append(rrFiltered, sig)
+	}
+	if len(all) > 0 && len(rrFiltered) < len(all) {
+		log.Printf("[Scanner] R:R filter: %d/%d passed (rejected %d with R:R < %.1f)",
+			len(rrFiltered), len(all), len(all)-len(rrFiltered), config.MinRR)
+	}
 
-	if len(all) > 0 && len(filtered) < len(all) {
+	// Filter by net profitability — reject signals that can't cover charges
+	filtered := s.FilterByNetProfit(rrFiltered, config.TotalCapital)
+
+	if len(rrFiltered) > 0 && len(filtered) < len(rrFiltered) {
 		log.Printf("[Scanner] Charge filter: %d/%d signals passed (rejected %d unprofitable)",
-			len(filtered), len(all), len(all)-len(filtered))
+			len(filtered), len(rrFiltered), len(rrFiltered)-len(filtered))
 	}
 
 	return filtered

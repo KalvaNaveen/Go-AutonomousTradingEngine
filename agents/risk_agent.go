@@ -151,55 +151,33 @@ func (r *RiskAgent) CalculatePositionSize(entry, stop float64, regime, strategy,
 
 	var scale float64
 	if meanRevStrategies[strategy] {
-		// Mean reversion: SCALE UP in volatile (more reversion), DOWN in trend
+		// Mean reversion: full size everywhere except strong trends
 		switch regime {
-		case "BULL":
+		case "BULLISH":
 			scale = 0.85 // Trending market — reversion less reliable
-		case "NORMAL":
-			scale = 1.0
-		case "VOLATILE":
-			scale = 1.15 // Bigger swings = better reversion entries
-		case "CHOP":
-			scale = 1.0 // Choppy = good for mean reversion
-		case "BEAR_PANIC":
-			scale = 0.70 // Extreme moves may not revert intraday
-		case "EXTREME_PANIC":
-			scale = 0.25
-		default:
+		case "BEARISH":
+			scale = 1.0  // Bearish = oversold bounces = mean reversion paradise
+		default: // SIDEWAYS
 			scale = 1.0
 		}
 	} else if momentumStrategies[strategy] {
-		// Momentum: SCALE UP in trends, BLOCK in chop/panic
+		// Momentum: full size in trends, blocked in bearish
 		switch regime {
-		case "BULL":
+		case "BULLISH":
 			scale = 1.0
-		case "NORMAL":
-			scale = 1.0
-		case "VOLATILE":
-			scale = 0.50 // Volatile = risky for momentum
-		case "CHOP":
-			scale = 0.0 // BLOCK: chop kills momentum — S13 lost ₹2,347 in chop on Apr 29
-		case "BEAR_PANIC":
-			scale = 0.0 // BLOCK: panic reverses too fast for momentum
-		case "EXTREME_PANIC":
-			scale = 0.0
-		default:
-			scale = 1.0
+		case "BEARISH":
+			scale = 0.0  // BLOCK: panic reverses too fast for momentum
+		default: // SIDEWAYS
+			scale = 0.85 // Slightly reduced — no clear trend
 		}
 	} else {
-		// Default (S8_VOL_PIVOT, macro, etc.)
+		// Default (S8_VOL_PIVOT, S10_GAP_FILL, etc.)
 		switch regime {
-		case "BULL", "NORMAL":
+		case "BULLISH":
 			scale = 1.0
-		case "VOLATILE":
-			scale = 0.85
-		case "CHOP":
-			scale = 0.60
-		case "BEAR_PANIC":
-			scale = 0.50
-		case "EXTREME_PANIC":
-			scale = 0.25
-		default:
+		case "BEARISH":
+			scale = 0.70
+		default: // SIDEWAYS
 			scale = 1.0
 		}
 	}

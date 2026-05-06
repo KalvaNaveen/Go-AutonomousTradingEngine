@@ -96,20 +96,8 @@ func main() {
 	exec.Scanner = scanner
 	fillMonitor := core.NewFillMonitor(stateManager)
 
-	// ── ML Signal Filter (with Backtester cold-start fix) ──
-	mlFilter := core.NewMLFilter()
-	mlFilter.TrainFromJournal()
-
-	// If ML has insufficient training data, run backtester to seed journal.db
-	if !mlFilter.Trained {
-		log.Println("[Engine] ML filter needs more data — running backtester to seed...")
-		simulator.RunBacktestAndSeed()
-		// Retrain with new backtest data
-		mlFilter.TrainFromJournal()
-	}
-
-	log.Printf("[Engine] ML Filter: trained=%v samples=%d accuracy=%.1f%%",
-		mlFilter.Trained, mlFilter.TrainCount, mlFilter.Accuracy)
+	// ML Filter REMOVED — was untrained, insufficient data, randomly blocking signals
+	// Signals now go straight through: DisabledStrategies → VaR → Execute
 
 	// ── Walk-Forward Optimizer ──
 	wfo := core.NewWalkForwardOptimizer()
@@ -393,7 +381,7 @@ func main() {
 	// Kill any zombie process holding the port from a previous crash
 	killOldProcess(dashboardPort)
 
-	apiServer := api.NewServer(risk, journal, exec, scanner, tickStore, dailyCache, macroAgent, mlFilter)
+	apiServer := api.NewServer(risk, journal, exec, scanner, tickStore, dailyCache, macroAgent)
 	go apiServer.Start(dashboardAddr)
 	log.Printf("[Engine] API server started on %s — Dashboard: %s", dashboardAddr, dashboardURL)
 
@@ -416,15 +404,14 @@ func main() {
 	// ══════════════════════════════════════════════════════════════
 	initTime := (time.Now().UnixNano() - startNs) / 1000
 	journal.LogAgentActivity("Engine", "STARTUP",
-		fmt.Sprintf("Go Engine v2.0 | Capital=%.0f | Mode=%v | Universe=%d | Strategies=12 | ML=%v | Init=%dμs",
-			risk.TotalCapital, config.PaperMode, len(dataAgent.Universe), mlFilter.Trained, initTime),
+		fmt.Sprintf("Go Engine v2.0 | Capital=%.0f | Mode=%v | Universe=%d | Strategies=12 | Init=%dμs",
+			risk.TotalCapital, config.PaperMode, len(dataAgent.Universe), initTime),
 		config.NowIST().Format("15:04:05"))
 
 	agents.SendTelegram(fmt.Sprintf(
-		"🚀 *QUANTIX ENGINE v2.0*\nMode: `%s`\nCapital: `₹%.0f`\nUniverse: `%d stocks`\nStrategies: `12 (S1-S13)`\nML Filter: `%v (acc=%.0f%%)`\nMin Net Profit: `₹50/trade`\nInit: `%dμs`",
+		"🚀 *QUANTIX ENGINE v2.0*\nMode: `%s`\nCapital: `₹%.0f`\nUniverse: `%d stocks`\nStrategies: `12 (S1-S13)`\nMin Net Profit: `₹50/trade`\nInit: `%dμs`",
 		map[bool]string{true: "PAPER", false: "LIVE"}[config.PaperMode],
-		risk.TotalCapital, len(dataAgent.Universe),
-		mlFilter.Trained, mlFilter.Accuracy, initTime))
+		risk.TotalCapital, len(dataAgent.Universe), initTime))
 
 	log.Printf("[Engine] ✅ Fully initialized in %dμs. Entering main loop...", initTime)
 
@@ -589,72 +576,14 @@ func main() {
 					config.NowIST().Format("15:04:05"))
 			}
 
-			// Execute all signals — no filters, no restrictions
+		// Execute signals — STRIPPED PIPELINE
+			// Only 2 checks: DisabledStrategies + VaR risk. Everything else was killing signals.
+			// May 6: 13 signals entered the old 7-layer gauntlet, only 1 survived. Unacceptable.
 			execStart := time.Now().UnixNano()
 			executed := 0
 			for _, sig := range signals {
 				if config.DisabledStrategies[sig.Strategy] {
 					continue
-				}
-
-				// Per-strategy adaptive kill: skip strategies that lost 3+ times today
-				if scanner.IsStrategyKilledToday(sig.Strategy) {
-					continue
-				}
-
-				// ML Filter: neural network quality gate (only blocks worst 10-20% of signals)
-				mlFV := core.FeatureVector{
-					RSI:         core.Clamp01(sig.RSI / 100.0),
-					ADX:         core.Clamp01(sig.ADX / 100.0),
-					RVol:        core.Clamp01(sig.RVol / 5.0),
-					VIX:         core.Clamp01(scanner.GetIndiaVIX() / 40.0),
-					ADRatio:     core.Clamp01(scanner.GetADRatio()),
-					HourOfDay:   core.Clamp01(float64(config.NowIST().Hour()-9) / 6.0),
-					RegimeScore: core.EncodeRegime(currentRegime),
-				}
-				if mlApproved, mlProb := mlFilter.ShouldTradeSignal(mlFV); !mlApproved {
-					log.Printf("[ML] REJECTED %s %s prob=%.2f (min=%.2f)",
-						sig.Strategy, sig.Symbol, mlProb, core.MLMinConfidence)
-					continue
-				}
-
-				// Sector limit: max 2 positions per sector
-				if exec.SectorCount(sig.Symbol) >= 2 {
-					continue
-				}
-
-				// Order Flow Intelligence: boost/penalize signal based on bid/ask imbalance
-				flowScore := scanner.OrderFlowScore(sig.Token, sig.IsShort)
-				if flowScore < 0.75 {
-					log.Printf("[OrderFlow] WEAK %s %s flow=%.2f — counter-flow signal, skipping",
-						sig.Strategy, sig.Symbol, flowScore)
-					continue // Order flow strongly contradicts the signal direction
-				}
-				sig.SortKey *= flowScore // Boost priority for flow-confirmed signals
-
-				// Directional Balance: prevent all-long or all-short portfolio
-				exec.Mu.RLock()
-				longCount, shortCount := 0, 0
-				for _, t := range exec.ActiveTrades {
-					if t.IsShort {
-						shortCount++
-					} else {
-						longCount++
-					}
-				}
-				exec.Mu.RUnlock()
-				totalActive := longCount + shortCount
-				if totalActive >= 3 { // Only apply balance when we have enough positions
-					if !sig.IsShort && longCount > 0 && float64(longCount)/float64(totalActive) > 0.75 {
-						log.Printf("[Balance] SKIPPED long %s — portfolio is %d/%d long, need shorts for hedge",
-							sig.Symbol, longCount, totalActive)
-						continue
-					}
-					if sig.IsShort && shortCount > 0 && float64(shortCount)/float64(totalActive) > 0.75 {
-						log.Printf("[Balance] SKIPPED short %s — portfolio is %d/%d short, need longs for hedge",
-							sig.Symbol, shortCount, totalActive)
-						continue
-					}
 				}
 
 				// VaR Portfolio Risk Check: block trades that would push total risk beyond limit
@@ -679,8 +608,8 @@ func main() {
 				if exec.Execute(sig, currentRegime) {
 					executed++
 					journal.LogAgentActivity("Execution", "TRADE_OPENED",
-						fmt.Sprintf("%s %s Qty=%d Entry=%.1f SL=%.1f Target=%.1f Flow=%.1f",
-							sig.Strategy, sig.Symbol, sig.Qty, sig.EntryPrice, sig.StopPrice, sig.TargetPrice, flowScore),
+						fmt.Sprintf("%s %s Qty=%d Entry=%.1f SL=%.1f Target=%.1f",
+							sig.Strategy, sig.Symbol, sig.Qty, sig.EntryPrice, sig.StopPrice, sig.TargetPrice),
 						config.NowIST().Format("15:04:05"))
 				}
 			}
@@ -720,9 +649,7 @@ func main() {
 				newParams.InSampleSharpe, newParams.OutSampleSharpe, newParams.TotalTradesUsed)
 		}
 
-		// ── ML Filter Retrain (learns from today's trades) ──
-		mlFilter.TrainFromJournal()
-		log.Printf("[ML] Retrained: samples=%d accuracy=%.1f%%", mlFilter.TrainCount, mlFilter.Accuracy)
+		// ML Filter removed — no retrain needed
 
 		log.Println("[Engine] Post-Market Cleanup complete. Trading paused. Sleeping until next morning...")
 		agents.SendTelegram("🏁 *ENGINE SHUTDOWN* — Trading day complete. Process sleeping.")
