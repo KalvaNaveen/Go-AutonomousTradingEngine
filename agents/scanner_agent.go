@@ -3,6 +3,7 @@ package agents
 import (
 	"log"
 	"math"
+	"time"
 
 	"bnf_go_engine/config"
 )
@@ -466,6 +467,10 @@ func (s *ScannerAgent) detectVCPBreakout(token uint32, symbol string, ltp float6
 	}
 
 	// Doc V.1: "Buy exactly at the Pivot Point breakout on high volume"
+	// Kite's tick.Volume is cumulative day-volume — comparing it raw against the
+	// 20-day average is wrong early in the session (trivially smaller). Scale by
+	// the fraction of the trading day elapsed so an intraday breakout passes when
+	// it's pacing above the 20-day average.
 	if vOk && len(volumes) > 20 {
 		var avgVol float64
 		for i := len(volumes) - 21; i < len(volumes)-1; i++ {
@@ -476,8 +481,23 @@ func (s *ScannerAgent) detectVCPBreakout(token uint32, symbol string, ltp float6
 		if s.GetVolume != nil {
 			currentVol = float64(s.GetVolume(token))
 		}
-		if currentVol > 0 && currentVol < avgVol {
-			return nil // Breakout NOT on high volume
+		if currentVol > 0 && avgVol > 0 {
+			// Trading day = 09:15–15:30 IST = 375 minutes. Cap at 1.0 to avoid
+			// over-rewarding late-day breakouts; floor at 0.05 to avoid div-by-tiny.
+			now := config.NowIST()
+			marketOpen := time.Date(now.Year(), now.Month(), now.Day(), 9, 15, 0, 0, now.Location())
+			elapsed := now.Sub(marketOpen).Minutes()
+			fraction := elapsed / 375.0
+			if fraction > 1.0 {
+				fraction = 1.0
+			}
+			if fraction < 0.05 {
+				fraction = 0.05
+			}
+			pacedVol := currentVol / fraction
+			if pacedVol < avgVol {
+				return nil // Pace says today won't reach average → not high-volume breakout
+			}
 		}
 	}
 
@@ -489,7 +509,10 @@ func (s *ScannerAgent) detectVCPBreakout(token uint32, symbol string, ltp float6
 	positionSize := effectiveCapital * config.MaxTradeAllocPct / 100
 	qty := int(math.Floor(positionSize / entryPrice))
 	if qty <= 0 {
-		qty = 1
+		// Stock too expensive for the per-trade allocation — drop the signal.
+		log.Printf("[VCP] %s: position size ₹%.0f / ₹%.2f = 0 shares — skipping",
+			symbol, positionSize, entryPrice)
+		return nil
 	}
 
 	log.Printf("[VCP] BREAKOUT: %s LTP=%.2f Resistance=%.2f Pullbacks=%v",
@@ -546,7 +569,9 @@ func (s *ScannerAgent) CheckTopUp(token uint32, symbol string, entryPrice float6
 	positionSize := effectiveCapital * config.MinTradeAllocPct / 100 // Smaller allocation for top-up
 	qty := int(math.Floor(positionSize / ltp))
 	if qty <= 0 {
-		qty = 1
+		log.Printf("[TopUp] %s: top-up size ₹%.0f / ₹%.2f = 0 shares — skipping",
+			symbol, positionSize, ltp)
+		return nil
 	}
 
 	stopPrice := ltp * (1 - config.HardStopLossPct/100)
@@ -602,7 +627,9 @@ func (s *ScannerAgent) CheckReEntry(token uint32, symbol string, regime string) 
 	positionSize := effectiveCapital * config.MaxTradeAllocPct / 100
 	qty := int(math.Floor(positionSize / entryPrice))
 	if qty <= 0 {
-		qty = 1
+		log.Printf("[ReEntry] %s: re-entry size ₹%.0f / ₹%.2f = 0 shares — skipping",
+			symbol, positionSize, entryPrice)
+		return nil
 	}
 
 	log.Printf("[ReEntry] %s reclaimed 21 EMA: Close=%.2f EMA21=%.2f", symbol, lastClose, ema21Val)

@@ -71,6 +71,17 @@ var (
 	TelegramChatIDs  []string
 )
 
+// ── Dashboard / API ─────────────────────────────────────────
+// DashboardAPIToken protects the JSON endpoints exposed by api.Server
+// (positions, trades, status, ws/live). When empty, auth is disabled —
+// recommended only for local-only paper-mode runs. In live mode, set this
+// in .env and pass `?token=…` (or Authorization: Bearer …) on requests.
+var DashboardAPIToken = envStr("DASHBOARD_API_TOKEN", "")
+
+// DashboardAllowedOrigin restricts CORS on the dashboard API. Defaults to
+// localhost; override via env when serving the dashboard from a different host.
+var DashboardAllowedOrigin = envStr("DASHBOARD_ALLOWED_ORIGIN", "http://127.0.0.1:8085")
+
 func init() {
 	Reload()
 }
@@ -87,6 +98,8 @@ func Reload() {
 	ZerodhaTOTPSecret = envStr("ZERODHA_TOTP_SECRET", "")
 
 	TelegramBotToken = envStr("TELEGRAM_BOT_TOKEN", "")
+	DashboardAPIToken = envStr("DASHBOARD_API_TOKEN", "")
+	DashboardAllowedOrigin = envStr("DASHBOARD_ALLOWED_ORIGIN", "http://127.0.0.1:8085")
 	TelegramChatIDs = nil
 	raw := envStr("TELEGRAM_CHAT_IDS", "")
 	for _, id := range strings.Split(raw, ",") {

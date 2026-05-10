@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"sync"
 	"time"
 
 	"bnf_go_engine/agents"
@@ -98,6 +99,15 @@ func main() {
 		kb := broker.NewKiteBroker()
 		execAgent.PlaceOrder = kb.PlaceOrder
 		execAgent.CancelOrder = kb.CancelOrder
+		// Wire FillMonitor REST hooks so it can poll order status & modify SL qty.
+		fillMonitor.GetOrderStatus = func(orderID string) (*core.OrderStatus, error) {
+			status, filled, pending, avg, err := kb.GetOrderStatus(orderID)
+			if err != nil {
+				return nil, err
+			}
+			return &core.OrderStatus{Status: status, FilledQty: filled, PendingQty: pending, AveragePrice: avg}, nil
+		}
+		fillMonitor.ModifyOrder = kb.ModifyOrder
 		log.Println("[Engine] LIVE broker connected (Kite)")
 	}
 
@@ -340,8 +350,24 @@ func main() {
 		fillMonitor.PlaceOrder = execAgent.PlaceOrder
 		fillMonitor.CancelOrder = execAgent.CancelOrder
 		fillMonitor.AlertFn = func(msg string) { agents.SendTelegram(msg) }
+		// Hand FillMonitor to ExecutionAgent so each LIMIT entry is polled to fill.
+		execAgent.FillMonitor = fillMonitor
 	}
-	_ = fillMonitor
+
+	// Refresh NSE holiday list at startup and once daily at 06:00 IST so the
+	// hardcoded fallback isn't relied on for routine holidays.
+	go refreshNSEHolidays()
+	go func() {
+		for {
+			now := config.NowIST()
+			next := time.Date(now.Year(), now.Month(), now.Day(), 6, 0, 0, 0, now.Location())
+			if !next.After(now) {
+				next = next.AddDate(0, 0, 1)
+			}
+			time.Sleep(time.Until(next))
+			refreshNSEHolidays()
+		}
+	}()
 
 	go launchDashboardUI()
 
@@ -574,32 +600,47 @@ func splitFields(s string) []string {
 	return fields
 }
 
-// FIX-13: NSE Holiday calendar — ⚠️ EXTENSION: Update annually
+// NSE holidays are loaded once at startup from research.FetchNSEHolidays() and
+// refreshed daily at 06:00 IST. Falls back to the hardcoded 2026 list below
+// only if the live fetch fails (e.g., no network at boot).
+//
 // Source: https://www.nseindia.com/resources/exchange-communication-holidays
-var nseHolidays2026 = map[string]bool{
-	"2026-01-26": true, // Republic Day
-	"2026-02-17": true, // Mahashivratri (tentative)
-	"2026-03-10": true, // Holi
-	"2026-03-30": true, // Id-Ul-Fitr (tentative)
-	"2026-04-02": true, // Ram Navami
-	"2026-04-03": true, // Good Friday
-	"2026-04-14": true, // Dr. Ambedkar Jayanti
-	"2026-05-01": true, // Maharashtra Day
-	"2026-06-06": true, // Id-Ul-Adha (tentative)
-	"2026-07-06": true, // Muharram (tentative)
-	"2026-08-15": true, // Independence Day
-	"2026-08-18": true, // Parsi New Year (tentative)
-	"2026-09-04": true, // Milad-Un-Nabi (tentative)
-	"2026-10-02": true, // Mahatma Gandhi Jayanti
-	"2026-10-20": true, // Dussehra
-	"2026-10-21": true, // Dussehra (tentative)
-	"2026-11-09": true, // Diwali (Laxmi Pujan)
-	"2026-11-10": true, // Diwali (Balipratipada)
-	"2026-11-24": true, // Guru Nanak Jayanti (tentative)
-	"2026-12-25": true, // Christmas
+var (
+	nseHolidaysMu sync.RWMutex
+	// MM-DD keys (year-agnostic), matching research.FetchNSEHolidays's format.
+	nseHolidaysMMDD = map[string]string{}
+)
+
+var nseHolidays2026Fallback = map[string]bool{
+	"2026-01-26": true, "2026-02-17": true, "2026-03-10": true,
+	"2026-03-30": true, "2026-04-02": true, "2026-04-03": true,
+	"2026-04-14": true, "2026-05-01": true, "2026-06-06": true,
+	"2026-07-06": true, "2026-08-15": true, "2026-08-18": true,
+	"2026-09-04": true, "2026-10-02": true, "2026-10-20": true,
+	"2026-10-21": true, "2026-11-09": true, "2026-11-10": true,
+	"2026-11-24": true, "2026-12-25": true,
+}
+
+func refreshNSEHolidays() {
+	fetched := research.FetchNSEHolidays()
+	if len(fetched) == 0 {
+		log.Printf("[Engine] NSE holiday fetch returned empty — keeping existing/fallback list")
+		return
+	}
+	nseHolidaysMu.Lock()
+	nseHolidaysMMDD = fetched
+	nseHolidaysMu.Unlock()
 }
 
 func isNSEHoliday(t time.Time) bool {
+	mmdd := fmt.Sprintf("%02d-%02d", t.Month(), t.Day())
+	nseHolidaysMu.RLock()
+	_, fromAPI := nseHolidaysMMDD[mmdd]
+	nseHolidaysMu.RUnlock()
+	if fromAPI {
+		return true
+	}
+	// Fallback to hardcoded list if live fetch hasn't populated yet.
 	dateStr := t.Format("2006-01-02")
-	return nseHolidays2026[dateStr]
+	return nseHolidays2026Fallback[dateStr]
 }

@@ -31,6 +31,11 @@ type ExecutionAgent struct {
 	CancelOrder func(orderID string) error
 	GetLTP      func(uint32) float64
 
+	// FillMonitor is wired by main.go in live mode to poll entry order status,
+	// detect partial fills / cancellations, and place SL+target after the entry fills.
+	// When nil (paper mode), Execute treats the LIMIT entry as immediately filled.
+	FillMonitor *core.FillMonitor
+
 	// Phase 5: Track daily closes below 21 EMA per position
 	RedCandlesBelow map[string]int // entryOID → consecutive red candles below 21 EMA
 
@@ -117,7 +122,11 @@ func (e *ExecutionAgent) Execute(sig *Signal, regime string) bool {
 
 	qty := sig.Qty
 	if qty <= 0 {
-		qty = 1
+		// Capital sizing produced 0 shares — likely below per-trade allocation
+		// or the stock is too expensive for the configured capital. Skip rather
+		// than placing a meaningless 1-share trade.
+		log.Printf("[Execute] Skipping %s — computed qty=%d (capital/price mismatch)", sym, qty)
+		return false
 	}
 
 	var oid string
@@ -162,6 +171,32 @@ func (e *ExecutionAgent) Execute(sig *Signal, regime string) bool {
 	SendTelegram(fmt.Sprintf(
 		"🟢 *SWING BUY — %s*\n`%s` | `%s`\nEntry: ₹`%.2f` | SL: ₹`%.2f`\nQty: `%d` | Product: `CNC`",
 		sig.Strategy, sym, regime, sig.EntryPrice, sig.StopPrice, qty))
+
+	// Live mode: poll the entry order until it fills (or partials / cancels / times out).
+	// On fill, FillMonitor adjusts qty/price to actuals and places SL+partial+target.
+	// Paper mode (FillMonitor nil) treats the LIMIT entry as immediately filled.
+	if e.FillMonitor != nil {
+		go func() {
+			updated := e.FillMonitor.WaitForFill(trade)
+			if updated == nil {
+				return
+			}
+			if updated.EntryCancelled {
+				// Entry rejected, cancelled, or 0-fill timeout — purge from active state.
+				e.Mu.Lock()
+				delete(e.ActiveTrades, oid)
+				delete(e.RedCandlesBelow, oid)
+				e.Mu.Unlock()
+				e.State.Close(oid)
+				return
+			}
+			// FillMonitor adjusts qty / SL / target OIDs; persist the updated trade.
+			e.Mu.Lock()
+			e.ActiveTrades[oid] = updated
+			e.Mu.Unlock()
+			e.State.Save(oid, updated)
+		}()
+	}
 
 	return true
 }
@@ -418,8 +453,19 @@ func (e *ExecutionAgent) forceExit(oid string, trade *core.Trade, reason string,
 		exitQty = trade.Qty
 	}
 
+	// Place exit order. If broker rejects (e.g., circuit / connectivity), bail out
+	// without closing state — the next monitor tick will retry. Closing locally
+	// while shares are still held would desync the engine from the actual portfolio.
 	if e.PlaceOrder != nil {
-		e.PlaceOrder(trade.Symbol, exitQty, true, "MARKET", 0) // Sell to close
+		exitOID, err := e.PlaceOrder(trade.Symbol, exitQty, true, "MARKET", 0)
+		if err != nil || exitOID == "" {
+			log.Printf("[Exit] ⚠️ %s exit REJECTED (%s): %v — keeping position OPEN for retry",
+				trade.Symbol, reason, err)
+			SendTelegram(fmt.Sprintf(
+				"⚠️ EXIT REJECTED: `%s` (%s)\nReason: `%v`\nPosition still OPEN — manual intervention may be required.",
+				trade.Symbol, reason, err))
+			return
+		}
 	}
 
 	if exitPrice <= 0 {

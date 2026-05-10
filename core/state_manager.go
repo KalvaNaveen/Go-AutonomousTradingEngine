@@ -222,7 +222,9 @@ func (sm *StateManager) LoadOpenPositions() []*Trade {
 		return nil
 	}
 
-	cutoff := config.TodayIST().AddDate(0, 0, -1).Format("2006-01-02")
+	// Swing positions can be held for weeks. NEVER filter open positions by date —
+	// only by status='OPEN'. Crash recovery must restore every open position regardless
+	// of when it was entered.
 	rows, err := sm.db.Query(`
 		SELECT entry_oid, symbol, strategy, product, COALESCE(regime,''),
 		       entry_price, stop_price, COALESCE(partial_target,0), target_price,
@@ -237,9 +239,9 @@ func (sm *StateManager) LoadOpenPositions() []*Trade {
 		       CAST(COALESCE(NULLIF(rsi,''),0) AS REAL), CAST(COALESCE(NULLIF(adx,''),0) AS REAL),
 		       CAST(COALESCE(NULLIF(vix,''),0) AS REAL), CAST(COALESCE(NULLIF(ad_ratio,''),0) AS REAL)
 		FROM active_positions
-		WHERE status='OPEN' AND entry_date >= ?
+		WHERE status='OPEN'
 		ORDER BY entry_time ASC
-	`, cutoff)
+	`)
 	if err != nil {
 		return nil
 	}

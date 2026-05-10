@@ -46,12 +46,13 @@ func (k *KiteBroker) PlaceOrder(symbol string, qty int, isShort bool, orderType 
 		kiteOrderType = "LIMIT"
 	}
 
+	// Blueprint Section VII: swing positions held overnight → CNC delivery, not MIS intraday.
 	params := url.Values{
 		"exchange":         {"NSE"},
 		"tradingsymbol":    {symbol},
 		"transaction_type": {txnType},
 		"quantity":         {strconv.Itoa(qty)},
-		"product":          {"MIS"},
+		"product":          {"CNC"},
 		"order_type":       {kiteOrderType},
 		"validity":         {"DAY"},
 	}
@@ -160,6 +161,55 @@ func (k *KiteBroker) GetOrders() ([]map[string]interface{}, error) {
 	}
 	json.Unmarshal(resp, &result)
 	return result.Data, nil
+}
+
+// GetOrderStatus fetches the current status of a single order by ID.
+// Used by FillMonitor as REST fallback when the WebSocket cache lacks an entry.
+// Returns status (COMPLETE/OPEN/CANCELLED/REJECTED/...), filledQty, pendingQty, avgPrice.
+func (k *KiteBroker) GetOrderStatus(orderID string) (string, int, int, float64, error) {
+	// Kite returns order history (one row per state transition); the last entry is current.
+	resp, err := k.doGet(fmt.Sprintf("/orders/%s", orderID))
+	if err != nil {
+		return "", 0, 0, 0, err
+	}
+	var result struct {
+		Data []struct {
+			Status       string  `json:"status"`
+			FilledQty    int     `json:"filled_quantity"`
+			PendingQty   int     `json:"pending_quantity"`
+			AveragePrice float64 `json:"average_price"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(resp, &result); err != nil {
+		return "", 0, 0, 0, err
+	}
+	if len(result.Data) == 0 {
+		return "UNKNOWN", 0, 0, 0, nil
+	}
+	last := result.Data[len(result.Data)-1]
+	return last.Status, last.FilledQty, last.PendingQty, last.AveragePrice, nil
+}
+
+// ModifyOrder changes the quantity of an existing pending order (used by FillMonitor
+// to reduce SL qty after a partial target fills).
+func (k *KiteBroker) ModifyOrder(orderID string, qty int) error {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	params := url.Values{"quantity": {strconv.Itoa(qty)}}
+	endpoint := fmt.Sprintf("/orders/regular/%s", orderID)
+	req, _ := http.NewRequest("PUT", k.BaseURL+endpoint, strings.NewReader(params.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("X-Kite-Version", "3")
+	req.Header.Set("Authorization", k.authHeader())
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		return fmt.Errorf("modify order HTTP %d", resp.StatusCode)
+	}
+	return nil
 }
 
 // GetQuote fetches LTP for a symbol

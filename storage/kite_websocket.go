@@ -191,8 +191,13 @@ func (kws *KiteWebSocket) parseTick(pkt []byte) {
 	var bidQty, askQty int64
 	var exchangeTS time.Time
 
-	isIndex := token == 289545 || token == 260105 || token == 264969 // NIFTY250, BANKNIFTY, VIX
-	
+	// Index tick packets have a different layout (no volume, no depth) than
+	// equity packets. Kite emits index packets at exactly 32 bytes in FULL
+	// mode and 28 bytes in QUOTE mode; equity packets are 44 / 184. Use both
+	// the size and a token allow-list (all NSE benchmark indices) so a
+	// missized packet for a known index still parses correctly.
+	isIndex := isIndexToken(token) || len(pkt) == 28 || len(pkt) == 32
+
 	if isIndex {
 		if len(pkt) >= 28 {
 			dayHigh = float64(int32(binary.BigEndian.Uint32(pkt[8:12]))) / 100.0
@@ -311,6 +316,26 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// isIndexToken reports whether the given Kite instrument token belongs to a
+// non-tradeable benchmark index. These packets lack volume and depth fields
+// and must be parsed with the index layout, not the equity layout.
+func isIndexToken(token uint32) bool {
+	switch token {
+	case config.Nifty250Token,
+		config.NiftySpotToken,
+		config.SmallcapToken,
+		config.IndiaVIXToken,
+		config.BankNiftySpotToken:
+		return true
+	}
+	for _, t := range config.SectorTokens {
+		if t == token {
+			return true
+		}
+	}
+	return false
 }
 
 // Suppress unused import

@@ -1,12 +1,14 @@
 package api
 
 import (
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"bnf_go_engine/agents"
@@ -38,8 +40,10 @@ func NewServer(
 
 func (s *Server) Start(addr string) {
 	mux := http.NewServeMux()
-	handler := corsMiddleware(mux)
+	handler := corsMiddleware(authMiddleware(mux))
 
+	// /api/health stays unauthenticated so the dashboard can render a login wall
+	// before holding a token. All other endpoints require auth when configured.
 	mux.HandleFunc("/api/health", s.handleHealth)
 	mux.HandleFunc("/api/status", s.handleStatus)
 	mux.HandleFunc("/api/positions", s.handlePositions)
@@ -66,11 +70,45 @@ func (s *Server) Start(addr string) {
 
 func corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
+		origin := config.DashboardAllowedOrigin
+		if origin == "" {
+			origin = "http://127.0.0.1:8085"
+		}
+		w.Header().Set("Access-Control-Allow-Origin", origin)
+		w.Header().Set("Vary", "Origin")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 		if r.Method == "OPTIONS" {
 			w.WriteHeader(204)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// authMiddleware enforces a shared-secret token on protected /api/* routes.
+// Reads the token from `Authorization: Bearer …` or `?token=…`. /api/health
+// and the static dashboard files are exempt so the UI can bootstrap.
+func authMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if config.DashboardAPIToken == "" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		// Public paths
+		if !strings.HasPrefix(r.URL.Path, "/api/") || r.URL.Path == "/api/health" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		got := ""
+		if h := r.Header.Get("Authorization"); strings.HasPrefix(h, "Bearer ") {
+			got = strings.TrimPrefix(h, "Bearer ")
+		} else if t := r.URL.Query().Get("token"); t != "" {
+			got = t
+		}
+		want := config.DashboardAPIToken
+		if got == "" || subtle.ConstantTimeCompare([]byte(got), []byte(want)) != 1 {
+			http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
 			return
 		}
 		next.ServeHTTP(w, r)

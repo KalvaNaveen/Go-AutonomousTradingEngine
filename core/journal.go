@@ -289,7 +289,9 @@ func (j *Journal) GetPeriodSummary(fromDate, toDate string) *PeriodSummary {
 				}
 			}
 		}
-		s.EstCharges += ComputeChargesFromTrade(r.ep, r.xp, r.qty, isShort, "MIS", 0)
+		// Swing engine: every equity exit is a CNC delivery trade (Blueprint Section VII).
+		// MIS would understate charges (no DP fee, lower STT side coverage).
+		s.EstCharges += ComputeChargesFromTrade(r.ep, r.xp, r.qty, isShort, "CNC", 0)
 	}
 	s.Losses = s.Total - s.Wins
 	if s.Total > 0 {
