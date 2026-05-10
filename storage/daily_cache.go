@@ -39,6 +39,7 @@ type DailyCacheEntry struct {
 	Lows         []float64
 	Volumes      []float64
 	EMA25        float64
+	EMA21        float64 // Phase 5: 21-day EMA for swing exit
 	RSI14        float64
 	BBUpper      float64
 	BBLower      float64
@@ -63,10 +64,11 @@ func NewDailyCache() *DailyCache {
 	}
 }
 
-// Preload fetches 260 days of historical data for all universe tokens.
+// Preload fetches 500 days of historical data for all universe tokens.
+// Extended from 260d to support monthly ROC (needs up to 420 daily bars).
 // Uses 3 parallel workers to respect Kite's ~3 req/sec rate limit while cutting load time by 3x.
 func (dc *DailyCache) Preload(universe map[uint32]string) bool {
-	log.Printf("[DailyCache] Preloading %d tokens (260d) with 3 parallel workers...", len(universe))
+	log.Printf("[DailyCache] Preloading %d tokens (500d) with 3 parallel workers...", len(universe))
 
 	type tokenJob struct {
 		token  uint32
@@ -92,7 +94,7 @@ func (dc *DailyCache) Preload(universe map[uint32]string) bool {
 		go func() {
 			defer wg.Done()
 			for job := range jobs {
-				dailyData, err := dc.fetchDaily(job.token, 260)
+				dailyData, err := dc.fetchDaily(job.token, 500)
 				if err != nil || len(dailyData) < 25 {
 					mu.Lock()
 					failed++
@@ -119,6 +121,13 @@ func (dc *DailyCache) Preload(universe map[uint32]string) bool {
 				ema25Val := 0.0
 				if len(ema25) > 0 {
 					ema25Val = ema25[len(ema25)-1]
+				}
+
+				// Phase 5: Compute 21-day EMA for swing exit trailing
+				ema21 := data.ComputeEMA(closes, 21)
+				ema21Val := 0.0
+				if len(ema21) > 0 {
+					ema21Val = ema21[len(ema21)-1]
 				}
 
 				rsiSlice := data.ComputeRSI(closes, 14)
@@ -179,6 +188,7 @@ func (dc *DailyCache) Preload(universe map[uint32]string) bool {
 					Lows:         lows,
 					Volumes:      volumes,
 					EMA25:        ema25Val,
+					EMA21:        ema21Val,
 					RSI14:        rsi14,
 					BBUpper:      bbHi,
 					BBLower:      bbLo,
@@ -231,13 +241,17 @@ func (dc *DailyCache) ToScannerCache() *agents.DailyCache {
 		SMA200:       make(map[uint32]float64),
 		ATR:          make(map[uint32]float64),
 		EMA25:        make(map[uint32]float64),
+		EMA21:        make(map[uint32]float64),
 		BBLower:      make(map[uint32]float64),
 		Closes:       make(map[uint32][]float64),
 		Highs:        make(map[uint32][]float64),
 		Lows:         make(map[uint32][]float64),
+		Volumes:      make(map[uint32][]float64),
 		AvgVol:       make(map[uint32]float64),
 		TurnoverCr:   make(map[uint32]float64),
 		PivotSupport: make(map[uint32]float64),
+		High52W:      make(map[uint32]float64),
+		RSScore:      make(map[uint32]int),
 		Loaded:       dc.loaded,
 	}
 
@@ -245,13 +259,17 @@ func (dc *DailyCache) ToScannerCache() *agents.DailyCache {
 		sc.SMA200[token] = entry.SMA200
 		sc.ATR[token] = entry.ATR14
 		sc.EMA25[token] = entry.EMA25
+		sc.EMA21[token] = entry.EMA21
 		sc.BBLower[token] = entry.BBLower
 		sc.Closes[token] = entry.Closes
 		sc.Highs[token] = entry.Highs
 		sc.Lows[token] = entry.Lows
+		sc.Volumes[token] = entry.Volumes
 		sc.AvgVol[token] = entry.AvgDailyVol
 		sc.TurnoverCr[token] = entry.TurnoverCr
 		sc.PivotSupport[token] = entry.PivotSupport
+		sc.High52W[token] = entry.High52W
+		sc.RSScore[token] = entry.RSScore
 	}
 
 	return sc

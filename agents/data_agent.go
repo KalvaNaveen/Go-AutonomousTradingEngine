@@ -221,7 +221,7 @@ func (d *DataAgent) GetAllTokens() []uint32 {
 		tokens = append(tokens, t)
 	}
 	// Add index tokens
-	tokens = append(tokens, config.Nifty50Token, config.IndiaVIXToken)
+	tokens = append(tokens, config.Nifty250Token, config.IndiaVIXToken)
 	for _, t := range config.SectorTokens {
 		tokens = append(tokens, t)
 	}

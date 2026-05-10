@@ -191,7 +191,7 @@ func (kws *KiteWebSocket) parseTick(pkt []byte) {
 	var bidQty, askQty int64
 	var exchangeTS time.Time
 
-	isIndex := token == 256265 || token == 260105 || token == 264969 // NIFTY50, BANKNIFTY, VIX
+	isIndex := token == 289545 || token == 260105 || token == 264969 // NIFTY250, BANKNIFTY, VIX
 	
 	if isIndex {
 		if len(pkt) >= 28 {
@@ -282,6 +282,22 @@ func (kws *KiteWebSocket) Close() {
 		kws.conn.Close()
 		kws.connected = false
 	}
+}
+
+// AddTokens subscribes additional tokens to the WebSocket (used by F&O module
+// to add NFO option tokens after the initial equity subscription).
+func (kws *KiteWebSocket) AddTokens(tokens []uint32) {
+	if len(tokens) == 0 {
+		return
+	}
+	kws.mu.Lock()
+	kws.tokens = append(kws.tokens, tokens...)
+	kws.mu.Unlock()
+
+	// Subscribe and set mode for new tokens
+	kws.subscribe(tokens)
+	kws.setMode("full", tokens)
+	log.Printf("[WS] Added %d tokens (total now: %d)", len(tokens), len(kws.tokens))
 }
 
 func (kws *KiteWebSocket) UpdateToken(newToken string) {

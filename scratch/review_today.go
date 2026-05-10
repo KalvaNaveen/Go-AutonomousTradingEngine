@@ -1,123 +1,172 @@
+// +build ignore
+
 package main
 
 import (
 	"database/sql"
 	"fmt"
-	"log"
-	"math"
+	"os"
+	"path/filepath"
+	"strings"
 
 	_ "modernc.org/sqlite"
 )
 
 func main() {
-	dbPath := `c:\Users\Admin\.gemini\antigravity\scratch\bnf_go_engine\data\journal.db`
-	db, err := sql.Open("sqlite", dbPath)
-	if err != nil { log.Fatal(err) }
-	defer db.Close()
+	exe, _ := os.Executable()
+	baseDir := filepath.Dir(exe)
+	if strings.Contains(baseDir, "go-build") || strings.Contains(baseDir, "Temp") {
+		baseDir, _ = os.Getwd()
+	}
+	dbPath := filepath.Join(baseDir, "data", "journal.db")
 
-	// Find the most recent trading day
-	var today string
-	db.QueryRow(`SELECT date FROM trades ORDER BY date DESC LIMIT 1`).Scan(&today)
-	if today == "" {
-		fmt.Println("No trades found!")
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		fmt.Printf("ERROR: %v\n", err)
 		return
 	}
+	defer db.Close()
 
-	// Summary
-	var total int; var grossPnl float64; var wins, losses int
-	var winAmt, lossAmt float64
-	db.QueryRow(`SELECT COUNT(*), COALESCE(SUM(gross_pnl),0) FROM trades WHERE date=?`, today).Scan(&total, &grossPnl)
-	db.QueryRow(`SELECT COUNT(*), COALESCE(SUM(gross_pnl),0) FROM trades WHERE date=? AND gross_pnl>0`, today).Scan(&wins, &winAmt)
-	db.QueryRow(`SELECT COUNT(*), COALESCE(SUM(gross_pnl),0) FROM trades WHERE date=? AND gross_pnl<=0`, today).Scan(&losses, &lossAmt)
+	today := "2026-05-07"
 
-	wr := 0.0; if total > 0 { wr = float64(wins)/float64(total)*100 }
-	avgW := 0.0; if wins > 0 { avgW = winAmt/float64(wins) }
-	avgL := 0.0; if losses > 0 { avgL = lossAmt/float64(losses) }
-
-	fmt.Println("═══════════════════════════════════════════════════════")
-	fmt.Printf("  TRADE REVIEW — %s\n", today)
-	fmt.Println("═══════════════════════════════════════════════════════")
-	fmt.Printf("  Trades: %d | Wins: %d | Losses: %d | WR: %.1f%%\n", total, wins, losses, wr)
-	fmt.Printf("  Gross P&L: ₹%.2f\n", grossPnl)
-	fmt.Printf("  Avg Win: ₹%.2f | Avg Loss: ₹%.2f\n", avgW, avgL)
-	if avgL != 0 { fmt.Printf("  Risk:Reward: 1:%.2f\n", math.Abs(avgW/avgL)) }
-
-	// Per strategy
-	fmt.Println("\n═══ BY STRATEGY ═══")
-	r1, _ := db.Query(`SELECT strategy, COUNT(*), SUM(CASE WHEN gross_pnl>0 THEN 1 ELSE 0 END),
-		SUM(gross_pnl), COALESCE(AVG(CASE WHEN gross_pnl>0 THEN gross_pnl END),0),
-		COALESCE(AVG(CASE WHEN gross_pnl<=0 THEN gross_pnl END),0)
-		FROM trades WHERE date=? GROUP BY strategy ORDER BY SUM(gross_pnl) ASC`, today)
-	for r1.Next() {
-		var s string; var c, w int; var t, aw, al float64
-		r1.Scan(&s, &c, &w, &t, &aw, &al)
-		fmt.Printf("  %-24s %d trades  %dW  P&L=₹%.0f  AvgW=%.0f  AvgL=%.0f\n", s, c, w, t, aw, al)
+	// 1. All agent log entries for today — grouped by agent and action
+	fmt.Println("═══ AGENT LOG SUMMARY (May 7) ═══")
+	rows, _ := db.Query(`
+		SELECT agent, action, COUNT(*) as cnt 
+		FROM agent_logs 
+		WHERE date=? 
+		GROUP BY agent, action 
+		ORDER BY cnt DESC`, today)
+	for rows.Next() {
+		var agent, action string
+		var cnt int
+		rows.Scan(&agent, &action, &cnt)
+		fmt.Printf("  %-15s %-25s : %d entries\n", agent, action, cnt)
 	}
-	r1.Close()
+	rows.Close()
 
-	// All trades
-	fmt.Println("\n═══ ALL TRADES (worst → best) ═══")
-	r2, _ := db.Query(`SELECT entry_time, strategy, symbol, entry_price, full_exit_price,
-		qty, gross_pnl, exit_reason, regime, COALESCE(rvol,0)
-		FROM trades WHERE date=? ORDER BY gross_pnl ASC`, today)
-	for r2.Next() {
-		var et, s, sym, er, reg string; var ep, xp, pnl, rv float64; var q int
-		r2.Scan(&et, &s, &sym, &ep, &xp, &q, &pnl, &er, &reg, &rv)
-		t := et; if len(et) > 16 { t = et[11:16] }
-		icon := "✅"; if pnl <= 0 { icon = "❌" }
-		fmt.Printf("  %s %s %-20s %-12s E=%.1f X=%.1f Q=%d P&L=%.0f  %s [%s RV=%.1f]\n",
-			icon, t, s, sym, ep, xp, q, pnl, er, reg, rv)
+	// 2. Signal generation logs — any mention of strategy names
+	fmt.Println("\n═══ STRATEGY SIGNAL MENTIONS ═══")
+	strategies := []string{"S1_", "S2_", "S3_", "S6_", "S8_", "S9_", "S10_", "S12_", "S13_", "S14_", "S15_"}
+	for _, s := range strategies {
+		var cnt int
+		db.QueryRow(`SELECT COUNT(*) FROM agent_logs WHERE date=? AND detail LIKE ?`, today, "%"+s+"%").Scan(&cnt)
+		fmt.Printf("  %-20s : %d log entries\n", s, cnt)
 	}
-	r2.Close()
 
-	// Exit reasons
-	fmt.Println("\n═══ EXIT REASONS ═══")
-	r3, _ := db.Query(`SELECT exit_reason, COUNT(*), SUM(gross_pnl) FROM trades WHERE date=? GROUP BY exit_reason ORDER BY SUM(gross_pnl)`, today)
-	for r3.Next() {
-		var r string; var c int; var t float64
-		r3.Scan(&r, &c, &t)
-		fmt.Printf("  %-25s %d trades  ₹%.0f\n", r, c, t)
+	// 3. Look for SIGNAL, ENTRY, REJECT, SKIP, BLOCK mentions
+	fmt.Println("\n═══ SIGNAL PIPELINE KEYWORDS ═══")
+	keywords := []string{"SIGNAL", "ENTRY", "REJECT", "SKIP", "BLOCK", "KILL", "DISABLED", "APPROVE", "EXECUTE", "EXIT", "STOP", "TARGET", "REGIME"}
+	for _, kw := range keywords {
+		var cnt int
+		db.QueryRow(`SELECT COUNT(*) FROM agent_logs WHERE date=? AND (detail LIKE ? OR action LIKE ?)`, today, "%"+kw+"%", "%"+kw+"%").Scan(&cnt)
+		fmt.Printf("  %-15s : %d entries\n", kw, cnt)
 	}
-	r3.Close()
 
-	// Signals & regime
-	fmt.Println("\n═══ SIGNAL FUNNEL ═══")
-	var sigC, trC int
-	db.QueryRow(`SELECT COUNT(*) FROM agent_logs WHERE date=? AND action='SIGNAL_FOUND'`, today).Scan(&sigC)
-	db.QueryRow(`SELECT COUNT(*) FROM agent_logs WHERE date=? AND action='TRADE_OPENED'`, today).Scan(&trC)
-	fmt.Printf("  Signals: %d → Trades: %d (%.1f%% conv)\n", sigC, trC, func()float64{if sigC>0{return float64(trC)/float64(sigC)*100}; return 0}())
-
-	fmt.Println("\n═══ REGIME TIMELINE ═══")
-	r4, _ := db.Query(`SELECT time, detail FROM agent_logs WHERE date=? AND action='REGIME_CHANGE' ORDER BY time`, today)
-	for r4.Next() {
-		var t, d string; r4.Scan(&t, &d); fmt.Printf("  %s  %s\n", t, d)
+	// 4. Show signal-related logs (not SCAN_CYCLE spam)
+	fmt.Println("\n═══ NON-SCAN-CYCLE LOGS (all interesting activity) ═══")
+	rows2, _ := db.Query(`
+		SELECT time, agent, action, detail 
+		FROM agent_logs 
+		WHERE date=? AND action != 'SCAN_CYCLE'
+		ORDER BY time`, today)
+	cnt := 0
+	for rows2.Next() {
+		var t, agent, action, detail string
+		rows2.Scan(&t, &agent, &action, &detail)
+		cnt++
+		if len(detail) > 150 {
+			detail = detail[:150] + "..."
+		}
+		fmt.Printf("  %s [%-10s] %-20s %s\n", t, agent, action, detail)
 	}
-	r4.Close()
+	rows2.Close()
+	fmt.Printf("  Total non-scan entries: %d\n", cnt)
 
-	// Full history
-	fmt.Println("\n═══ ALL DAILY P&L (full history) ═══")
-	var cumPnl float64
-	r5, _ := db.Query(`SELECT date, total_trades, wins, losses, win_rate, gross_pnl FROM daily_summary WHERE total_trades > 0 ORDER BY date ASC`)
-	for r5.Next() {
-		var d string; var tt, w, l int; var wr2, gp float64
-		r5.Scan(&d, &tt, &w, &l, &wr2, &gp)
-		cumPnl += gp
-		icon := "🟢"; if gp < 0 { icon = "🔴" }
-		fmt.Printf("  %s %s  %2d trades  %2dW/%2dL  WR=%3.0f%%  Day=₹%7.0f  Cum=₹%7.0f\n", icon, d, tt, w, l, wr2, gp, cumPnl)
+	// 5. Show a sample of SCAN_CYCLE logs to see what strategies are being scanned
+	fmt.Println("\n═══ SCAN_CYCLE SAMPLES (every 1000th) ═══")
+	rows3, _ := db.Query(`
+		SELECT time, detail 
+		FROM agent_logs 
+		WHERE date=? AND action='SCAN_CYCLE'
+		ORDER BY time`, today)
+	i := 0
+	for rows3.Next() {
+		var t, detail string
+		rows3.Scan(&t, &detail)
+		i++
+		if i == 1 || i%1000 == 0 {
+			fmt.Printf("  %s %s\n", t, detail)
+		}
 	}
-	r5.Close()
-	fmt.Printf("\n  ═══ TOTAL CUMULATIVE P&L: ₹%.0f ═══\n", cumPnl)
+	rows3.Close()
+	fmt.Printf("  Total scan cycles: %d\n", i)
 
-	// Worst strategies all-time
-	fmt.Println("\n═══ ALL-TIME BY STRATEGY ═══")
-	r6, _ := db.Query(`SELECT strategy, COUNT(*), SUM(CASE WHEN gross_pnl>0 THEN 1 ELSE 0 END),
-		SUM(gross_pnl) FROM trades GROUP BY strategy ORDER BY SUM(gross_pnl) ASC`)
-	for r6.Next() {
-		var s string; var c, w int; var t float64
-		r6.Scan(&s, &c, &w, &t)
-		wr := 0.0; if c > 0 { wr = float64(w)/float64(c)*100 }
-		icon := "🟢"; if t < 0 { icon = "🔴" }
-		fmt.Printf("  %s %-24s %3d trades  WR=%3.0f%%  P&L=₹%.0f\n", icon, s, c, wr, t)
+	// 6. Look for any signal generation or emission
+	fmt.Println("\n═══ SIGNAL EMISSION LOGS ═══")
+	rows4, _ := db.Query(`
+		SELECT time, agent, action, detail 
+		FROM agent_logs 
+		WHERE date=? AND (
+			action LIKE '%SIGNAL%' OR action LIKE '%EMIT%' OR action LIKE '%GENERATE%'
+			OR detail LIKE '%signal%' OR detail LIKE '%emit%'
+			OR detail LIKE '%candidate%' OR detail LIKE '%approved%'
+		)
+		ORDER BY time`, today)
+	for rows4.Next() {
+		var t, agent, action, detail string
+		rows4.Scan(&t, &agent, &action, &detail)
+		if len(detail) > 150 {
+			detail = detail[:150] + "..."
+		}
+		fmt.Printf("  %s [%-10s] %-20s %s\n", t, agent, action, detail)
 	}
-	r6.Close()
+	rows4.Close()
+
+	// 7. Show ENTRY logs
+	fmt.Println("\n═══ TRADE ENTRY/EXIT LOGS ═══")
+	rows5, _ := db.Query(`
+		SELECT time, agent, action, detail 
+		FROM agent_logs 
+		WHERE date=? AND (
+			action LIKE '%ENTRY%' OR action LIKE '%EXIT%' OR action LIKE '%TRADE%' OR action LIKE '%ORDER%'
+			OR action LIKE '%OPEN%' OR action LIKE '%CLOSE%'
+			OR detail LIKE '%ENTRY%' OR detail LIKE '%placed%' OR detail LIKE '%filled%'
+		)
+		ORDER BY time`, today)
+	for rows5.Next() {
+		var t, agent, action, detail string
+		rows5.Scan(&t, &agent, &action, &detail)
+		if len(detail) > 180 {
+			detail = detail[:180] + "..."
+		}
+		fmt.Printf("  %s [%-10s] %-20s %s\n", t, agent, action, detail)
+	}
+	rows5.Close()
+
+	// 8. What regime was active at different times
+	fmt.Println("\n═══ REGIME THROUGHOUT THE DAY ═══")
+	rows6, _ := db.Query(`
+		SELECT time, detail 
+		FROM agent_logs 
+		WHERE date=? AND detail LIKE '%Regime=%'
+		ORDER BY time`, today)
+	lastRegime := ""
+	for rows6.Next() {
+		var t, detail string
+		rows6.Scan(&t, &detail)
+		// Extract regime from "Regime=XXX"
+		idx := strings.Index(detail, "Regime=")
+		if idx >= 0 {
+			regime := detail[idx+7:]
+			if spaceIdx := strings.IndexAny(regime, " |"); spaceIdx >= 0 {
+				regime = regime[:spaceIdx]
+			}
+			if regime != lastRegime {
+				fmt.Printf("  %s Regime changed to: %s\n", t, regime)
+				lastRegime = regime
+			}
+		}
+	}
+	rows6.Close()
 }

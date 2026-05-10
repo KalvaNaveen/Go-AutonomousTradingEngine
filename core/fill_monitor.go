@@ -81,7 +81,7 @@ func (fm *FillMonitor) GetStatus(orderID string) *OrderStatus {
 func (fm *FillMonitor) WaitForFill(trade *Trade) *Trade {
 	entryOID := trade.EntryOID
 	symbol := trade.Symbol
-	timeoutAt := config.NowIST().Add(time.Duration(config.FillTimeoutMinutes) * time.Minute)
+	timeoutAt := config.NowIST().Add(30 * time.Minute) // 30 min fill timeout
 
 	for config.NowIST().Before(timeoutAt) {
 		status := fm.GetStatus(entryOID)
@@ -108,7 +108,7 @@ func (fm *FillMonitor) WaitForFill(trade *Trade) *Trade {
 			return trade
 		}
 
-		time.Sleep(time.Duration(config.FillPollIntervalSec) * time.Second)
+		time.Sleep(30 * time.Second) // Poll every 30s
 	}
 
 	// Timeout

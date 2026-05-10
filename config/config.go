@@ -56,12 +56,12 @@ var PaperMode = envBool("PAPER_MODE", true)
 
 // ── Zerodha ─────────────────────────────────────────────────
 var (
-	KiteAPIKey       = envStr("KITE_API_KEY", "")
-	KiteAPISecret    = envStr("KITE_API_SECRET", "")
-	KiteAccessToken  = envStr("KITE_ACCESS_TOKEN", "")
-	KiteRedirectURL  = envStr("KITE_REDIRECT_URL", "https://127.0.0.1")
-	ZerodhaUserID    = envStr("ZERODHA_USER_ID", "")
-	ZerodhaPassword  = envStr("ZERODHA_PASSWORD", "")
+	KiteAPIKey        = envStr("KITE_API_KEY", "")
+	KiteAPISecret     = envStr("KITE_API_SECRET", "")
+	KiteAccessToken   = envStr("KITE_ACCESS_TOKEN", "")
+	KiteRedirectURL   = envStr("KITE_REDIRECT_URL", "https://127.0.0.1")
+	ZerodhaUserID     = envStr("ZERODHA_USER_ID", "")
+	ZerodhaPassword   = envStr("ZERODHA_PASSWORD", "")
 	ZerodhaTOTPSecret = envStr("ZERODHA_TOTP_SECRET", "")
 )
 
@@ -100,27 +100,75 @@ func Reload() {
 // ── Capital ─────────────────────────────────────────────────
 var TotalCapital = envFloat("TRADING_CAPITAL", 500000)
 
-// ── Risk — Balanced Intraday System ─────────────────────────
-const (
-	MaxRiskPerTradePct   = 0.01  // 1% of capital per trade — standard for active intraday
-	DailyLossLimitPct    = 0.03  // 3% daily loss limit (₹3000 on 1L) — room for recovery
-	MaxConsecutiveLosses = 6     // 6 losses in a row → pause engine
-	MaxOpenPositions     = 8     // Max 8 concurrent positions — more surface area
-	MaxPositionsPerStrat = 3     // Max 3 per strategy
-	MaxPositionPct       = 0.25  // 25% max notional per position — meaningful size
-	EODSquareoffTime     = "15:15"
-	EODSquareoffFinal    = "15:15"
-	PreemptiveExitTime   = "14:50"
+// ══════════════════════════════════════════════════════════════
+//  SWING TRADING STRATEGY CONSTANTS (Harsh's System)
+// ══════════════════════════════════════════════════════════════
 
-	STTBuffer        = 1.0   // No haircut — charges already computed precisely in charges.go
-	ActiveCapitalPct = 0.85  // Deploy more capital (was 80%)
-	RiskReservePct   = 0.15
+// Phase 1: Market Timing — ROC (Rate of Change) thresholds
+// Doc says: "Timeframe 1 Month, Length 18" → 18 monthly candles = 18 × 21 trading days = 378 daily bars
+// Doc says: "Smallcap Length 20" → 20 × 21 = 420 daily bars
+const (
+	ROCNiftyLengthDaily        = 378   // 18 months × 21 trading days
+	ROCSmallcapLengthDaily     = 420   // 20 months × 21 trading days
+	ROCNiftyBuyThreshold       = 5.0   // Buy signal: ROC near 0 (within this band)
+	ROCNiftySellThreshold      = 45.0  // Sell signal: ROC reaches near 45
+	ROCSmallcapBuyThreshold    = 5.0   // Buy signal: ROC near 0
+	ROCSmallcapSellThreshold   = 100.0 // Sell signal: ROC reaches near 100
+	ConsecutiveSLCutoff        = 5     // 5 consecutive SL hits → reduce capital
+	ReducedCapitalPct          = 0.35  // Reduce to 30-40% capital on contingency
+)
+
+// Section V: Technical Entry Setups
+const (
+	VCPLookbackDays       = 60   // Days to look back for VCP pattern
+	VCPMinPullbacks       = 3    // Min pullbacks for contraction (doc example: 25%->10%->5% = 3)
+	VCPContractionRatio   = 0.7  // Each pullback depth must be < previous
+	ATHProximityPct       = 5.0  // Stock must be at or near All-Time Highs
+)
+
+// Section VI: Risk Management & Portfolio Sizing
+// Doc: "Absolute Maximum SL: 7%"
+// Doc: "Ideal Active SL: 3% to 5%"
+// Doc: "5% to 10% of total portfolio per trade"
+// Doc: "Maximum 5 to 6 stocks"
+const (
+	MaxOpenPositions      = 6     // "Maximum 5 to 6 stocks at any given time"
+	HardStopLossPct       = 7.0   // "Absolute Maximum SL: 7%"
+	IdealSLPct            = 5.0   // "Ideal Active SL: 3% to 5%" (upper)
+	TightSLPct            = 3.0   // "3% SL for 6-9% target"
+	TightTargetPct        = 7.5   // "6-9% target" (midpoint)
+	IdealTargetPct        = 12.5  // "5% SL for 10-15% target" (midpoint)
+	MaxTradeAllocPct      = 10.0  // "5% to 10% of total portfolio per trade"
+	MinTradeAllocPct      = 5.0   // Lower bound of allocation
+)
+
+// Section VII: Exits — 21 EMA Mechanical Exit
+// Doc: "Apply the 21-day EMA to your daily chart to ride the trend"
+// 63 EMA is used ONLY for VCP invalidation (Section V.1), NOT for exits
+const (
+	EMA21Period           = 21 // Exit trailing indicator: 21-day EMA
+	EMA63Period           = 63 // VCP invalidation check only
+	RedCandlesBelowEMA    = 2  // "two continuous red candles that CLOSE below the 21 EMA"
 )
 
 // ── Instrument Tokens ───────────────────────────────────────
+// FIX-12: Token Count Documentation
+// Equity tokens (253): Full OHLCV history + live monitoring + pattern scans
+//   - 250 Nifty 250 stocks from NSE universe CSV
+//   - 1 GOLDBEES ETF (Gold ratio computation)
+//   - 1 NIFTY 50 index (ROC regime + Gold ratio)
+//   - 1 NIFTY SMALLCAP 100 index (ROC regime)
+// Benchmark tokens (12): Live monitoring ONLY — WebSocket subscribed but NOT in pattern scan
+//   - 10 sector indices (Bank, IT, Auto, FMCG, Metal, Realty, Energy, Pharma, Infra, PSE)
+//   - 1 India VIX
+//   - 1 Bank Nifty spot (informational)
+// Total WebSocket tokens ≈ 265 (253 equity + 12 benchmark)
 const (
-	Nifty50Token  = 256265
-	IndiaVIXToken = 264969
+	Nifty250Token       = 289545
+	NiftySpotToken      = 256265  // NIFTY 50 spot → ROC regime + Gold ratio
+	SmallcapToken       = 264713  // NIFTY SMALLCAP 100 → Smallcap ROC
+	IndiaVIXToken       = 264969  // India VIX → informational
+	BankNiftySpotToken  = 260105  // Bank Nifty → informational
 )
 
 var SectorTokens = map[string]uint32{
@@ -136,155 +184,23 @@ var SectorTokens = map[string]uint32{
 	"NIFTY PSE":    262665,
 }
 
-// ── Regime Thresholds ───────────────────────────────────────
+// ── Timing (Swing — no intraday squareoff) ──────────────────
 const (
-	VIXBearPanic   = 22.5
-	VIXNormalHigh  = 22.0
-	VIXNormalLow   = 12.0
-	VIXBullMax     = 18.0
-	VIXExtremeStop = 30.0
-)
-
-// ══════════════════════════════════════════════════════════════
-//  STRATEGY CONFIGURATIONS  (var, not const — enables runtime optimization)
-// ══════════════════════════════════════════════════════════════
-
-// S1: Moving Average Crossover
-var (
-	S1_EMA_FAST    = 9
-	S1_EMA_SLOW    = 21
-	S1_EMA_TREND   = 200
-	S1_ADX_PERIOD  = 14
-	S1_ADX_MIN     = 20
-	S1_ATR_SL_MULT = 1.5
-	S1_RR          = 3.0
-	S1_RISK_PCT    = 0.01
-)
-
-// S2: BB + RSI Mean Reversion
-var (
-	S2_BB_PERIOD      = 20
-	S2_BB_SD          = 2.0
-	S2_RSI_PERIOD     = 14
-	S2_RSI_OVERSOLD   = 40  // Loosened from 35 — RSI(14)<35 on 5min still too rare for signals
-	S2_RSI_OVERBOUGHT = 60  // Loosened from 65
-	S2_ATR_SL_MULT    = 1.0
-	S2_RR             = 1.2
-	S2_RISK_PCT       = 0.005
-	S2_MAX_HOLD_MINS  = 45
-	S2_VIX_MAX        = 30.0
-)
-
-// S3: Opening Range Breakout
-var (
-	S3_RISK_PCT    = 0.005
-	S3_MAX_TRADES  = 2
-	S3_ENTRY_END   = "11:30"
-	S3_EXIT_TIME   = "15:20"
-	S3_TARGET_MULT = 1.0
-)
-
-// S6 Trend Short (Intraday VWAP Breakdown)
-var (
-	S6_EMA_FAST          = 9
-	S6_EMA_SLOW          = 20
-	S6_RSI_PERIOD        = 14
-	S6_RSI_ENTRY_LOW     = 35
-	S6_RSI_ENTRY_HIGH    = 60
-	S6_RSI_EXIT          = 25
-	S6_COOLDOWN_DAYS     = 1
-	S6_MIN_TURNOVER_CR   = 30.0
-	S6_RELATIVE_WEAKNESS = 0.005 // 0.5% weaker than Nifty
-	S6_RVOL_MIN          = 1.5
-	S6_VWAP_FILTER       = true
-	S6_MIN_PRICE         = 200.0
-)
-
-// S6 VWAP Band
-var (
-	S6_VWAP_SD       = 2.0
-	S6_VWAP_RISK_PCT = 0.005
-	S6_VWAP_RR       = 1.5
-)
-
-// S7: Mean Reversion Long
-var (
-	S7_RSI_PERIOD         = 14
-	S7_RSI_OVERSOLD       = 28
-	S7_RSI_EXIT           = 45
-	S7_VWAP_DEVIATION_PCT = 0.020
-	S7_MIN_TURNOVER_CR    = 50.0
-	S7_RVOL_MIN           = 1.5
-	S7_ATR_PERIOD         = 14
-)
-
-// S8: Volume Profile + Pivot
-var (
-	S8_VOL_SPIKE_MULT = 2.5
-	S8_RISK_PCT       = 0.0075
-)
-
-// S9: Multi-Timeframe Momentum
-var (
-	S9_EMA_TREND     = 200
-	S9_RSI_PERIOD    = 14
-	S9_RSI_THRESHOLD = 40
-	S9_ATR_SL_MULT   = 2.0
-	S9_RR            = 3.0
-)
-
-// S14: RSI Scalper (RSI-2 on 5min — Larry Connors adapted for intraday)
-var (
-	S14_RSI_PERIOD     = 2
-	S14_RSI_OVERSOLD   = 15  // Loosened from 10 — RSI(2)<10 still too rare; <15 fires frequently while retaining edge
-	S14_RSI_OVERBOUGHT = 85  // Loosened from 90
-	S14_RSI_EXIT       = 50
-	S14_STOP_PCT       = 0.005 // 0.5% tight scalp stop
-	S14_MAX_HOLD_MINS  = 30
-	S14_MIN_PRICE      = 50.0
-)
-
-// S15: RSI Swing (RSI-14 pullback with EMA20 trend confirmation)
-var (
-	S15_RSI_PERIOD     = 14
-	S15_RSI_OVERSOLD   = 35  // Loosened from 30 — RSI(14)<30 on 5min too rare for intraday
-	S15_RSI_OVERBOUGHT = 65  // Loosened from 70
-	S15_EMA_TREND      = 20
-	S15_ATR_SL_MULT    = 1.0
-	S15_RR             = 2.0
-	S15_MAX_HOLD_MINS  = 120
-	S15_MIN_PRICE      = 100.0
-)
-
-// ── Timing ──────────────────────────────────────────────────
-const (
-	TradeWindowStart    = "09:16"
-	TradeWindowEnd      = "15:15"
-	IntradaySquareoff   = "15:15"
-	HuntWindowStart     = "09:16"
-	LastEntryTime       = "14:50"
-	FillPollIntervalSec = 30
-	FillTimeoutMinutes  = 30
-)
-
-const (
-	MinATRPercentile = 50
-	MinDailyVolume   = 500000
+	MarketOpenTime  = "09:15"
+	MarketCloseTime = "15:30"
+	EODCheckTime    = "15:20" // Run daily EMA exit check near close
 )
 
 // ── Paths ───────────────────────────────────────────────────
 var (
-	BaseDir  string
-	StateDB  string
+	BaseDir   string
+	StateDB   string
 	JournalDB string
 )
 
 func init() {
-	// BaseDir is set to the executable's directory
 	if exe, err := os.Executable(); err == nil {
 		BaseDir = filepath.Dir(exe)
-		
-		// If running via 'go run', the exe is in a temp directory, so fallback to current working directory
 		if strings.Contains(BaseDir, "go-build") || strings.Contains(BaseDir, "Temp") {
 			if cwd, err := os.Getwd(); err == nil {
 				BaseDir = cwd
@@ -296,19 +212,6 @@ func init() {
 	StateDB = BaseDir + string(os.PathSeparator) + "data" + string(os.PathSeparator) + "engine_state.db"
 	JournalDB = BaseDir + string(os.PathSeparator) + "data" + string(os.PathSeparator) + "journal.db"
 }
-
-// DisabledStrategies — only permanently broken strategies
-// S10: Re-enabled — losses came from THESIS_EXPIRED cutting gap fills too early (now exempted)
-// S13: Re-enabled — losses came from CHOP regime entries (now blocked by scale=0.0)
-// S6_TREND: STAYS disabled — 22% WR is structurally broken, not fixable with risk management
-var DisabledStrategies = map[string]bool{
-	"S6_TREND_SHORT": true,
-}
-
-// MinRR is the minimum reward:risk ratio for any signal to be emitted.
-// Enforced at scanner level to structurally prevent inverted R:R.
-// Historical data showed avg loss = 2.7× avg win — this fixes it at source.
-const MinRR = 1.5
 
 // ParseTime parses "HH:MM" into hour, minute
 func ParseTime(s string) (int, int) {
@@ -323,14 +226,16 @@ func ParseTime(s string) (int, int) {
 
 func PrintBanner() {
 	fmt.Println("═══════════════════════════════════════════")
-	fmt.Println("  QUANTIX ENGINE v2.0 — Full Native Golang")
-	fmt.Println("  Ultra HFT Nanosecond Trading Platform")
+	fmt.Println("  SWING ENGINE v4.0 — Final Verified Blueprint")
+	fmt.Println("  Harsh & Apoorva's System (Strict 1:1)")
 	fmt.Println("═══════════════════════════════════════════")
 	if PaperMode {
 		fmt.Println("  Mode: PAPER (Virtual Fills)")
 	} else {
 		fmt.Println("  Mode: LIVE (Real Orders)")
 	}
-	fmt.Printf("  Capital: ₹%.0f\n", TotalCapital)
+	fmt.Printf("  Capital: ₹%.0f | Max Positions: %d\n", TotalCapital, MaxOpenPositions)
+	fmt.Printf("  Max SL: %.0f%% | Ideal SL: %.0f-%.0f%%\n", HardStopLossPct, TightSLPct, IdealSLPct)
+	fmt.Printf("  Trade Size: %.0f-%.0f%% | Exit: %d-EMA (%d red candles)\n", MinTradeAllocPct, MaxTradeAllocPct, EMA21Period, RedCandlesBelowEMA)
 	fmt.Println("═══════════════════════════════════════════")
 }

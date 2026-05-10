@@ -87,6 +87,57 @@ func (k *KiteBroker) PlaceOrder(symbol string, qty int, isShort bool, orderType 
 	return result.Data.OrderID, nil
 }
 
+// PlaceFNOOrder places an F&O order via Kite REST API (NFO exchange)
+func (k *KiteBroker) PlaceFNOOrder(tradingSymbol string, qty int, txnType string, orderType string, price float64) (string, error) {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+
+	kiteOrderType := "MARKET"
+	if strings.ToUpper(orderType) == "LIMIT" {
+		kiteOrderType = "LIMIT"
+	}
+
+	params := url.Values{
+		"exchange":         {"NFO"},
+		"tradingsymbol":    {tradingSymbol},
+		"transaction_type": {txnType},
+		"quantity":         {strconv.Itoa(qty)},
+		"product":          {"MIS"},
+		"order_type":       {kiteOrderType},
+		"validity":         {"DAY"},
+	}
+	if kiteOrderType == "LIMIT" && price > 0 {
+		params.Set("price", fmt.Sprintf("%.1f", price))
+	}
+
+	start := time.Now().UnixNano()
+	resp, err := k.doPost("/orders/regular", params)
+	latency := time.Now().UnixNano() - start
+
+	if err != nil {
+		return "", fmt.Errorf("kite FNO order failed: %v", err)
+	}
+
+	var result struct {
+		Status string `json:"status"`
+		Data   struct {
+			OrderID string `json:"order_id"`
+		} `json:"data"`
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal(resp, &result); err != nil {
+		return "", fmt.Errorf("kite FNO response parse error: %v", err)
+	}
+
+	if result.Status != "success" {
+		return "", fmt.Errorf("kite FNO rejected: %s", result.Message)
+	}
+
+	log.Printf("[Broker] FNO order placed: %s %s %s x%d in %dμs → OID=%s",
+		txnType, tradingSymbol, kiteOrderType, qty, latency/1000, result.Data.OrderID)
+	return result.Data.OrderID, nil
+}
+
 // CancelOrder cancels an order
 func (k *KiteBroker) CancelOrder(orderID string) error {
 	k.mu.Lock()

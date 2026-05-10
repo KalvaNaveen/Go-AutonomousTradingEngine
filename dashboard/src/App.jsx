@@ -301,157 +301,7 @@ function TabJournal() {
   );
 }
 
-function NewsFeedWidget({ news }) {
-  return (
-    <div className="card" style={{ flex: 1, height: '100%', display: 'flex', flexDirection: 'column', minHeight: 0 }}>
-      <div className="card-header" style={{ paddingBottom: '12px' }}>
-        <h3>Macro News Feed</h3>
-        <span style={{ fontSize: '12px', color: 'var(--text-muted)' }}>Live impact</span>
-      </div>
-      <div className="table-scroll" style={{ flex: 1, padding: '0 24px 24px', display: 'flex', flexDirection: 'column', gap: '12px' }}>
-        {!news || news.length === 0 ? (
-          <div style={{ textAlign: 'center', color: 'var(--text-muted)', fontSize: '12px', marginTop: '20px' }}>No news updates</div>
-        ) : (
-          news.map((n, i) => {
-            const isBull = n.sentiment === 'bullish';
-            const isBear = n.sentiment === 'bearish';
-            const hasImage = !!n.image;
-            return (
-              <div key={i} style={{
-                borderBottom: hasImage ? 'none' : '1px solid var(--border-light)',
-                padding: hasImage ? '16px' : '0 0 12px 0',
-                borderRadius: hasImage ? '12px' : '0',
-                display: 'flex', flexDirection: 'column', gap: '6px',
-                backgroundImage: hasImage ? `linear-gradient(to bottom, rgba(0,0,0,0.2), rgba(0,0,0,0.85)), url(${n.image})` : 'none',
-                backgroundSize: 'cover',
-                backgroundPosition: 'center',
-                boxShadow: hasImage ? '0 4px 6px -1px rgba(0, 0, 0, 0.1)' : 'none',
-                marginBottom: hasImage ? '4px' : '0'
-              }}>
-                <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-                  <span style={{ fontSize: '10px', fontWeight: 800, color: hasImage ? '#E5E7EB' : 'var(--accent-purple)' }}>{n.source}</span>
-                  <span style={{ fontSize: '10px', fontWeight: 600, color: hasImage ? '#D1D5DB' : 'var(--text-muted)' }}>{n.time?.substring(0, 5)}</span>
-                </div>
-                <p style={{ fontSize: '13px', margin: 0, fontWeight: hasImage ? 600 : 500, color: hasImage ? '#fff' : 'var(--text-primary)', lineHeight: 1.4 }}>{n.title}</p>
-                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: '6px' }}>
-                  <span className="type-badge" style={{
-                    fontSize: '10px', padding: '2px 8px', fontWeight: 700, letterSpacing: '0.02em',
-                    background: isBull ? (hasImage ? 'rgba(16,185,129,0.25)' : 'var(--bg-badge-green)') :
-                      isBear ? (hasImage ? 'rgba(239,68,68,0.25)' : 'var(--bg-badge-red)') :
-                        (hasImage ? 'rgba(255,255,255,0.15)' : '#F3F4F6'),
-                    color: hasImage ? (isBull ? '#34D399' : isBear ? '#F87171' : '#F3F4F6') :
-                      (isBull ? '#059669' : isBear ? 'var(--accent-red)' : 'var(--text-secondary)'),
-                    border: hasImage ? `1px solid ${isBull ? 'rgba(16,185,129,0.5)' : isBear ? 'rgba(239,68,68,0.5)' : 'rgba(255,255,255,0.3)'}` : 'none'
-                  }}>
-                    {isBull ? 'BULLISH' : isBear ? 'BEARISH' : 'NEUTRAL'}
-                  </span>
-                  <span style={{ fontSize: '10px', fontWeight: 600, color: hasImage ? '#9CA3AF' : 'var(--text-muted)' }}>{n.symbol || ''}</span>
-                </div>
-              </div>
-            );
-          })
-        )}
-      </div>
-    </div>
-  );
-}
 
-const AVAILABLE_STRATEGIES = [
-  "S1_MA_CROSS", "S2_BB_MEAN_REV", "S3_ORB", "S6_TREND_SHORT", 
-  "S6_VWAP_BAND", "S7_MEAN_REV_LONG", "S8_VOL_PIVOT", "S9_MTF_MOMENTUM", 
-  "S10_GAP_FILL", "S11_VWAP_REVERT", "S12_EOD_REVERT", "S13_SECTOR_ROT", 
-  "S14_RSI_SCALP", "S15_RSI_SWING"
-];
-
-function TabSimulator() {
-  const [days, setDays] = useState(30);
-  const [top, setTop] = useState(50);
-  const [running, setRunning] = useState(false);
-  const [logs, setLogs] = useState([]);
-  const [selectedStrategies, setSelectedStrategies] = useState(AVAILABLE_STRATEGIES);
-
-  const toggleStrategy = (strat) => {
-    if (selectedStrategies.includes(strat)) {
-      setSelectedStrategies(selectedStrategies.filter(s => s !== strat));
-    } else {
-      setSelectedStrategies([...selectedStrategies, strat]);
-    }
-  };
-
-  const runSimulator = () => {
-    setRunning(true);
-    setLogs(["[SIM] Initializing Native Go Backtester..."]);
-    const wsUrl = `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}/api/ws/simulator?days=${days}&top=${top}&strategies=${selectedStrategies.join(',')}`;
-
-    const ws = new WebSocket(wsUrl);
-    ws.onopen = () => setLogs(prev => [...prev, "[SIM] Connected to Engine Simulator Core."]);
-    ws.onmessage = (e) => setLogs(prev => [...prev, e.data]);
-    ws.onclose = () => {
-      setRunning(false);
-      setLogs(prev => [...prev, "[SIM] Connection closed."]);
-    };
-    ws.onerror = () => {
-      setLogs(prev => [...prev, "[ERROR] Connection to simulator failed. Backend route /api/ws/simulator not implemented yet."]);
-    };
-  };
-
-  return (
-    <div className="card" style={{ flex: 1, display: 'flex', flexDirection: 'column', padding: '24px', minHeight: 0 }}>
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '24px' }}>
-        <div>
-          <h3 style={{ fontSize: '18px', fontWeight: 600 }}>Quantum Simulator Options</h3>
-          <p style={{ fontSize: '13px', color: 'var(--text-muted)' }}>Replay historical intraday ticks through core strategy paths.</p>
-        </div>
-        <div style={{ display: 'flex', gap: '16px', alignItems: 'flex-end' }}>
-          <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
-            <label style={{ fontSize: '11px', fontWeight: 600, color: 'var(--text-secondary)' }}>LOOKBACK DAYS</label>
-            <input type="number" value={days} onChange={e => setDays(Number(e.target.value))} style={{ padding: '8px 12px', border: '1px solid var(--border-light)', borderRadius: '8px', width: '100px' }} />
-          </div>
-          <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
-            <label style={{ fontSize: '11px', fontWeight: 600, color: 'var(--text-secondary)' }}>TOP SYMBOLS (VOL)</label>
-            <input type="number" value={top} onChange={e => setTop(Number(e.target.value))} style={{ padding: '8px 12px', border: '1px solid var(--border-light)', borderRadius: '8px', width: '100px' }} />
-          </div>
-          <button onClick={runSimulator} disabled={running} style={{ padding: '10px 24px', background: 'var(--accent-blue)', color: 'white', border: 'none', borderRadius: '8px', fontWeight: 600, cursor: running ? 'not-allowed' : 'pointer' }}>
-            {running ? 'Simulating...' : 'Run Simulation'}
-          </button>
-        </div>
-      </div>
-
-      <div style={{ marginBottom: '24px' }}>
-        <h4 style={{ fontSize: '13px', fontWeight: 600, color: 'var(--text-secondary)', marginBottom: '12px' }}>FILTER STRATEGIES</h4>
-        <div style={{ display: 'flex', flexWrap: 'wrap', gap: '8px' }}>
-          {AVAILABLE_STRATEGIES.map(strat => {
-            const isActive = selectedStrategies.includes(strat);
-            return (
-              <button
-                key={strat}
-                onClick={() => toggleStrategy(strat)}
-                style={{
-                  padding: '6px 12px',
-                  borderRadius: '16px',
-                  fontSize: '12px',
-                  fontWeight: 600,
-                  cursor: 'pointer',
-                  border: isActive ? '1px solid var(--accent-blue)' : '1px solid var(--border-light)',
-                  background: isActive ? 'var(--accent-blue)' : 'transparent',
-                  color: isActive ? 'white' : 'var(--text-secondary)',
-                  transition: 'all 0.2s ease'
-                }}
-              >
-                {strat}
-              </button>
-            );
-          })}
-        </div>
-      </div>
-
-      <div style={{ flex: 1, background: '#111827', borderRadius: '12px', padding: '16px', overflowY: 'auto', color: '#10B981', fontFamily: 'monospace', fontSize: '13px', lineHeight: 1.6 }}>
-        {logs.length === 0 ? <div style={{ color: '#6B7280' }}>Ready to initialize Engine. Waiting for backtest parameters...</div> : null}
-        {logs.map((L, i) => <div key={i}>{L}</div>)}
-      </div>
-    </div>
-  );
-}
 
 // ════════════════════════════════════════════
 //  MAIN APP
@@ -466,8 +316,8 @@ function App() {
     pnl: 0, pnl_history: [], regime: 'UNKNOWN', uptime: '0h 0m 0s',
     positions: [], activity_log: [],
     universe_count: 0,
-    index_data: { nifty50: null, banknifty: null, vix: null },
-    news_feed: [], ml_stats: { trained: false, accuracy: 0, samples: 0 },
+    index_data: { nifty250: null, banknifty: null, vix: null },
+    news_feed: [],
     phases: {
       auto_login: 'pending', cache_load: 'pending', universe_load: 'pending',
       websocket: 'pending', scanner: 'pending', execution: 'pending',
@@ -584,7 +434,6 @@ function App() {
                 index_data: root.index_data || prev.index_data,
                 news_feed: root.news_feed || prev.news_feed || [],
                 activity_log: logs.logs || [],
-                ml_stats: root.ml_stats || prev.ml_stats,
                 phases, strategy_breakdown: stratBreak,
                 daily_stats: {
                   ...prev.daily_stats,
@@ -641,7 +490,7 @@ function App() {
           <div className="brand-icon">QTX</div>
           <div>
             <h1>Quantix Engine</h1>
-            <span>Quantum Terminal v2.0</span>
+            <span>Swing Trading v3.0</span>
           </div>
         </div>
 
@@ -653,7 +502,6 @@ function App() {
             { id: 'dashboard', icon: '📊', label: 'Dashboard' },
             { id: 'scanner', icon: '🔍', label: 'Scanner Feed' },
             { id: 'history', icon: '📋', label: 'Trade Journal' },
-            { id: 'simulator', icon: '🧪', label: 'Quantum Simulator' },
           ].map(item => (
             <button key={item.id} className={`nav-item ${activeTab === item.id ? 'active' : ''}`} onClick={() => setActiveTab(item.id)}>
               <span className="nav-icon">{item.icon}</span>{item.label}
@@ -663,18 +511,17 @@ function App() {
 
 
 
-        {/* Engine Phases Visualization */}
         <div className="engine-phases">
-          <div className="sidebar-section-label" style={{ padding: '0 8px 12px' }}>Engine Pipeline</div>
+          <div className="sidebar-section-label" style={{ padding: '0 8px 12px' }}>Swing Pipeline</div>
           {[
             { key: 'auto_login', label: 'Auto Login', icon: '🔑', time: '08:30' },
             { key: 'cache_load', label: 'Cache Preload', icon: '📊', time: '08:45' },
             { key: 'universe_load', label: 'Universe Load', icon: '🌐', time: '08:50' },
             { key: 'websocket', label: 'WebSocket Feed', icon: '📡', time: '09:00' },
-            { key: 'scanner', label: 'Scanner Active', icon: '🔍', time: '09:16' },
-            { key: 'execution', label: 'Execution Ready', icon: '⚡', time: '09:16' },
-            { key: 'risk', label: 'Risk Checks', icon: '🛡️', time: 'Always' },
-            { key: 'eod_squareoff', label: 'EOD Squareoff', icon: '🏁', time: '15:15' },
+            { key: 'regime', label: 'Market Timing (ROC)', icon: '🎯', time: '09:15' },
+            { key: 'scanner', label: 'VCP Breakout Scan', icon: '🔍', time: '09:15' },
+            { key: 'execution', label: 'Hard SL Monitor', icon: '⚡', time: 'Live' },
+            { key: 'ema_exit', label: '21 EMA Exit Check', icon: '📈', time: '15:20' },
           ].map(phase => (
             <div className="phase-item" key={phase.key}>
               <div className={`phase-dot ${state.phases[phase.key] || 'pending'}`}></div>
@@ -700,14 +547,13 @@ function App() {
             <h2>
               {activeTab === 'dashboard' ? '' :
                 activeTab === 'scanner' ? 'Live Scanner' :
-                  activeTab === 'history' ? 'Trade Journal' :
-                    activeTab === 'simulator' ? 'Historical Strategy Simulator' : 'Trade Analysis'}
+                  activeTab === 'history' ? 'Trade Journal' : 'Trade Analysis'}
             </h2>
 
             {/* Market Indices in Header */}
             <div style={{ display: 'flex', gap: '12px' }}>
               {[
-                { label: 'NIFTY 50', val: state.index_data?.nifty50, pct: state.index_data?.nifty50_pct },
+                { label: 'NIFTY 250', val: state.index_data?.nifty250, pct: state.index_data?.nifty250_pct },
                 { label: 'BANK NIFTY', val: state.index_data?.banknifty, pct: state.index_data?.banknifty_pct },
                 { label: 'INDIA VIX', val: state.index_data?.vix, pct: state.index_data?.vix_pct },
               ].map((idx, i) => (
@@ -753,7 +599,6 @@ function App() {
 
         {activeTab === 'scanner' && <TabScanner logs={state.activity_log || []} />}
         {activeTab === 'history' && <TabJournal />}
-        {activeTab === 'simulator' && <TabSimulator />}
 
         {activeTab === 'dashboard' && (
           <>
@@ -890,9 +735,7 @@ function App() {
                 })()}
               </div>
 
-              <div className="right-column">
-                <NewsFeedWidget news={state.news_feed} />
-              </div>
+
             </div>
 
             {/* STAT STRIP — Compact pill-style cards like the index header */}
@@ -903,7 +746,6 @@ function App() {
                 { label: 'Avg Loss', value: `₹${Math.abs(ds.avg_loss || 0).toFixed(0)}`, icon: '❌', isGood: false },
                 { label: 'Profit Factor', value: (ds.profit_factor || 0) > 0 ? (ds.profit_factor || 0).toFixed(2) : '—', icon: '⚖️', isGood: (ds.profit_factor || 0) > 1 },
                 { label: 'Best Trade', value: `₹${Math.abs(ds.best_trade || 0).toFixed(0)}`, icon: '🏆', isGood: (ds.best_trade || 0) > 0 },
-                { label: 'ML Accuracy', value: state.ml_stats?.trained ? `${(state.ml_stats.accuracy || 0).toFixed(0)}%` : '—', icon: '🤖', isGood: state.ml_stats?.trained, sub: state.ml_stats?.trained ? `${state.ml_stats.samples}s` : '' },
               ].map((s, i) => (
                 <div className="card stat-pill" key={i}>
                   <span className="stat-pill-icon">{s.icon}</span>

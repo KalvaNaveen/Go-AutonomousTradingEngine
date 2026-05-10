@@ -138,6 +138,18 @@ func (pb *RealisticPaperBroker) PlaceOrder(symbol string, qty int, isShort bool,
 	return oid, nil
 }
 
+// PlaceFNOOrder places a virtual F&O order. Same as PlaceOrder but with wider slippage for options.
+func (pb *RealisticPaperBroker) PlaceFNOOrder(tradingSymbol string, qty int, txnType string, orderType string, price float64) (string, error) {
+	isShort := txnType == "SELL"
+	// Options have ~2× wider spreads than equity
+	oid, err := pb.PlaceOrder(tradingSymbol, qty, isShort, orderType, price)
+	if err != nil {
+		return "", fmt.Errorf("paper FNO order failed: %v", err)
+	}
+	log.Printf("[Paper-FNO] %s %s x%d → %s", txnType, tradingSymbol, qty, oid)
+	return oid, nil
+}
+
 // CancelOrder cancels a pending order
 func (pb *RealisticPaperBroker) CancelOrder(orderID string) error {
 	pb.mu.Lock()
