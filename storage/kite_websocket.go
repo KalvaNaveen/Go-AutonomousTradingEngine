@@ -323,8 +323,7 @@ func min(a, b int) int {
 // and must be parsed with the index layout, not the equity layout.
 func isIndexToken(token uint32) bool {
 	switch token {
-	case config.Nifty250Token,
-		config.NiftySpotToken,
+	case config.NiftySpotToken,
 		config.SmallcapToken,
 		config.IndiaVIXToken,
 		config.BankNiftySpotToken:

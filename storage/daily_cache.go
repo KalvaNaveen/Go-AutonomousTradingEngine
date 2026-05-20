@@ -38,19 +38,12 @@ type DailyCacheEntry struct {
 	Highs        []float64
 	Lows         []float64
 	Volumes      []float64
-	EMA25        float64
-	EMA21        float64 // Phase 5: 21-day EMA for swing exit
-	RSI14        float64
-	BBUpper      float64
-	BBLower      float64
+	EMA10        float64 // Fast EMA — crossover entry signal
+	EMA20        float64 // Trend EMA — entry confirmation + exit trigger
 	AvgDailyVol  float64
 	TurnoverCr   float64
 	PivotSupport float64
 	ATR14        float64
-	SMA50        float64
-	SMA150       float64
-	SMA200       float64
-	SMA200Up     bool
 	High52W      float64
 	Low52W       float64
 	RSScore      int
@@ -64,11 +57,19 @@ func NewDailyCache() *DailyCache {
 	}
 }
 
-// Preload fetches 500 days of historical data for all universe tokens.
-// Extended from 260d to support monthly ROC (needs up to 420 daily bars).
-// Uses 3 parallel workers to respect Kite's ~3 req/sec rate limit while cutting load time by 3x.
+// isRegimeToken returns true for the two index tokens that need the full
+// RegimeLookbackDays history for ROC calculation.
+func isRegimeToken(token uint32) bool {
+	return token == config.NiftySpotToken || token == config.SmallcapToken
+}
+
+// Preload fetches historical EOD data for all universe tokens.
+// Equity tokens use EODLookbackDays (150); regime index tokens use
+// RegimeLookbackDays (420) for the monthly ROC calculation.
+// Uses 3 parallel workers to respect Kite's ~3 req/sec rate limit.
 func (dc *DailyCache) Preload(universe map[uint32]string) bool {
-	log.Printf("[DailyCache] Preloading %d tokens (500d) with 3 parallel workers...", len(universe))
+	log.Printf("[DailyCache] Preloading %d tokens (equity:%dd, regime:%dd) with 3 workers...",
+		len(universe), config.EODLookbackDays, config.RegimeLookbackDays)
 
 	type tokenJob struct {
 		token  uint32
@@ -87,14 +88,19 @@ func (dc *DailyCache) Preload(universe map[uint32]string) bool {
 	total := len(universe)
 
 	var wg sync.WaitGroup
-	numWorkers := 3 // Kite rate limit ~3 req/sec
+	numWorkers := 3
 
 	for w := 0; w < numWorkers; w++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for job := range jobs {
-				dailyData, err := dc.fetchDaily(job.token, 500)
+				lookback := config.EODLookbackDays
+				if isRegimeToken(job.token) {
+					lookback = config.RegimeLookbackDays
+				}
+
+				dailyData, err := dc.fetchDaily(job.token, lookback)
 				if err != nil || len(dailyData) < 25 {
 					mu.Lock()
 					failed++
@@ -117,26 +123,17 @@ func (dc *DailyCache) Preload(universe map[uint32]string) bool {
 					volumes[i] = float64(d.Volume)
 				}
 
-				ema25 := data.ComputeEMA(closes, 25)
-				ema25Val := 0.0
-				if len(ema25) > 0 {
-					ema25Val = ema25[len(ema25)-1]
+				ema10Slice := data.ComputeEMA(closes, config.EMA10Period)
+				ema10Val := 0.0
+				if len(ema10Slice) > 0 {
+					ema10Val = ema10Slice[len(ema10Slice)-1]
 				}
 
-				// Phase 5: Compute 21-day EMA for swing exit trailing
-				ema21 := data.ComputeEMA(closes, 21)
-				ema21Val := 0.0
-				if len(ema21) > 0 {
-					ema21Val = ema21[len(ema21)-1]
+				ema20Slice := data.ComputeEMA(closes, config.EMA20Period)
+				ema20Val := 0.0
+				if len(ema20Slice) > 0 {
+					ema20Val = ema20Slice[len(ema20Slice)-1]
 				}
-
-				rsiSlice := data.ComputeRSI(closes, 14)
-				rsi14 := 50.0
-				if len(rsiSlice) > 0 {
-					rsi14 = rsiSlice[len(rsiSlice)-1]
-				}
-
-				bbHi, _, bbLo := data.ComputeBollinger(closes, 20, 2.0)
 
 				avgVol := 1.0
 				if len(volumes) >= 20 {
@@ -159,24 +156,6 @@ func (dc *DailyCache) Preload(universe map[uint32]string) bool {
 
 				atr14 := computeATR(highs, lows, closes, 14)
 				pivot := computePivotSupport(closes, lows)
-
-				sma50, sma150, sma200 := 0.0, 0.0, 0.0
-				if len(closes) >= 50 {
-					sma50 = sma(closes, 50)
-				}
-				if len(closes) >= 150 {
-					sma150 = sma(closes, 150)
-				}
-				if len(closes) >= 200 {
-					sma200 = sma(closes, 200)
-				}
-
-				sma200Up := false
-				if len(closes) >= 220 {
-					sma200Prev := sma(closes[:len(closes)-20], 200)
-					sma200Up = sma200 > sma200Prev
-				}
-
 				high52 := maxSlice(closes)
 				low52 := minSlice(closes)
 
@@ -187,19 +166,12 @@ func (dc *DailyCache) Preload(universe map[uint32]string) bool {
 					Highs:        highs,
 					Lows:         lows,
 					Volumes:      volumes,
-					EMA25:        ema25Val,
-					EMA21:        ema21Val,
-					RSI14:        rsi14,
-					BBUpper:      bbHi,
-					BBLower:      bbLo,
+					EMA10:        ema10Val,
+					EMA20:        ema20Val,
 					AvgDailyVol:  avgVol,
 					TurnoverCr:   math.Round(avgTurn*100) / 100,
 					PivotSupport: pivot,
 					ATR14:        math.Round(atr14*100) / 100,
-					SMA50:        math.Round(sma50*100) / 100,
-					SMA150:       math.Round(sma150*100) / 100,
-					SMA200:       math.Round(sma200*100) / 100,
-					SMA200Up:     sma200Up,
 					High52W:      math.Round(high52*100) / 100,
 					Low52W:       math.Round(low52*100) / 100,
 				}
@@ -207,20 +179,17 @@ func (dc *DailyCache) Preload(universe map[uint32]string) bool {
 
 				mu.Lock()
 				loaded++
-				if loaded%25 == 0 {
+				if loaded%50 == 0 {
 					log.Printf("[DailyCache] Progress: %d/%d loaded", loaded, total)
 				}
 				mu.Unlock()
 
-				// Per-worker rate limit: each worker sleeps 350ms = 3 workers × ~3 req/s total
 				time.Sleep(350 * time.Millisecond)
 			}
 		}()
 	}
 
 	wg.Wait()
-
-	// Compute RS scores cross-sectionally
 	dc.computeRSScores()
 
 	dc.mu.Lock()
@@ -232,17 +201,15 @@ func (dc *DailyCache) Preload(universe map[uint32]string) bool {
 	return dc.loaded
 }
 
-// ToScannerCache converts to the agents.DailyCache format expected by scanner
+// ToScannerCache converts to the agents.DailyCache format expected by scanner.
 func (dc *DailyCache) ToScannerCache() *agents.DailyCache {
 	dc.mu.RLock()
 	defer dc.mu.RUnlock()
 
 	sc := &agents.DailyCache{
-		SMA200:       make(map[uint32]float64),
 		ATR:          make(map[uint32]float64),
-		EMA25:        make(map[uint32]float64),
-		EMA21:        make(map[uint32]float64),
-		BBLower:      make(map[uint32]float64),
+		EMA10:        make(map[uint32]float64),
+		EMA20:        make(map[uint32]float64),
 		Closes:       make(map[uint32][]float64),
 		Highs:        make(map[uint32][]float64),
 		Lows:         make(map[uint32][]float64),
@@ -256,11 +223,9 @@ func (dc *DailyCache) ToScannerCache() *agents.DailyCache {
 	}
 
 	for token, entry := range dc.store {
-		sc.SMA200[token] = entry.SMA200
 		sc.ATR[token] = entry.ATR14
-		sc.EMA25[token] = entry.EMA25
-		sc.EMA21[token] = entry.EMA21
-		sc.BBLower[token] = entry.BBLower
+		sc.EMA10[token] = entry.EMA10
+		sc.EMA20[token] = entry.EMA20
 		sc.Closes[token] = entry.Closes
 		sc.Highs[token] = entry.Highs
 		sc.Lows[token] = entry.Lows
@@ -376,7 +341,9 @@ func toFloat(v interface{}) float64 {
 	return 0
 }
 
-// ── RS Score computation ─────────────────────────────────────
+// computeRSScores ranks universe stocks by relative strength using available bars.
+// With EODLookbackDays=150 we can compute 3-month (63d), 1-month (21d), 1-week (5d).
+// Regime tokens (420-day history) also get a 6-month component.
 func (dc *DailyCache) computeRSScores() {
 	dc.mu.Lock()
 	defer dc.mu.Unlock()
@@ -389,13 +356,16 @@ func (dc *DailyCache) computeRSScores() {
 	var perfs []tokenPerf
 	for token, entry := range dc.store {
 		closes := entry.Closes
-		if len(closes) < 260 {
+		if len(closes) < 21 {
 			continue
 		}
 		cNow := closes[len(closes)-1]
-		p12, p3, p1 := 0.0, 0.0, 0.0
-		if len(closes) >= 252 && closes[len(closes)-252] > 0 {
-			p12 = (cNow - closes[len(closes)-252]) / closes[len(closes)-252] * 100
+
+		// Use whatever lookbacks are available; weight shorter periods more heavily
+		// when only 150 days of data exist.
+		p6, p3, p1, pw := 0.0, 0.0, 0.0, 0.0
+		if len(closes) >= 126 && closes[len(closes)-126] > 0 {
+			p6 = (cNow - closes[len(closes)-126]) / closes[len(closes)-126] * 100
 		}
 		if len(closes) >= 63 && closes[len(closes)-63] > 0 {
 			p3 = (cNow - closes[len(closes)-63]) / closes[len(closes)-63] * 100
@@ -403,7 +373,11 @@ func (dc *DailyCache) computeRSScores() {
 		if len(closes) >= 21 && closes[len(closes)-21] > 0 {
 			p1 = (cNow - closes[len(closes)-21]) / closes[len(closes)-21] * 100
 		}
-		perfs = append(perfs, tokenPerf{token, p12*0.4 + p3*0.3 + p1*0.3})
+		if len(closes) >= 5 && closes[len(closes)-5] > 0 {
+			pw = (cNow - closes[len(closes)-5]) / closes[len(closes)-5] * 100
+		}
+		composite := p6*0.3 + p3*0.35 + p1*0.25 + pw*0.1
+		perfs = append(perfs, tokenPerf{token, composite})
 	}
 
 	sort.Slice(perfs, func(i, j int) bool { return perfs[i].composite < perfs[j].composite })
@@ -550,8 +524,9 @@ func (dc *DailyCache) SyncEODToHistoricalDB(universe map[uint32]string) {
 		}
 
 		if todayBar == nil {
-			lastBar := bars[len(bars)-1]
-			todayBar = &lastBar
+			// Today's candle is not available yet (sync ran before 15:30, or stock did not trade).
+			// Do NOT write the previous day's bar under today's date — that corrupts historical.db.
+			continue
 		}
 
 		_, err = db.Exec(`

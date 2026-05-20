@@ -7,6 +7,7 @@ import (
 	"log"
 	"mime/multipart"
 	"net/http"
+	"os"
 	"sort"
 	"strings"
 	"time"
@@ -39,10 +40,11 @@ func BuildDailyReport(
 		return fmt.Sprintf("📅 *DAILY REPORT* : %s\nNo trades executed today. Engine healthy.", dateStr)
 	}
 
-	// Compute charges
+	// Compute charges — CNC (delivery) applies 0.1% STT on sell side, not 0.025% MIS rate.
+	// Bug fix: was incorrectly passing "MIS" for this CNC swing engine, understating charges ~4×.
 	var totalCharges float64
 	for _, t := range trades {
-		totalCharges += core.ComputeChargesFromTrade(t.EntryPrice, t.FullExitPrice, t.Qty, t.IsShort, "MIS", 0)
+		totalCharges += core.ComputeChargesFromTrade(t.EntryPrice, t.FullExitPrice, t.Qty, t.IsShort, "CNC", 0)
 	}
 
 	dayROI := 0.0
@@ -183,38 +185,49 @@ func BuildMonthlyReport(stats map[string]interface{}, from, to string, capital f
 }
 
 // SendTelegramDocument sends a file to Telegram
-func SendTelegramDocument(filepath string, caption string) {
+func SendTelegramDocument(filePath string, caption string) {
 	if config.TelegramBotToken == "" || len(config.TelegramChatIDs) == 0 {
-		log.Printf("[Report] Would send %s", filepath)
+		log.Printf("[Report] Would send %s", filePath)
 		return
 	}
 
 	for _, chatID := range config.TelegramChatIDs {
 		go func(cid string) {
+			// Open the file from disk
+			file, err := os.Open(filePath)
+			if err != nil {
+				log.Printf("[Report] Failed to open file %s: %v", filePath, err)
+				return
+			}
+			defer file.Close()
+
 			body := &bytes.Buffer{}
 			writer := multipart.NewWriter(body)
 			writer.WriteField("chat_id", cid)
 			writer.WriteField("caption", caption)
 			writer.WriteField("parse_mode", "Markdown")
 
-			part, err := writer.CreateFormFile("document", filepath)
+			// Extract just the filename for the attachment
+			fileName := filePath
+			if idx := strings.LastIndex(filePath, string(os.PathSeparator)); idx >= 0 {
+				fileName = filePath[idx+1:]
+			}
+
+			part, err := writer.CreateFormFile("document", fileName)
 			if err != nil {
+				log.Printf("[Report] Failed to create form file: %v", err)
 				return
 			}
-			// Read file content
-			file, err := http.Get("file://" + filepath)
-			if err != nil {
-				return
-			}
-			defer file.Body.Close()
-			io.Copy(part, file.Body)
+			io.Copy(part, file)
 			writer.Close()
 
-			url := fmt.Sprintf("https://api.telegram.org/bot%s/sendDocument", config.TelegramBotToken)
-			resp, err := http.Post(url, writer.FormDataContentType(), body)
-			if err == nil {
-				resp.Body.Close()
+			apiURL := fmt.Sprintf("https://api.telegram.org/bot%s/sendDocument", config.TelegramBotToken)
+			resp, err := http.Post(apiURL, writer.FormDataContentType(), body)
+			if err != nil {
+				log.Printf("[Report] Failed to send document to Telegram: %v", err)
+				return
 			}
+			resp.Body.Close()
 		}(chatID)
 	}
 }

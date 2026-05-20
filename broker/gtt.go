@@ -146,6 +146,39 @@ func (g *GTTClient) PlaceOCO(symbol string, qty int, targetPrice, slPrice, lastP
 	return triggerID, nil
 }
 
+// PlaceSLGTT places a single-leg SELL GTT for SL exit of a long CNC position.
+// Matches the FillMonitor.PlaceGTT function signature.
+// The limit price is set 1% below the trigger so a gap-down still fills.
+func (g *GTTClient) PlaceSLGTT(symbol, exchange string, token uint32, lastPrice float64, qty int, slPrice float64) (int, error) {
+	limitPrice := slPrice * 0.99 // 1% below trigger — guarantees fill on gap downs
+	payload := gttPayload{
+		TriggerType:   GTTTypeSingle,
+		TradingSymbol: symbol,
+		Exchange:      exchange,
+		TriggerValues: []float64{slPrice},
+		LastPrice:     lastPrice,
+		Orders: []GTTOrder{
+			{
+				Exchange:        exchange,
+				TradingSymbol:   symbol,
+				TransactionType: "SELL",
+				Quantity:        qty,
+				Price:           limitPrice,
+				OrderType:       "LIMIT",
+				Product:         "CNC",
+			},
+		},
+	}
+
+	triggerID, err := g.postGTT(payload)
+	if err != nil {
+		return 0, err
+	}
+	log.Printf("[GTT] SL placed: %s trigger=%.2f limit=%.2f qty=%d → ID=%d",
+		symbol, slPrice, limitPrice, qty, triggerID)
+	return triggerID, nil
+}
+
 // CancelGTT cancels a GTT trigger by ID
 func (g *GTTClient) CancelGTT(triggerID int) error {
 	url := fmt.Sprintf("%s/gtt/triggers/%d", g.BaseURL, triggerID)

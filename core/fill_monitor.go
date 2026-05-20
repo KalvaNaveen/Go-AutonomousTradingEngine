@@ -3,6 +3,7 @@ package core
 import (
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 	"time"
 
@@ -22,6 +23,12 @@ type FillMonitor struct {
 	ModifyOrder    func(orderID string, qty int) error
 	State          *StateManager
 	AlertFn        func(msg string)
+
+	// GTT interfaces — when set, SL is placed as a GTT (persists overnight, survives bot restarts).
+	// PlaceGTT creates a single-leg SL GTT for a long position; returns Kite trigger ID.
+	// GTT is preferred over SL-M for swing positions held overnight.
+	PlaceGTT  func(symbol, exchange string, token uint32, lastPrice float64, qty int, slPrice float64) (int, error)
+	CancelGTT func(triggerID int) error
 }
 
 type OrderStatus struct {
@@ -108,7 +115,7 @@ func (fm *FillMonitor) WaitForFill(trade *Trade) *Trade {
 			return trade
 		}
 
-		time.Sleep(30 * time.Second) // Poll every 30s
+		time.Sleep(10 * time.Second) // Poll every 10s — 30s was too slow for fast breakout reversals
 	}
 
 	// Timeout
@@ -141,35 +148,65 @@ func (fm *FillMonitor) WaitForFill(trade *Trade) *Trade {
 	return trade
 }
 
-// adjustOrderQuantities places SL-M + partial + target orders after entry fills
+// adjustOrderQuantities places exit orders after entry fills.
+// If PlaceGTT is wired, places a single-leg SL GTT (persists overnight).
+// Otherwise falls back to SL-M + partial + target regular orders.
 func (fm *FillMonitor) adjustOrderQuantities(trade *Trade, actualQty int, actualPrice float64) *Trade {
 	symbol := trade.Symbol
 
 	// Cancel existing exit orders if any (partial fill re-adjustment)
 	for _, oid := range []string{trade.SLOID, trade.PartialOID, trade.TargetOID} {
-		if oid != "" && fm.CancelOrder != nil {
-			fm.CancelOrder(oid)
+		if oid != "" {
+			if strings.HasPrefix(oid, "GTT_") {
+				if fm.CancelGTT != nil {
+					var gttID int
+					fmt.Sscanf(oid[4:], "%d", &gttID)
+					fm.CancelGTT(gttID)
+				}
+			} else if fm.CancelOrder != nil {
+				fm.CancelOrder(oid)
+			}
 		}
 	}
 
+	// ── GTT path: preferred for swing positions held overnight ──
+	if fm.PlaceGTT != nil {
+		gttID, err := fm.PlaceGTT(symbol, "NSE", trade.Token, actualPrice, actualQty, trade.StopPrice)
+		if err != nil {
+			log.Printf("[FillMonitor] GTT SL place failed for %s: %v — falling back to SL-M", symbol, err)
+			// fall through to SL-M path below
+		} else {
+			trade.Qty = actualQty
+			trade.PartialQty = 0
+			trade.RemainingQty = actualQty
+			trade.EntryPrice = actualPrice
+			trade.SLOID = fmt.Sprintf("GTT_%d", gttID)
+			trade.PartialOID = ""
+			trade.TargetOID = ""
+			fm.State.Save(trade.EntryOID, trade)
+			log.Printf("[FillMonitor] GTT SL placed for %s: trigger=₹%.2f ID=%d", symbol, trade.StopPrice, gttID)
+			fm.AlertFn(fmt.Sprintf("🛡 *GTT SL SET*: `%s` trigger=₹`%.2f` ID=`%d`", symbol, trade.StopPrice, gttID))
+			return trade
+		}
+	}
+
+	// ── SL-M path: fallback when GTT not available ──
 	partialQty := actualQty / 2
 	if partialQty < 1 {
 		partialQty = 1
 	}
 	remainingQty := actualQty - partialQty
 
-	// Place SL-M order
 	var newSLOID string
 	if fm.PlaceOrder != nil {
 		oid, err := fm.PlaceOrder(symbol, actualQty, !trade.IsShort, "SL-M", trade.StopPrice)
 		if err != nil {
-			log.Printf("[FillMonitor] SL place failed: %v", err)
+			log.Printf("[FillMonitor] SL-M place failed: %v", err)
 		} else {
 			newSLOID = oid
 		}
 	}
 
-	// Place partial target
 	var newPartialOID string
 	if partialQty > 0 && trade.PartialTarget > 0 && fm.PlaceOrder != nil {
 		oid, err := fm.PlaceOrder(symbol, partialQty, !trade.IsShort, "LIMIT", trade.PartialTarget)
@@ -180,13 +217,12 @@ func (fm *FillMonitor) adjustOrderQuantities(trade *Trade, actualQty int, actual
 		}
 	}
 
-	// Place full target
 	var newTargetOID string
 	targetQty := remainingQty
 	if newPartialOID == "" {
 		targetQty = actualQty
 	}
-	if fm.PlaceOrder != nil {
+	if fm.PlaceOrder != nil && trade.TargetPrice > 0 {
 		oid, err := fm.PlaceOrder(symbol, targetQty, !trade.IsShort, "LIMIT", trade.TargetPrice)
 		if err != nil {
 			log.Printf("[FillMonitor] Target place failed: %v", err)
@@ -195,7 +231,6 @@ func (fm *FillMonitor) adjustOrderQuantities(trade *Trade, actualQty int, actual
 		}
 	}
 
-	// Update trade
 	trade.Qty = actualQty
 	trade.PartialQty = partialQty
 	trade.RemainingQty = remainingQty
@@ -204,7 +239,6 @@ func (fm *FillMonitor) adjustOrderQuantities(trade *Trade, actualQty int, actual
 	trade.PartialOID = newPartialOID
 	trade.TargetOID = newTargetOID
 
-	// Persist adjusted state
 	fm.State.Save(trade.EntryOID, trade)
 	return trade
 }

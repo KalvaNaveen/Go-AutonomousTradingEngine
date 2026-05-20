@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -48,6 +49,9 @@ func (s *Server) Start(addr string) {
 	mux.HandleFunc("/api/status", s.handleStatus)
 	mux.HandleFunc("/api/positions", s.handlePositions)
 	mux.HandleFunc("/api/trades", s.handleTrades)
+	mux.HandleFunc("/api/trades/dates", s.handleTradesDates)
+	mux.HandleFunc("/api/summary", s.handleSummary)
+	mux.HandleFunc("/api/pnl-summary", s.handlePnlSummary)
 	mux.HandleFunc("/api/ws/live", s.handleWSLive)
 
 	distDir := filepath.Join(config.BaseDir, "dashboard", "dist")
@@ -185,11 +189,69 @@ func (s *Server) buildStatusData() map[string]interface{} {
 	}
 	s.exec.Mu.RUnlock()
 
+	// Sort openPositions by symbol so UI doesn't shuffle
+	sort.SliceStable(openPositions, func(i, j int) bool {
+		s1, _ := openPositions[i]["symbol"].(string)
+		s2, _ := openPositions[j]["symbol"].(string)
+		return s1 < s2
+	})
+
+	universeCount := 0
+	if s.scanner != nil && s.scanner.Universe != nil {
+		universeCount = len(s.scanner.Universe)
+	}
+
+	indexData := map[string]interface{}{}
+	if s.tickStore != nil {
+		indexData["NIFTY_50"] = map[string]float64{
+			"ltp":    s.tickStore.GetLTPIfFresh(config.NiftySpotToken),
+			"change": s.tickStore.GetChangePct(config.NiftySpotToken),
+		}
+		indexData["BANK_NIFTY"] = map[string]float64{
+			"ltp":    s.tickStore.GetLTPIfFresh(config.BankNiftySpotToken),
+			"change": s.tickStore.GetChangePct(config.BankNiftySpotToken),
+		}
+		indexData["INDIA_VIX"] = map[string]float64{
+			"ltp":    s.tickStore.GetLTPIfFresh(config.IndiaVIXToken),
+			"change": s.tickStore.GetChangePct(config.IndiaVIXToken),
+		}
+	}
+
+	// Calculate Live Stats
+	stats := map[string]interface{}{
+		"total": 0, "wins": 0, "losses": 0,
+		"win_rate": 0.0, "gross_pnl": 0.0,
+	}
+	if s.journal != nil {
+		today := config.TodayIST().Format("2006-01-02")
+		ps := s.journal.GetPeriodSummary(today, today)
+		if ps != nil {
+			stats["total"] = ps.Total
+			stats["wins"] = ps.Wins
+			stats["losses"] = ps.Losses
+			stats["win_rate"] = ps.WinRate
+			
+			realized := ps.GrossPnl
+			unrealized := 0.0
+			for _, pos := range openPositions {
+				if upnlStr, ok := pos["unrealised_pnl"].(string); ok {
+					var val float64
+					fmt.Sscanf(upnlStr, "%f", &val)
+					unrealized += val
+				}
+			}
+			stats["gross_pnl"] = realized + unrealized
+		}
+	}
+
 	return map[string]interface{}{
 		"regime":         regime,
 		"open_positions": openPositions,
 		"capital":        config.TotalCapital,
 		"paper_mode":     config.PaperMode,
+		"universe_count": universeCount,
+		"index_data":     indexData,
+		"stats":          stats,
 	}
 }
 
@@ -229,8 +291,96 @@ func (s *Server) handleTrades(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]interface{}{"trades": trades, "date": dateStr})
 }
 
+func (s *Server) handleTradesDates(w http.ResponseWriter, r *http.Request) {
+	dates := s.journal.GetAvailableDates()
+	writeJSON(w, map[string]interface{}{"dates": dates})
+}
+
+func (s *Server) handleSummary(w http.ResponseWriter, r *http.Request) {
+	dateStr := r.URL.Query().Get("date")
+	if dateStr == "" {
+		dateStr = config.TodayIST().Format("2006-01-02")
+	}
+	summary := s.journal.GetDailySummaryForDate(dateStr)
+	writeJSON(w, map[string]interface{}{"summary": summary})
+}
+
+func (s *Server) handlePnlSummary(w http.ResponseWriter, r *http.Request) {
+	today := config.TodayIST()
+
+	// Weekly summary: Monday to Friday of the current week
+	offset := int(time.Monday - today.Weekday())
+	if offset > 0 {
+		offset = -6
+	}
+	weekStart := today.AddDate(0, 0, offset)
+	weekEnd := weekStart.AddDate(0, 0, 4)
+
+	weeklySummary := s.journal.GetPeriodSummary(weekStart.Format("2006-01-02"), weekEnd.Format("2006-01-02"))
+	weeklyBreakdown := s.journal.GetPnlBreakdown(weekStart.Format("2006-01-02"), weekEnd.Format("2006-01-02"))
+
+	// Monthly summary: 1st to last day of current month
+	monthStart := time.Date(today.Year(), today.Month(), 1, 0, 0, 0, 0, today.Location())
+	monthEnd := monthStart.AddDate(0, 1, -1)
+
+	monthlySummary := s.journal.GetPeriodSummary(monthStart.Format("2006-01-02"), monthEnd.Format("2006-01-02"))
+	monthlyBreakdown := s.journal.GetPnlBreakdown(monthStart.Format("2006-01-02"), monthEnd.Format("2006-01-02"))
+
+	// Calculate unrealized P&L from open positions
+	unrealized := 0.0
+	s.exec.Mu.RLock()
+	for _, trade := range s.exec.ActiveTrades {
+		if s.tickStore != nil && trade.Token > 0 {
+			ltp := s.tickStore.GetLTPIfFresh(trade.Token)
+			if ltp > 0 {
+				if trade.IsShort {
+					unrealized += (trade.EntryPrice - ltp) * float64(trade.RemainingQty)
+				} else {
+					unrealized += (ltp - trade.EntryPrice) * float64(trade.RemainingQty)
+				}
+			}
+		}
+	}
+	s.exec.Mu.RUnlock()
+
+	// unrealized_pnl is the same value for both periods — it's the mark-to-market on all
+	// currently open positions. Exposing it separately lets the UI label it clearly so the
+	// user can distinguish realized (closed trades) from floating (open positions).
+	// "pnl" = realized + unrealized, kept for any consumers that read the total directly.
+	writeJSON(w, map[string]interface{}{
+		"weekly": map[string]interface{}{
+			"realized_pnl":   weeklySummary.GrossPnl,
+			"unrealized_pnl": unrealized,
+			"pnl":            weeklySummary.GrossPnl + unrealized,
+			"trades":         weeklySummary.Total,
+			"wins":           weeklySummary.Wins,
+			"losses":         weeklySummary.Losses,
+			"breakdown":      weeklyBreakdown,
+		},
+		"monthly": map[string]interface{}{
+			"realized_pnl":   monthlySummary.GrossPnl,
+			"unrealized_pnl": unrealized,
+			"pnl":            monthlySummary.GrossPnl + unrealized,
+			"trades":         monthlySummary.Total,
+			"wins":           monthlySummary.Wins,
+			"losses":         monthlySummary.Losses,
+			"breakdown":      monthlyBreakdown,
+		},
+	})
+}
+
 var upgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool { return true },
+	CheckOrigin: func(r *http.Request) bool {
+		origin := r.Header.Get("Origin")
+		if origin == "" {
+			return true // direct/local connection with no Origin header
+		}
+		allowed := config.DashboardAllowedOrigin
+		if allowed == "" {
+			allowed = "http://127.0.0.1:8085"
+		}
+		return origin == allowed
+	},
 }
 
 func (s *Server) handleWSLive(w http.ResponseWriter, r *http.Request) {
@@ -241,12 +391,20 @@ func (s *Server) handleWSLive(w http.ResponseWriter, r *http.Request) {
 	ticker := time.NewTicker(1000 * time.Millisecond)
 	defer ticker.Stop()
 
-	for range ticker.C {
-		payload := map[string]interface{}{
-			"type":   "live_update",
-			"health": s.buildHealthData(),
-			"status": s.buildStatusData(),
+	for {
+		select {
+		case <-ticker.C:
+			payload := map[string]interface{}{
+				"type":   "live_update",
+				"health": s.buildHealthData(),
+				"status": s.buildStatusData(),
+				"logs": map[string]interface{}{
+					"logs": core.GlobalMemLog.GetLogs(),
+				},
+			}
+			if err := conn.WriteJSON(payload); err != nil {
+				return
+			}
 		}
-		if err := conn.WriteJSON(payload); err != nil { break }
 	}
 }

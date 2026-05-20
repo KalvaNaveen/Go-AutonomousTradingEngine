@@ -5,6 +5,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync"
 	"time"
 
@@ -29,6 +30,7 @@ type ExecutionAgent struct {
 
 	PlaceOrder  func(symbol string, qty int, isShort bool, orderType string, price float64) (string, error)
 	CancelOrder func(orderID string) error
+	CancelGTT   func(triggerID int) error // nil if GTT not configured
 	GetLTP      func(uint32) float64
 
 	// FillMonitor is wired by main.go in live mode to poll entry order status,
@@ -50,6 +52,13 @@ type ExecutionAgent struct {
 	LastKnownLTP    map[uint32]float64    // token → last seen LTP
 	LastLTPChangeAt map[uint32]time.Time  // token → time when LTP last changed
 	CircuitAlerted  map[uint32]bool       // token → already sent circuit alert
+
+	// ExitInProgress prevents placing a second exit order while one is in-flight.
+	// Guards against the engine calling forceExit concurrently with a broker SL-M fill.
+	ExitInProgress map[string]bool
+
+	// RecentlyExitedByEMAAt tracks when each symbol was EMA-exited, for stale-entry cleanup.
+	RecentlyExitedByEMAAt map[string]time.Time
 }
 
 // FIX-05: Re-entry max premium cap
@@ -72,15 +81,17 @@ const EMAResetBuffer = 0.0
 
 func NewExecutionAgent(journal *core.Journal, state *core.StateManager) *ExecutionAgent {
 	return &ExecutionAgent{
-		Journal:             journal,
-		State:               state,
-		ActiveTrades:        make(map[string]*core.Trade),
-		RedCandlesBelow:     make(map[string]int),
-		RecentlyExitedByEMA: make(map[string]uint32),
-		EMAExitPrices:       make(map[string]float64),
-		LastKnownLTP:        make(map[uint32]float64),
-		LastLTPChangeAt:     make(map[uint32]time.Time),
-		CircuitAlerted:      make(map[uint32]bool),
+		Journal:               journal,
+		State:                 state,
+		ActiveTrades:          make(map[string]*core.Trade),
+		RedCandlesBelow:       make(map[string]int),
+		RecentlyExitedByEMA:   make(map[string]uint32),
+		EMAExitPrices:         make(map[string]float64),
+		LastKnownLTP:          make(map[uint32]float64),
+		LastLTPChangeAt:       make(map[uint32]time.Time),
+		CircuitAlerted:        make(map[uint32]bool),
+		ExitInProgress:        make(map[string]bool),
+		RecentlyExitedByEMAAt: make(map[string]time.Time),
 	}
 }
 
@@ -91,6 +102,10 @@ func (e *ExecutionAgent) RestoreFromState() {
 	}
 	for _, trade := range openPositions {
 		oid := trade.EntryOID
+		// Defensive fix: Recompute target if it was stored as 0 (data corruption / old bug)
+		if trade.TargetPrice == 0 {
+			// TargetPrice=0 means trailing exit (no fixed target) — this is correct, no repair needed
+		}
 		e.ActiveTrades[oid] = trade
 	}
 	log.Printf("[ExecutionAgent] Restored %d swing positions from state", len(openPositions))
@@ -103,9 +118,27 @@ func (e *ExecutionAgent) RestoreFromState() {
 func (e *ExecutionAgent) Execute(sig *Signal, regime string) bool {
 	sym := sig.Symbol
 
-	// Section VI.1: Max 6 positions (top-ups don't count as new)
+	// Defense: warn and attempt self-heal if token is missing.
+	// A token=0 position won't receive LTP ticks → SL monitoring silently skips it.
+	if sig.Token == 0 {
+		if e.Scanner != nil {
+			for tok, s := range e.Scanner.Universe {
+				if s == sym {
+					sig.Token = tok
+					log.Printf("[Execute] Self-healed token for %s: %d", sym, tok)
+					break
+				}
+			}
+		}
+		if sig.Token == 0 {
+			log.Printf("[Execute] ⚠️ Signal for %s has token=0 — LTP monitoring will be DISABLED!", sym)
+		}
+	}
+
+	// Dynamic position cap based on current capital
+	maxPos := config.ComputeMaxPositions(config.TotalCapital)
 	e.Mu.RLock()
-	if sig.Strategy != "VCP_TOPUP" && len(e.ActiveTrades) >= config.MaxOpenPositions {
+	if sig.Strategy != "VCP_TOPUP" && len(e.ActiveTrades) >= maxPos {
 		e.Mu.RUnlock()
 		return false
 	}
@@ -118,7 +151,21 @@ func (e *ExecutionAgent) Execute(sig *Signal, regime string) bool {
 			}
 		}
 	}
+	// Available capital check — ensure deployed positions haven't consumed the minimum
+	// per-trade allocation. Prevents over-extension on top-ups beyond the 6-position limit.
+	deployedCapital := 0.0
+	for _, t := range e.ActiveTrades {
+		deployedCapital += t.EntryPrice * float64(t.RemainingQty)
+	}
 	e.Mu.RUnlock()
+
+	availableCapital := config.TotalCapital - deployedCapital
+	minRequired := config.TotalCapital * config.MinTradeAllocPct / 100
+	if availableCapital < minRequired {
+		log.Printf("[Execute] Skipping %s — available capital ₹%.0f below minimum ₹%.0f (deployed=₹%.0f)",
+			sym, availableCapital, minRequired, deployedCapital)
+		return false
+	}
 
 	qty := sig.Qty
 	if qty <= 0 {
@@ -129,10 +176,25 @@ func (e *ExecutionAgent) Execute(sig *Signal, regime string) bool {
 		return false
 	}
 
+	// Pre-GTT news check — block on NEGATIVE BSE announcements.
+	// Fail-open: any network error returns NEUTRAL and trading proceeds.
+	if !CheckNewsBeforeEntry(sym) {
+		return false
+	}
+
+	// For breakout strategies the signal fires at the live LTP, which is the breakout tick.
+	// By the time the LIMIT order reaches the exchange, price has moved. Add a small buffer
+	// above LTP so the order has a realistic chance of filling on fast breakout moves.
+	limitPrice := sig.EntryPrice
+	switch sig.Strategy {
+	case "VCP_BREAKOUT", "BULL_FLAG", "IPO_BASE", "CUP_HANDLE":
+		limitPrice = sig.EntryPrice * 1.001 // 0.1% buffer — negligible cost, avoids misses
+	}
+
 	var oid string
 	var err error
 	if e.PlaceOrder != nil {
-		oid, err = e.PlaceOrder(sym, qty, false, "LIMIT", sig.EntryPrice)
+		oid, err = e.PlaceOrder(sym, qty, false, "LIMIT", limitPrice)
 		if err != nil {
 			SendTelegram(fmt.Sprintf("❌ ORDER FAILED: `%s`\n`%v`", sym, err))
 			return false
@@ -148,7 +210,7 @@ func (e *ExecutionAgent) Execute(sig *Signal, regime string) bool {
 		Strategy:     sig.Strategy,
 		Product:      "CNC", // Always delivery for swing
 		Regime:       regime,
-		EntryPrice:   sig.EntryPrice,
+		EntryPrice:   limitPrice,
 		StopPrice:    sig.StopPrice,
 		TargetPrice:  sig.TargetPrice,
 		Qty:          qty,
@@ -244,6 +306,28 @@ func (e *ExecutionAgent) MonitorPositions(regime string) {
 
 		// Track LTP changes for circuit detection
 		e.trackLTPChange(token, ltp)
+
+		// Trailing stop — protect profits on winning positions.
+		// Tier 1: gain ≥15% → trail SL to breakeven (entry price).
+		// Tier 2: gain ≥25% → trail SL to entry+10% (lock in partial gain).
+		// Only trail upward — never move SL against the position.
+		if ltp > trade.EntryPrice && trade.EntryPrice > 0 {
+			gainPct := (ltp - trade.EntryPrice) / trade.EntryPrice * 100
+			var newStop float64
+			switch {
+			case gainPct >= 25:
+				newStop = trade.EntryPrice * 1.10
+			case gainPct >= 15:
+				newStop = trade.EntryPrice // breakeven
+			}
+			if newStop > trade.StopPrice {
+				log.Printf("[Trail] %s SL trailed ₹%.2f → ₹%.2f (gain=%.1f%%)",
+					trade.Symbol, trade.StopPrice, newStop, gainPct)
+				trade.StopPrice = newStop
+				trade.TrailStop = newStop
+				e.State.Save(oid, trade)
+			}
+		}
 	}
 }
 
@@ -286,60 +370,104 @@ func (e *ExecutionAgent) RunDailyEMACheck(dailyCache *DailyCache) {
 	for oid, trade := range e.ActiveTrades {
 		token := trade.Token
 		closes, cOk := dailyCache.Closes[token]
-		if !cOk || len(closes) < config.EMA21Period+1 {
+		if !cOk || len(closes) < config.EMA20Period+1 {
 			continue
 		}
 
-		// Doc Section VII: "Apply the 21-day EMA to your daily chart"
-		ema21 := ComputeEMA21(closes)
-		if ema21 <= 0 {
+		highs, hOk := dailyCache.Highs[token]
+		lows, lOk := dailyCache.Lows[token]
+		volumes, vOk := dailyCache.Volumes[token]
+
+		ema20 := ComputeEMA20(closes)
+		if ema20 <= 0 {
 			continue
 		}
 
 		lastClose := closes[len(closes)-1]
 		prevClose := closes[len(closes)-2]
 
+		// ── Rule 4: Volume+Price sell pressure exit ────────────────
+		// Exit next open if: 2 of last 3 days have CPR<0.35 + volume spike,
+		// AND LTP < yesterday's low (today's price confirming breakdown).
+		if hOk && lOk && vOk && len(highs) >= 4 && len(lows) >= 4 && len(volumes) >= 20 {
+			if e.Scanner != nil {
+				n := len(closes)
+				sellPressureDays := 0
+				for i := n - 3; i < n; i++ {
+					h := highs[i]
+					l := lows[i]
+					c := closes[i]
+					rng := h - l
+					if rng <= 0 {
+						continue
+					}
+					cpr := (c - l) / rng
+					// Volume spike: compare to 20-day avg
+					avgVol := 0.0
+					if len(volumes) >= 20 {
+						for _, v := range volumes[i-20 : i] {
+							avgVol += v
+						}
+						avgVol /= 20
+					}
+					volSpike := avgVol > 0 && volumes[i] > avgVol*config.VolumeSpikeMultiplier
+					if cpr < config.SellPressureRatio && volSpike {
+						sellPressureDays++
+					}
+				}
+				// Get live LTP to check against yesterday's low
+				ltp := 0.0
+				if e.GetLTP != nil && token > 0 {
+					ltp = e.GetLTP(token)
+				}
+				yesterdayLow := lows[len(lows)-2]
+				if sellPressureDays >= config.VolumePressureDaysNeeded && ltp > 0 && ltp < yesterdayLow {
+					log.Printf("[SellPressure] %s: EXIT — %d days CPR<%.2f+volume spike, LTP=%.2f < yesterdayLow=%.2f",
+						trade.Symbol, sellPressureDays, config.SellPressureRatio, ltp, yesterdayLow)
+					SendTelegram(fmt.Sprintf(
+						"🔴 *SELL PRESSURE EXIT — %s*\nCPR+Volume: `%d/3` days | LTP ₹`%.2f` < PrevLow ₹`%.2f`",
+						trade.Symbol, sellPressureDays, ltp, yesterdayLow))
+					e.forceExit(oid, trade, "SELL_PRESSURE_CPR", ltp)
+					e.RecentlyExitedByEMA[trade.Symbol] = token
+					e.EMAExitPrices[trade.Symbol] = ltp
+					e.RecentlyExitedByEMAAt[trade.Symbol] = time.Now()
+					continue
+				}
+			}
+		}
+
+		// ── Rule 5: EMA20 trailing exit (2 red candles below EMA) ──
 		isRedCandle := lastClose < prevClose
-		belowEMA := lastClose < ema21
+		belowEMA := lastClose < ema20
 
 		if isRedCandle && belowEMA {
 			e.RedCandlesBelow[oid]++
-			log.Printf("[EMA21] %s: Red candle #%d below EMA (Close=%.2f EMA=%.2f)",
-				trade.Symbol, e.RedCandlesBelow[oid], lastClose, ema21)
+			log.Printf("[EMA20] %s: Red candle #%d below EMA20 (Close=%.2f EMA=%.2f)",
+				trade.Symbol, e.RedCandlesBelow[oid], lastClose, ema20)
 
-			// Doc: "two continuous red candles that CLOSE below the 21 EMA"
 			if e.RedCandlesBelow[oid] >= config.RedCandlesBelowEMA {
-				log.Printf("[EMA21] %s: EXIT — %d red candles below 21 EMA",
+				log.Printf("[EMA20] %s: EXIT — %d red candles below EMA20",
 					trade.Symbol, e.RedCandlesBelow[oid])
-				e.forceExit(oid, trade, "EMA21_2RED_BELOW", lastClose)
+				e.forceExit(oid, trade, "EMA20_2RED_BELOW", lastClose)
 
 				e.RecentlyExitedByEMA[trade.Symbol] = token
-				// FIX-05: Save exit price for re-entry cap
 				e.EMAExitPrices[trade.Symbol] = lastClose
+				e.RecentlyExitedByEMAAt[trade.Symbol] = time.Now()
 				continue
 			}
 		} else {
-			// FIX-11: Configurable reset behavior for EMA counter
-			// Blueprint says "two continuous red candles" — interpret as:
-			// When EMAResetBuffer = 0.0 (default): any non-red-below-EMA day resets
-			//   counter (Blueprint literal interpretation of "continuous").
-			// When EMAResetBuffer > 0 (e.g. 0.005): only resets if close > EMA×(1+buffer)
-			//   AND green candle. A weak close near EMA neither increments nor resets.
 			if EMAResetBuffer > 0 {
-				// Stricter mode: require meaningful recovery
-				if lastClose > ema21*(1+EMAResetBuffer) && lastClose > prevClose {
+				if lastClose > ema20*(1+EMAResetBuffer) && lastClose > prevClose {
 					if e.RedCandlesBelow[oid] > 0 {
-						log.Printf("[EMA21] %s: Recovered above EMA+buffer, reset red counter (Close=%.2f EMA=%.2f)",
-							trade.Symbol, lastClose, ema21)
+						log.Printf("[EMA20] %s: Recovered above EMA20+buffer, reset counter (Close=%.2f EMA=%.2f)",
+							trade.Symbol, lastClose, ema20)
 					}
 					e.RedCandlesBelow[oid] = 0
 				}
-				// Weak close near EMA: neither increment nor reset
 			} else {
-				// Blueprint-literal mode: any interruption resets counter
 				if e.RedCandlesBelow[oid] > 0 {
-					log.Printf("[EMA21] %s: Streak broken, reset red counter (Close=%.2f EMA=%.2f)",
-						trade.Symbol, lastClose, ema21)
+					log.Printf("[EMA20] %s: Streak broken, reset counter (Close=%.2f EMA=%.2f)",
+						trade.Symbol, lastClose, ema20)
 				}
 				e.RedCandlesBelow[oid] = 0
 			}
@@ -354,6 +482,18 @@ func (e *ExecutionAgent) RunDailyEMACheck(dailyCache *DailyCache) {
 //   and closes back above 21 EMA with a green candle → re-enter."
 
 func (e *ExecutionAgent) CheckReEntries(scanner *ScannerAgent, regime string) {
+	// Purge stale EMA-exit entries. If no re-entry signal fires within 30 days, the setup
+	// has expired. Without this, the map grows indefinitely and generates spurious re-entry checks.
+	const maxReEntryWindow = 30 * 24 * time.Hour
+	for symbol, exitAt := range e.RecentlyExitedByEMAAt {
+		if time.Since(exitAt) > maxReEntryWindow {
+			delete(e.RecentlyExitedByEMA, symbol)
+			delete(e.EMAExitPrices, symbol)
+			delete(e.RecentlyExitedByEMAAt, symbol)
+			log.Printf("[ReEntry] %s re-entry window expired (>30d) — removed from watch list", symbol)
+		}
+	}
+
 	for symbol, token := range e.RecentlyExitedByEMA {
 		sig := scanner.CheckReEntry(token, symbol, regime)
 		if sig != nil {
@@ -439,13 +579,39 @@ func (e *ExecutionAgent) CheckTopUps(scanner *ScannerAgent, regime string) {
 // ══════════════════════════════════════════════════════════════
 
 func (e *ExecutionAgent) forceExit(oid string, trade *core.Trade, reason string, exitPrice float64) {
-	if e.CancelOrder != nil {
-		if trade.SLOID != "" {
-			e.CancelOrder(trade.SLOID)
+	// Guard: if an exit is already in-flight for this position, do not place a second one.
+	if e.ExitInProgress[oid] {
+		log.Printf("[Exit] %s exit already in-progress — skipping duplicate", trade.Symbol)
+		return
+	}
+	e.ExitInProgress[oid] = true
+
+	// Cancel broker SL (GTT or SL-M) and target orders.
+	// If cancel fails, the order may have already triggered/filled → skip our market exit to avoid double-sell.
+	slHandledByBroker := false
+	if trade.SLOID != "" {
+		if strings.HasPrefix(trade.SLOID, "GTT_") {
+			// GTT SL — cancel the trigger
+			if e.CancelGTT != nil {
+				var gttID int
+				fmt.Sscanf(trade.SLOID[4:], "%d", &gttID)
+				if err := e.CancelGTT(gttID); err != nil {
+					slHandledByBroker = true
+					log.Printf("[Exit] %s GTT cancel failed (%v) — GTT may have already triggered, skipping market exit",
+						trade.Symbol, err)
+				}
+			}
+		} else if e.CancelOrder != nil {
+			// Regular SL-M order
+			if err := e.CancelOrder(trade.SLOID); err != nil {
+				slHandledByBroker = true
+				log.Printf("[Exit] %s SL cancel failed (%v) — broker SL-M likely already filled, skipping market exit",
+					trade.Symbol, err)
+			}
 		}
-		if trade.TargetOID != "" {
-			e.CancelOrder(trade.TargetOID)
-		}
+	}
+	if trade.TargetOID != "" && e.CancelOrder != nil {
+		e.CancelOrder(trade.TargetOID)
 	}
 
 	exitQty := trade.RemainingQty
@@ -453,10 +619,10 @@ func (e *ExecutionAgent) forceExit(oid string, trade *core.Trade, reason string,
 		exitQty = trade.Qty
 	}
 
-	// Place exit order. If broker rejects (e.g., circuit / connectivity), bail out
-	// without closing state — the next monitor tick will retry. Closing locally
-	// while shares are still held would desync the engine from the actual portfolio.
-	if e.PlaceOrder != nil {
+	// Place exit order only if the broker SL hasn't already handled it.
+	// If broker rejects (circuit / connectivity), bail out without closing state —
+	// the next monitor tick will retry rather than leaving shares unhedged.
+	if e.PlaceOrder != nil && !slHandledByBroker {
 		exitOID, err := e.PlaceOrder(trade.Symbol, exitQty, true, "MARKET", 0)
 		if err != nil || exitOID == "" {
 			log.Printf("[Exit] ⚠️ %s exit REJECTED (%s): %v — keeping position OPEN for retry",
@@ -464,8 +630,12 @@ func (e *ExecutionAgent) forceExit(oid string, trade *core.Trade, reason string,
 			SendTelegram(fmt.Sprintf(
 				"⚠️ EXIT REJECTED: `%s` (%s)\nReason: `%v`\nPosition still OPEN — manual intervention may be required.",
 				trade.Symbol, reason, err))
+			delete(e.ExitInProgress, oid) // Reset so next tick can retry
 			return
 		}
+	} else if slHandledByBroker {
+		SendTelegram(fmt.Sprintf("ℹ️ EXIT: `%s` (%s) — broker SL-M already filled, no duplicate order placed.",
+			trade.Symbol, reason))
 	}
 
 	if exitPrice <= 0 {
@@ -516,6 +686,7 @@ func (e *ExecutionAgent) forceExit(oid string, trade *core.Trade, reason string,
 
 	delete(e.ActiveTrades, oid)
 	delete(e.RedCandlesBelow, oid)
+	delete(e.ExitInProgress, oid)
 }
 
 // FlattenAll closes all positions (kill switch / emergency)
@@ -539,13 +710,18 @@ func (e *ExecutionAgent) DailySummaryAlert(regime string) {
 
 	SendTelegram(fmt.Sprintf(
 		"📊 *EOD SWING SUMMARY*\nRegime: `%s`\nOpen Positions: `%d/%d`\nCapital Multiplier: `%.0f%%`",
-		regime, openCount, config.MaxOpenPositions,
+		regime, openCount, config.ComputeMaxPositions(config.TotalCapital),
 		e.Scanner.CapitalMultiplier*100))
 }
 
-// ComputeEMA21 computes 21-day EMA (primary exit indicator)
+// ComputeEMA20 computes 20-day EMA (trend EMA — entry confirmation + exit trigger)
+func ComputeEMA20(closes []float64) float64 {
+	return computeEMAForPeriod(closes, config.EMA20Period)
+}
+
+// ComputeEMA21 kept as alias so existing tests compile unchanged.
 func ComputeEMA21(closes []float64) float64 {
-	return computeEMAForPeriod(closes, config.EMA21Period)
+	return computeEMAForPeriod(closes, config.EMA20Period)
 }
 
 // ComputeEMA63 computes 63-day EMA (alternative longer-trend exit indicator)

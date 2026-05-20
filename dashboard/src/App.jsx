@@ -205,7 +205,7 @@ function TabJournal() {
             {isToday && <span className="type-badge" style={{ background: 'var(--bg-badge-green)', color: '#059669', fontSize: '10px' }}>TODAY</span>}
           </div>
           <button onClick={() => navigateDate('next')} disabled={isToday}
-            style={{ background: isToday ? 'var(--bg-secondary)' : 'var(--bg-hover)', border: '1px solid var(--border-light)', borderRadius: '8px', padding: '6px 12px', cursor: isToday ? 'not-allowed' : 'pointer', fontSize: '14px', color: isToday ? 'var(--text-muted)' : 'var(--text-primary)', opacity: isToday ? 0.5 : 1 }}>
+            style={{ background: isToday ? 'var(--bg-card)' : 'var(--bg-hover)', border: '1px solid var(--border-light)', borderRadius: '8px', padding: '6px 12px', cursor: isToday ? 'not-allowed' : 'pointer', fontSize: '14px', color: isToday ? 'var(--text-muted)' : 'var(--text-primary)', opacity: isToday ? 0.5 : 1 }}>
             ▶
           </button>
           <button onClick={() => setSelectedDate(new Date().toISOString().split('T')[0])}
@@ -238,7 +238,7 @@ function TabJournal() {
             { icon: '✅', label: 'Wins', value: wins, color: '#059669' },
             { icon: '❌', label: 'Losses', value: losses, color: 'var(--accent-red)' },
             { icon: '📈', label: 'Win Rate', value: `${trades.length > 0 ? ((wins / trades.length) * 100).toFixed(0) : 0}%` },
-            { icon: '💰', label: 'Day P&L', value: `${totalPnl >= 0 ? '+' : ''}₹${Math.abs(totalPnl).toFixed(0)}`, color: totalPnl >= 0 ? '#059669' : 'var(--accent-red)' },
+            { icon: '💰', label: 'Day P&L', value: `${totalPnl >= 0 ? '+' : ''}₹${Math.abs(totalPnl).toFixed(0)}`, color: totalPnl >= 0 ? 'var(--accent-green)' : 'var(--accent-red)' },
           ].map((s, i) => (
             <div key={i} className="stat-pill">
               <span className="stat-pill-icon">{s.icon}</span>
@@ -316,7 +316,7 @@ function App() {
     pnl: 0, pnl_history: [], regime: 'UNKNOWN', uptime: '0h 0m 0s',
     positions: [], activity_log: [],
     universe_count: 0,
-    index_data: { nifty250: null, banknifty: null, vix: null },
+    index_data: { nifty50: null, banknifty: null, vix: null },
     news_feed: [],
     phases: {
       auto_login: 'pending', cache_load: 'pending', universe_load: 'pending',
@@ -395,28 +395,30 @@ function App() {
               if (isPostMarket) {
                 // After market close: everything grey, only EOD green
                 phases = {
-                  auto_login: 'pending', cache_load: 'pending', universe_load: 'pending',
-                  websocket: 'pending', scanner: 'pending', execution: 'pending',
-                  risk: 'pending', eod_squareoff: 'active'
+                  auto_login: 'pending', universe_load: 'pending', websocket: 'pending',
+                  cache_load: 'pending', regime: 'pending', scanner: 'pending',
+                  execution: 'pending', ema_exit: 'active', eod_scan: 'active'
                 };
               } else if (isPreMarket || isWeekend) {
                 // Before engine boot or non-trading days: all grey (pending)
                 phases = {
-                  auto_login: 'pending', cache_load: 'pending', universe_load: 'pending',
-                  websocket: 'pending', scanner: 'pending', execution: 'pending',
-                  risk: 'pending', eod_squareoff: 'pending'
+                  auto_login: 'pending', universe_load: 'pending', websocket: 'pending',
+                  cache_load: 'pending', regime: 'pending', scanner: 'pending',
+                  execution: 'pending', ema_exit: 'pending', eod_scan: 'pending'
                 };
               } else {
                 // During market: derive from live engine state
+                const isEODDone = hhmm >= 1520;
                 phases = {
                   auto_login: health.status ? 'active' : 'pending',
-                  cache_load: health.cache_loaded ? 'active' : (health.status === 'running' ? 'running' : 'pending'),
                   universe_load: root.universe_count > 0 ? 'active' : 'pending',
                   websocket: health.ws_connected ? 'active' : 'pending',
+                  cache_load: health.cache_loaded ? 'active' : (health.status === 'running' ? 'running' : 'pending'),
+                  regime: (root.regime && root.regime !== 'UNKNOWN') ? 'active' : (hhmm >= 915 ? 'running' : 'pending'),
                   scanner: root.engine_stopped ? 'error' : (health.status === 'running' ? 'active' : 'pending'),
                   execution: root.engine_stopped ? 'error' : (health.status === 'running' ? 'active' : 'pending'),
-                  risk: root.engine_stopped ? 'error' : (health.status === 'running' ? 'active' : 'pending'),
-                  eod_squareoff: 'pending'
+                  ema_exit: isEODDone ? 'active' : 'pending',
+                  eod_scan: (hhmm >= 1545) ? 'active' : 'pending'
                 };
               }
 
@@ -431,7 +433,21 @@ function App() {
                 uptime: health.uptime || '0h 0m 0s',
                 positions: root.open_positions || [],
                 universe_count: root.universe_count || 0,
-                index_data: root.index_data || prev.index_data,
+                index_data: (() => {
+                  const raw = root.index_data;
+                  if (!raw) return prev.index_data;
+                  const n50 = raw['NIFTY_50'] || {};
+                  const bn = raw['BANK_NIFTY'] || {};
+                  const vx = raw['INDIA_VIX'] || {};
+                  return {
+                    nifty50: n50.ltp || null,
+                    nifty50_pct: n50.change ?? null,
+                    banknifty: bn.ltp || null,
+                    banknifty_pct: bn.change ?? null,
+                    vix: vx.ltp || null,
+                    vix_pct: vx.change ?? null,
+                  };
+                })(),
                 news_feed: root.news_feed || prev.news_feed || [],
                 activity_log: logs.logs || [],
                 phases, strategy_breakdown: stratBreak,
@@ -514,21 +530,26 @@ function App() {
         <div className="engine-phases">
           <div className="sidebar-section-label" style={{ padding: '0 8px 12px' }}>Swing Pipeline</div>
           {[
-            { key: 'auto_login', label: 'Auto Login', icon: '🔑', time: '08:30' },
-            { key: 'cache_load', label: 'Cache Preload', icon: '📊', time: '08:45' },
-            { key: 'universe_load', label: 'Universe Load', icon: '🌐', time: '08:50' },
-            { key: 'websocket', label: 'WebSocket Feed', icon: '📡', time: '09:00' },
-            { key: 'regime', label: 'Market Timing (ROC)', icon: '🎯', time: '09:15' },
-            { key: 'scanner', label: 'VCP Breakout Scan', icon: '🔍', time: '09:15' },
-            { key: 'execution', label: 'Hard SL Monitor', icon: '⚡', time: 'Live' },
-            { key: 'ema_exit', label: '21 EMA Exit Check', icon: '📈', time: '15:20' },
-          ].map(phase => (
-            <div className="phase-item" key={phase.key}>
-              <div className={`phase-dot ${state.phases[phase.key] || 'pending'}`}></div>
-              <span className="phase-label">{phase.icon} {phase.label}</span>
-              <span className="phase-time">{phase.time}</span>
-            </div>
-          ))}
+            { key: 'auto_login', label: 'Auto Login', icon: '🔑' },
+            { key: 'universe_load', label: 'Universe Load', icon: '🌐' },
+            { key: 'websocket', label: 'WebSocket Feed', icon: '📡' },
+            { key: 'cache_load', label: 'Cache Preload', icon: '📊' },
+            { key: 'regime', label: 'Market Timing (ROC)', icon: '🎯' },
+            { key: 'scanner', label: 'VCP Breakout Scan', icon: '🔍' },
+            { key: 'execution', label: 'Hard SL Monitor', icon: '⚡' },
+            { key: 'ema_exit', label: '21 EMA Exit Check', icon: '📈' },
+            { key: 'eod_scan', label: 'EOD Market Scan', icon: '📋' },
+          ].map(phase => {
+            const status = state.phases[phase.key] || 'pending';
+            const statusText = status === 'active' ? 'Done' : status === 'running' ? 'Running' : status === 'error' ? 'Error' : 'Pending';
+            return (
+              <div className="phase-item" key={phase.key}>
+                <div className={`phase-dot ${status}`}></div>
+                <span className="phase-label">{phase.icon} {phase.label}</span>
+                <span className="phase-time" style={{ color: status === 'active' ? 'var(--accent-green)' : 'var(--text-muted)' }}>{statusText}</span>
+              </div>
+            );
+          })}
         </div>
 
         <div className="sidebar-footer">
@@ -553,7 +574,7 @@ function App() {
             {/* Market Indices in Header */}
             <div style={{ display: 'flex', gap: '12px' }}>
               {[
-                { label: 'NIFTY 250', val: state.index_data?.nifty250, pct: state.index_data?.nifty250_pct },
+                { label: 'NIFTY 50', val: state.index_data?.nifty50, pct: state.index_data?.nifty50_pct },
                 { label: 'BANK NIFTY', val: state.index_data?.banknifty, pct: state.index_data?.banknifty_pct },
                 { label: 'INDIA VIX', val: state.index_data?.vix, pct: state.index_data?.vix_pct },
               ].map((idx, i) => (
@@ -586,7 +607,7 @@ function App() {
               display: 'flex', alignItems: 'center', gap: '6px',
               background: wsConnected ? 'var(--bg-badge-green)' : 'var(--bg-badge-red)',
               padding: '6px 14px', borderRadius: 'var(--radius-full)',
-              fontSize: '12px', fontWeight: 600, color: wsConnected ? '#059669' : 'var(--accent-red)'
+              fontSize: '12px', fontWeight: 600, color: wsConnected ? 'var(--accent-green)' : 'var(--accent-red)'
             }}>
               <div style={{ width: '6px', height: '6px', borderRadius: '50%', background: 'currentColor' }}></div>
               {wsConnected ? 'LIVE' : 'OFFLINE'}
@@ -615,14 +636,14 @@ function App() {
                         <div>
                           <div style={{ fontSize: '11px', fontWeight: 700, color: 'var(--text-muted)', letterSpacing: '0.05em', textTransform: 'uppercase' }}>📅 Daily Net P&L</div>
                           <div style={{ display: 'flex', alignItems: 'baseline', marginTop: '6px', gap: '8px' }}>
-                            <span style={{ fontSize: '24px', fontWeight: 800, color: dPos ? '#059669' : 'var(--accent-red)', fontVariantNumeric: 'tabular-nums' }}>
+                            <span style={{ fontSize: '28px', fontWeight: 800, color: dPos ? 'var(--accent-green)' : 'var(--accent-red)', fontVariantNumeric: 'tabular-nums' }}>
                               {dPos ? '+' : ''}₹{Math.abs(dPnl).toLocaleString('en-IN')}
                             </span>
                           </div>
                         </div>
-                        <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: '2px', fontSize: '11px', color: 'var(--text-muted)' }}>
+                        <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: '2px', fontSize: '12px', color: 'var(--text-muted)' }}>
                           <span>Trades: <strong style={{ color: 'var(--text-primary)' }}>{ds.total}</strong></span>
-                          <span>W/L: <strong style={{ color: '#059669' }}>{ds.wins}</strong>/<strong style={{ color: 'var(--accent-red)' }}>{ds.losses}</strong></span>
+                          <span>W/L: <strong style={{ color: 'var(--accent-green)' }}>{ds.wins}</strong>/<strong style={{ color: 'var(--accent-red)' }}>{ds.losses}</strong></span>
                         </div>
                       </div>
                       <div style={{ flex: 1, minHeight: '80px', padding: '0 8px 8px' }}>
@@ -636,6 +657,8 @@ function App() {
                 {(() => {
                   const w = pnlSummary.weekly || {};
                   const wPnl = w.pnl || 0;
+                  const wRealized = w.realized_pnl || 0;
+                  const wUnrealized = w.unrealized_pnl || 0;
                   const wPos = wPnl >= 0;
                   const wTrades = w.trades || 0;
                   const wWins = w.wins || 0;
@@ -661,14 +684,18 @@ function App() {
                         <div>
                           <div style={{ fontSize: '11px', fontWeight: 700, color: 'var(--text-muted)', letterSpacing: '0.05em', textTransform: 'uppercase' }}>📊 Weekly Net P&L</div>
                           <div style={{ display: 'flex', alignItems: 'baseline', marginTop: '6px', gap: '8px' }}>
-                            <span style={{ fontSize: '24px', fontWeight: 800, color: wPos ? '#059669' : 'var(--accent-red)', fontVariantNumeric: 'tabular-nums' }}>
+                            <span style={{ fontSize: '28px', fontWeight: 800, color: wPos ? 'var(--accent-green)' : 'var(--accent-red)', fontVariantNumeric: 'tabular-nums' }}>
                               {wPos ? '+' : ''}₹{Math.abs(wPnl).toLocaleString('en-IN')}
                             </span>
                           </div>
+                          <div style={{ fontSize: '10px', color: 'var(--text-muted)', marginTop: '2px' }}>
+                            <span>Realized <strong style={{ color: wRealized >= 0 ? 'var(--accent-green)' : 'var(--accent-red)' }}>₹{wRealized.toLocaleString('en-IN', { maximumFractionDigits: 0 })}</strong></span>
+                            {wUnrealized !== 0 && <span style={{ marginLeft: '6px' }}>· Open <strong style={{ color: wUnrealized >= 0 ? 'var(--accent-green)' : 'var(--accent-red)' }}>₹{wUnrealized.toLocaleString('en-IN', { maximumFractionDigits: 0 })}</strong></span>}
+                          </div>
                         </div>
-                        <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: '2px', fontSize: '11px', color: 'var(--text-muted)' }}>
+                        <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: '2px', fontSize: '12px', color: 'var(--text-muted)' }}>
                           <span>Trades: <strong style={{ color: 'var(--text-primary)' }}>{wTrades}</strong></span>
-                          <span>W/L: <strong style={{ color: '#059669' }}>{wWins}</strong>/<strong style={{ color: 'var(--accent-red)' }}>{wLosses}</strong></span>
+                          <span>W/L: <strong style={{ color: 'var(--accent-green)' }}>{wWins}</strong>/<strong style={{ color: 'var(--accent-red)' }}>{wLosses}</strong></span>
                         </div>
                       </div>
                       <div style={{ flex: 1, minHeight: '52px', padding: '0 8px' }}>
@@ -699,6 +726,8 @@ function App() {
                 {(() => {
                   const m = pnlSummary.monthly || {};
                   const mPnl = m.pnl || 0;
+                  const mRealized = m.realized_pnl || 0;
+                  const mUnrealized = m.unrealized_pnl || 0;
                   const mPos = mPnl >= 0;
                   const mTrades = m.trades || 0;
                   const mWins = m.wins || 0;
@@ -717,12 +746,16 @@ function App() {
                         <div>
                           <div style={{ fontSize: '11px', fontWeight: 700, color: 'var(--text-muted)', letterSpacing: '0.05em', textTransform: 'uppercase' }}>📆 {monthName} P&L</div>
                           <div style={{ display: 'flex', alignItems: 'baseline', marginTop: '6px', gap: '8px' }}>
-                            <span style={{ fontSize: '24px', fontWeight: 800, color: mPos ? '#059669' : 'var(--accent-red)', fontVariantNumeric: 'tabular-nums' }}>
+                            <span style={{ fontSize: '28px', fontWeight: 800, color: mPos ? 'var(--accent-green)' : 'var(--accent-red)', fontVariantNumeric: 'tabular-nums' }}>
                               {mPos ? '+' : ''}₹{Math.abs(mPnl).toLocaleString('en-IN')}
                             </span>
                           </div>
+                          <div style={{ fontSize: '10px', color: 'var(--text-muted)', marginTop: '2px' }}>
+                            <span>Realized <strong style={{ color: mRealized >= 0 ? 'var(--accent-green)' : 'var(--accent-red)' }}>₹{mRealized.toLocaleString('en-IN', { maximumFractionDigits: 0 })}</strong></span>
+                            {mUnrealized !== 0 && <span style={{ marginLeft: '6px' }}>· Open <strong style={{ color: mUnrealized >= 0 ? 'var(--accent-green)' : 'var(--accent-red)' }}>₹{mUnrealized.toLocaleString('en-IN', { maximumFractionDigits: 0 })}</strong></span>}
+                          </div>
                         </div>
-                        <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: '2px', fontSize: '11px', color: 'var(--text-muted)' }}>
+                        <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: '2px', fontSize: '12px', color: 'var(--text-muted)' }}>
                           <span>Trades: <strong style={{ color: 'var(--text-primary)' }}>{mTrades}</strong></span>
                           <span>{winRate}% win · {bd.length} days</span>
                         </div>

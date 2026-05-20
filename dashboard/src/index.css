@@ -1,40 +1,39 @@
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap');
 
 :root {
-  --bg-app: #EFF2F5;
+  --bg-app: #F5F6FA;
   --bg-card: #FFFFFF;
   --bg-sidebar: #FFFFFF;
-  --bg-sidebar-active: #3063F5;
-  --bg-hover: #F5F7FA;
-  --bg-badge-green: #D1FAE5;
-  --bg-badge-red: #FEE2E2;
-  --bg-badge-blue: #DBEAFE;
-  --bg-badge-yellow: #FEF3C7;
+  --bg-hover: #F1F4F8;
+  --bg-badge-green: #E6F8EF;
+  --bg-badge-red: #FEF0ED;
+  --bg-badge-blue: #E8F0FE;
+  --bg-badge-yellow: #FFF8E1;
 
-  --text-primary: #1A1D1F;
-  --text-secondary: #6A707E;
-  --text-muted: #9CA3AF;
+  --text-primary: #12161A;
+  --text-secondary: #58616D;
+  --text-muted: #8E98A8;
   --text-white: #FFFFFF;
 
-  --accent-blue: #3063F5;
-  --accent-green: #2ECC71;
-  --accent-red: #E8505B;
-  --accent-orange: #F59E0B;
-  --accent-purple: #8B5CF6;
-  --accent-cyan: #06B6D4;
+  --accent-blue: #2962FF;
+  --accent-green: #00B852;
+  --accent-red: #FF5000;
+  --accent-orange: #FF9800;
+  --accent-purple: #7C4DFF;
+  --accent-cyan: #00B4D8;
 
-  --border-light: #E5E7EB;
-  --border-card: #F0F0F0;
+  --border-light: #EBEEF2;
+  --border-card: #EBEEF2;
 
-  --radius-sm: 8px;
-  --radius-md: 12px;
-  --radius-lg: 16px;
-  --radius-xl: 20px;
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --radius-lg: 14px;
+  --radius-xl: 18px;
   --radius-full: 9999px;
 
-  --shadow-card: 0 1px 3px rgba(0,0,0,0.04), 0 1px 2px rgba(0,0,0,0.03);
-  --shadow-card-hover: 0 4px 12px rgba(0,0,0,0.08);
-  --shadow-sidebar: 2px 0 8px rgba(0,0,0,0.04);
+  --shadow-card: 0 2px 8px rgba(18, 22, 26, 0.04);
+  --shadow-card-hover: 0 6px 16px rgba(18, 22, 26, 0.08);
+  --shadow-sidebar: 1px 0 0 rgba(18, 22, 26, 0.04);
 }
 
 * {
@@ -134,10 +133,10 @@ body {
   display: flex;
   align-items: center;
   gap: 12px;
-  padding: 10px 12px;
+  padding: 12px 16px;
   border-radius: var(--radius-sm);
   cursor: pointer;
-  font-size: 13px;
+  font-size: 14px;
   font-weight: 500;
   color: var(--text-secondary);
   transition: all 0.15s ease;
@@ -153,8 +152,8 @@ body {
 }
 
 .nav-item.active {
-  background: var(--accent-blue);
-  color: white;
+  background: var(--bg-hover);
+  color: var(--accent-blue);
   font-weight: 600;
 }
 
@@ -247,10 +246,10 @@ body {
 }
 
 .header-bar h2 {
-  font-size: 22px;
+  font-size: 24px;
   font-weight: 700;
   color: var(--text-primary);
-  letter-spacing: -0.02em;
+  letter-spacing: -0.01em;
 }
 
 .header-bar .header-right {
@@ -278,7 +277,7 @@ body {
   padding: 8px 16px;
   border-radius: var(--radius-sm);
   border: 1px solid var(--border-light);
-  font-size: 13px;
+  font-size: 14px;
   font-weight: 600;
 }
 
@@ -298,11 +297,6 @@ body {
   box-shadow: var(--shadow-card);
   border: 1px solid var(--border-card);
   overflow: hidden;
-  transition: box-shadow 0.2s ease;
-}
-
-.card:hover {
-  box-shadow: var(--shadow-card-hover);
 }
 
 .card-header {
@@ -313,7 +307,7 @@ body {
 }
 
 .card-header h3 {
-  font-size: 15px;
+  font-size: 16px;
   font-weight: 600;
   color: var(--text-primary);
 }
@@ -326,10 +320,8 @@ body {
    TOP ROW (Chart + Target Cards)
    ═══════════════════════════════════════════ */
 .top-row {
-  display: grid;
-  grid-template-columns: 1fr 340px;
+  display: flex;
   gap: 24px;
-  height: 320px;
 }
 
 .pnl-chart-card {
@@ -358,7 +350,7 @@ body {
   margin-left: 12px;
 }
 
-.pnl-change.positive { background: var(--bg-badge-green); color: #059669; }
+.pnl-change.positive { background: var(--bg-badge-green); color: var(--accent-green); }
 .pnl-change.negative { background: var(--bg-badge-red); color: var(--accent-red); }
 
 .chart-area {
@@ -579,7 +571,7 @@ tbody tr:hover td {
   text-transform: uppercase;
 }
 
-.type-badge.buy { background: var(--bg-badge-green); color: #059669; }
+.type-badge.buy { background: var(--bg-badge-green); color: var(--accent-green); }
 .type-badge.sell { background: var(--bg-badge-red); color: var(--accent-red); }
 
 .pnl-positive { color: #059669; font-weight: 600; }
@@ -683,10 +675,8 @@ tbody tr:hover td {
 }
 
 @media (max-width: 1200px) {
-  .top-row { grid-template-columns: 1fr; height: auto; }
-  .pnl-chart-card, .right-column { height: 320px; }
+  .top-row { flex-direction: column; }
   .bottom-row { grid-template-columns: 1fr; }
-  .right-column { flex-direction: row; }
 }
 
 @media (max-width: 1024px) {

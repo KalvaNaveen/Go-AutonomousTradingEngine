@@ -38,11 +38,9 @@ type Candle struct {
 }
 
 type DailyCache struct {
-	SMA200       map[uint32]float64
 	ATR          map[uint32]float64
-	EMA25        map[uint32]float64
-	EMA21        map[uint32]float64
-	BBLower      map[uint32]float64
+	EMA10        map[uint32]float64 // Fast EMA — crossover entry
+	EMA20        map[uint32]float64 // Trend EMA — confirmation + exit
 	Closes       map[uint32][]float64
 	Highs        map[uint32][]float64
 	Lows         map[uint32][]float64
@@ -164,12 +162,19 @@ func (s *ScannerAgent) DetectRegime() string {
 }
 
 // computeROC calculates Rate of Change: ((current - past) / past) * 100
+// Uses live LTP as "current" when available so regime reflects intraday index moves,
+// not just the prior-day close loaded at startup.
 func (s *ScannerAgent) computeROC(token uint32, length int) float64 {
 	closes, ok := s.DailyCache.Closes[token]
 	if !ok || len(closes) < length+1 {
 		return 0
 	}
 	current := closes[len(closes)-1]
+	if s.GetLTP != nil {
+		if ltp := s.GetLTP(token); ltp > 0 {
+			current = ltp
+		}
+	}
 	past := closes[len(closes)-1-length]
 	if past <= 0 {
 		return 0
@@ -227,22 +232,32 @@ func (s *ScannerAgent) RunAllScans(regime string) []*Signal {
 			continue
 		}
 
-		// Section III.2: Near ATH filter
+		// Liquidity gate: skip stocks below ₹5Cr/day avg turnover (critical for Microcap 250 half)
+		if turn, ok := s.DailyCache.TurnoverCr[token]; ok && turn < config.LiquidityFilterCr {
+			continue
+		}
+
+		// Near ATH filter
 		if !s.passesPhase2Filter(token, ltp) {
 			continue
 		}
 
-		// Section V header: "Only execute these on stocks that passed the fundamental screens"
+		// Only trade stocks that passed the fundamental screens (if screener is active)
 		if s.FundamentalPassed != nil {
 			if passed, exists := s.FundamentalPassed[symbol]; exists && !passed {
 				continue
 			}
 		}
 
-		// Section V: All 5 technical entry setups
+		// EMA crossover signal (primary — checked first; broader universe makes this the main driver)
+		if sig := s.detectEMACrossover(token, symbol, ltp, regime); sig != nil {
+			signals = append(signals, sig)
+			continue
+		}
+		// VCP breakout (structural pattern — higher conviction when it fires)
 		if sig := s.detectVCPBreakout(token, symbol, ltp, regime); sig != nil {
 			signals = append(signals, sig)
-			continue // One signal per stock per scan
+			continue
 		}
 		if sig := s.detectBullFlag(token, symbol, ltp, regime); sig != nil {
 			signals = append(signals, sig)
@@ -262,6 +277,165 @@ func (s *ScannerAgent) RunAllScans(regime string) []*Signal {
 	}
 
 	return signals
+}
+
+// ══════════════════════════════════════════════════════════════
+//  EMA Crossover + Volume Direction Signal
+// ══════════════════════════════════════════════════════════════
+
+// detectEMACrossover fires when EMA10 freshly crosses above EMA20 (within last 3 bars)
+// AND at least 2 of the last 3 days show buying pressure via Close Position Ratio.
+func (s *ScannerAgent) detectEMACrossover(token uint32, symbol string, ltp float64, regime string) *Signal {
+	closes, cOk := s.DailyCache.Closes[token]
+	highs, hOk := s.DailyCache.Highs[token]
+	lows, lOk := s.DailyCache.Lows[token]
+	volumes, vOk := s.DailyCache.Volumes[token]
+	if !cOk || !hOk || !lOk || !vOk {
+		return nil
+	}
+	if len(closes) < config.EMA20Period+5 {
+		return nil
+	}
+
+	// Compute EMA series to detect fresh crossover
+	ema10s := computeEMASeries(closes, config.EMA10Period)
+	ema20s := computeEMASeries(closes, config.EMA20Period)
+	n := len(ema10s)
+	if n < 2 || len(ema20s) < 2 {
+		return nil
+	}
+
+	// Fresh crossover: EMA10 crossed above EMA20 in last 1-3 bars
+	crossed := false
+	lookback := 3
+	if lookback > n-1 {
+		lookback = n - 1
+	}
+	for i := n - lookback - 1; i < n-1; i++ {
+		if i < 0 {
+			continue
+		}
+		if ema10s[i] <= ema20s[i] && ema10s[i+1] > ema20s[i+1] {
+			crossed = true
+			break
+		}
+	}
+	if !crossed {
+		return nil
+	}
+
+	// Volume direction: ≥2 of last 3 days must show buying pressure
+	if !s.checkBuyPressure(closes, highs, lows, volumes) {
+		return nil
+	}
+
+	// Volume spike vs 20-day avg (time-paced for intraday)
+	avgVol := s.DailyCache.AvgVol[token]
+	if avgVol > 0 && s.GetVolume != nil {
+		currentVol := float64(s.GetVolume(token))
+		if currentVol > 0 {
+			now := config.NowIST()
+			open := time.Date(now.Year(), now.Month(), now.Day(), 9, 15, 0, 0, now.Location())
+			fraction := now.Sub(open).Minutes() / 375.0
+			if fraction > 1.0 {
+				fraction = 1.0
+			}
+			if fraction < 0.05 {
+				fraction = 0.05
+			}
+			if currentVol/fraction < avgVol*config.VolumeSpikeMultiplier {
+				return nil
+			}
+		}
+	}
+
+	// Structural SL using previous candle's low
+	prevLow := lows[len(lows)-2]
+	entryPrice := ltp * 1.003 // 0.3% above LTP for GTT trigger
+	stopPrice := config.ComputeStructuralSL(entryPrice, prevLow)
+	if stopPrice >= entryPrice {
+		return nil
+	}
+
+	capital := config.TotalCapital * config.MaxTradeAllocPct / 100
+	qty := int(capital / entryPrice)
+	if qty < 1 {
+		return nil
+	}
+
+	return &Signal{
+		Strategy:    "EMA_CROSS_BUY",
+		Symbol:      symbol,
+		Token:       token,
+		Regime:      regime,
+		EntryPrice:  entryPrice,
+		StopPrice:   stopPrice,
+		TargetPrice: 0,
+		Qty:         qty,
+		Product:     "CNC",
+		IsShort:     false,
+	}
+}
+
+// checkBuyPressure returns true if ≥VolumePressureDaysNeeded of the last VolumePressureDays
+// days show buying pressure: CPR=(Close-Low)/(High-Low) ≥ BuyPressureRatio with volume spike.
+func (s *ScannerAgent) checkBuyPressure(closes, highs, lows, volumes []float64) bool {
+	return s.countPressureDays(closes, highs, lows, volumes, true) >= config.VolumePressureDaysNeeded
+}
+
+// CheckSellPressure is exported for use by the exit monitor in execution_agent.
+func (s *ScannerAgent) CheckSellPressure(closes, highs, lows, volumes []float64) bool {
+	return s.countPressureDays(closes, highs, lows, volumes, false) >= config.VolumePressureDaysNeeded
+}
+
+func (s *ScannerAgent) countPressureDays(closes, highs, lows, volumes []float64, buyDirection bool) int {
+	n := len(closes)
+	if n < config.VolumePressureDays {
+		return 0
+	}
+	avgVol := 0.0
+	if len(volumes) >= 20 {
+		for _, v := range volumes[len(volumes)-20:] {
+			avgVol += v
+		}
+		avgVol /= 20
+	}
+	days := 0
+	for i := n - config.VolumePressureDays; i < n; i++ {
+		rng := highs[i] - lows[i]
+		if rng <= 0 {
+			continue
+		}
+		cpr := (closes[i] - lows[i]) / rng
+		volSpike := avgVol <= 0 || volumes[i] >= avgVol*config.VolumeSpikeMultiplier
+		if buyDirection && cpr >= config.BuyPressureRatio && volSpike {
+			days++
+		} else if !buyDirection && cpr <= config.SellPressureRatio && volSpike {
+			days++
+		}
+	}
+	return days
+}
+
+// computeEMASeries returns the full EMA series for the given period using standard
+// exponential smoothing: seed from first-N SMA, then apply multiplier forward.
+func computeEMASeries(closes []float64, period int) []float64 {
+	if len(closes) < period {
+		return nil
+	}
+	result := make([]float64, len(closes))
+	k := 2.0 / float64(period+1)
+	// Seed: SMA of first `period` closes
+	seed := 0.0
+	for i := 0; i < period; i++ {
+		seed += closes[i]
+	}
+	result[period-1] = seed / float64(period)
+	for i := period; i < len(closes); i++ {
+		result[i] = closes[i]*k + result[i-1]*(1-k)
+	}
+	// Return only the non-zero tail
+	return result[period-1:]
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -370,10 +544,10 @@ func (s *ScannerAgent) detectVCPBreakout(token uint32, symbol string, ltp float6
 		return nil
 	}
 
-	// Doc V.1 Invalidation: "setup is dead if stock closes below 21 EMA or 63 EMA"
+	// VCP invalidation: setup is dead if stock closes below EMA20 or EMA63
 	lastClose := closes[len(closes)-1]
-	ema21, e21Ok := s.DailyCache.EMA21[token]
-	if e21Ok && lastClose < ema21 {
+	ema20, e20Ok := s.DailyCache.EMA20[token]
+	if e20Ok && lastClose < ema20 {
 		return nil
 	}
 	// Also check 63 EMA (compute from closes)
@@ -395,30 +569,50 @@ func (s *ScannerAgent) detectVCPBreakout(token uint32, symbol string, ltp float6
 		}
 	}
 
-	// Identify pullback depths
+	// Identify pullback depths measured from each LOCAL HIGH (not always from the original ATH).
+	// Correct VCP structure: lower-high → lower-low → lower-high, each pullback shallower.
+	// Bug fix: previous code reset currentLow=resistance after each pullback, causing all depths
+	// to be measured from the same ATH instead of the most recent bounce high.
 	var pullbackDepths []float64
+	lastPullbackLow := resistance
+	localHigh := resistance
 	inPullback := false
 	currentLow := resistance
 
 	for i := 1; i < len(hWindow); i++ {
-		if hWindow[i] < resistance*0.98 {
-			inPullback = true
+		if !inPullback {
+			// Track new local highs before next pullback starts
+			if hWindow[i] > localHigh {
+				localHigh = hWindow[i]
+			}
+			// Pullback starts when price drops >2% from the local high
+			if lWindow[i] < localHigh*0.98 {
+				inPullback = true
+				currentLow = lWindow[i]
+			}
+		} else {
+			// Track the lowest point of this pullback
 			if lWindow[i] < currentLow {
 				currentLow = lWindow[i]
 			}
-		} else if inPullback {
-			depth := ((resistance - currentLow) / resistance) * 100
-			if depth > 1.0 {
-				pullbackDepths = append(pullbackDepths, depth)
+			// Pullback ends when price bounces >2% above the low
+			if hWindow[i] > currentLow*1.02 {
+				depth := ((localHigh - currentLow) / localHigh) * 100
+				if depth > 1.0 {
+					pullbackDepths = append(pullbackDepths, depth)
+					lastPullbackLow = currentLow
+				}
+				inPullback = false
+				localHigh = hWindow[i] // Next pullback measured from this bounce high
 			}
-			inPullback = false
-			currentLow = resistance
 		}
 	}
+	// Capture any in-progress pullback (price still contracting at end of window)
 	if inPullback {
-		depth := ((resistance - currentLow) / resistance) * 100
+		depth := ((localHigh - currentLow) / localHigh) * 100
 		if depth > 1.0 {
 			pullbackDepths = append(pullbackDepths, depth)
+			lastPullbackLow = currentLow
 		}
 	}
 
@@ -503,7 +697,8 @@ func (s *ScannerAgent) detectVCPBreakout(token uint32, symbol string, ltp float6
 
 	// Generate Signal — Doc VI: "5% to 10% of total portfolio per trade"
 	entryPrice := ltp
-	stopPrice := entryPrice * (1 - config.HardStopLossPct/100)
+	// Structural SL: 2% below the final VCP contraction pullback, capped at HardStopLossPct
+	stopPrice := math.Max(lastPullbackLow*0.98, entryPrice*(1-config.SLCeilingPct/100))
 
 	effectiveCapital := config.TotalCapital * s.CapitalMultiplier
 	positionSize := effectiveCapital * config.MaxTradeAllocPct / 100
@@ -574,7 +769,7 @@ func (s *ScannerAgent) CheckTopUp(token uint32, symbol string, entryPrice float6
 		return nil
 	}
 
-	stopPrice := ltp * (1 - config.HardStopLossPct/100)
+	stopPrice := ltp * (1 - config.SLCeilingPct/100)
 
 	log.Printf("[TopUp] %s retest confirmed: Entry=%.2f LTP=%.2f", symbol, entryPrice, ltp)
 
@@ -604,7 +799,7 @@ func (s *ScannerAgent) CheckReEntry(token uint32, symbol string, regime string) 
 	}
 
 	closes, cOk := s.DailyCache.Closes[token]
-	ema21Val, eOk := s.DailyCache.EMA21[token]
+	ema20Val, eOk := s.DailyCache.EMA20[token]
 	if !cOk || !eOk || len(closes) < 2 {
 		return nil
 	}
@@ -612,16 +807,17 @@ func (s *ScannerAgent) CheckReEntry(token uint32, symbol string, regime string) 
 	lastClose := closes[len(closes)-1]
 	prevClose := closes[len(closes)-2]
 
-	// Green candle (close > previous close) that closes above 21 EMA
+	// Green candle that closes above EMA20
 	isGreen := lastClose > prevClose
-	aboveEMA := lastClose > ema21Val
+	aboveEMA := lastClose > ema20Val
 
 	if !isGreen || !aboveEMA {
 		return nil
 	}
 
 	entryPrice := lastClose
-	stopPrice := entryPrice * (1 - config.HardStopLossPct/100)
+	prevLow := closes[len(closes)-2] // use prev close as proxy for structural SL in re-entry
+	stopPrice := config.ComputeStructuralSL(entryPrice, prevLow)
 
 	effectiveCapital := config.TotalCapital * s.CapitalMultiplier
 	positionSize := effectiveCapital * config.MaxTradeAllocPct / 100
@@ -632,7 +828,7 @@ func (s *ScannerAgent) CheckReEntry(token uint32, symbol string, regime string) 
 		return nil
 	}
 
-	log.Printf("[ReEntry] %s reclaimed 21 EMA: Close=%.2f EMA21=%.2f", symbol, lastClose, ema21Val)
+	log.Printf("[ReEntry] %s reclaimed EMA20: Close=%.2f EMA20=%.2f", symbol, lastClose, ema20Val)
 
 	return &Signal{
 		Strategy:    "VCP_REENTRY",
@@ -649,4 +845,39 @@ func (s *ScannerAgent) CheckReEntry(token uint32, symbol string, regime string) 
 }
 
 // ComputeEMA21 is defined in execution_agent.go (same package)
+
+// ComputeADRatio calculates the Advance/Decline ratio from the live universe.
+// Compares each stock's live LTP to the prior-day close in DailyCache.
+// Returns a value in [0,1]: >0.6 = broadly advancing, <0.4 = broadly declining.
+func (s *ScannerAgent) ComputeADRatio() float64 {
+	if s.DailyCache == nil || !s.DailyCache.Loaded || s.GetLTP == nil {
+		return 0.5
+	}
+	advance, decline := 0, 0
+	for token := range s.Universe {
+		ltp := s.GetLTP(token)
+		if ltp <= 0 {
+			continue
+		}
+		closes, ok := s.DailyCache.Closes[token]
+		if !ok || len(closes) == 0 {
+			continue
+		}
+		prevClose := closes[len(closes)-1]
+		if prevClose <= 0 {
+			continue
+		}
+		switch {
+		case ltp > prevClose*1.001:
+			advance++
+		case ltp < prevClose*0.999:
+			decline++
+		}
+	}
+	total := advance + decline
+	if total == 0 {
+		return 0.5
+	}
+	return float64(advance) / float64(total)
+}
 

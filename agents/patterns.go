@@ -97,7 +97,8 @@ func (s *ScannerAgent) detectBullFlag(token uint32, symbol string, ltp float64, 
 	}
 
 	entryPrice := ltp
-	stopPrice := entryPrice * (1 - config.HardStopLossPct/100)
+	// Structural SL: 2% below the flag consolidation, capped at HardStopLossPct
+	stopPrice := math.Max(flagLow*0.98, entryPrice*(1-config.SLCeilingPct/100))
 	effectiveCapital := config.TotalCapital * s.CapitalMultiplier
 	positionSize := effectiveCapital * config.MaxTradeAllocPct / 100
 	qty := int(math.Floor(positionSize / entryPrice))
@@ -117,13 +118,21 @@ func (s *ScannerAgent) detectBullFlag(token uint32, symbol string, ltp float64, 
 }
 
 // findSharpestRise finds the sub-window with the highest gain meeting constraints.
+// Only searches the most recent 90 candles to avoid matching stale historical poles.
 // minGain: minimum percentage gain for a valid pole
 // minLen/maxLen: min/max candle length for the pole
 func findSharpestRise(closes []float64, minGain float64, minLen, maxLen int) (int, int) {
 	bestGain := 0.0
 	bestStart := -1
 	bestEnd := -1
-	for start := 0; start < len(closes)-minLen; start++ {
+
+	// Limit search to the last 90 days so we don't match a rally from 18 months ago.
+	searchStart := len(closes) - 90
+	if searchStart < 0 {
+		searchStart = 0
+	}
+
+	for start := searchStart; start < len(closes)-minLen; start++ {
 		for length := minLen; length <= maxLen; length++ {
 			end := start + length
 			if end >= len(closes) {
@@ -224,7 +233,8 @@ func (s *ScannerAgent) detectIPOBaseBreakout(token uint32, symbol string, ltp fl
 	}
 
 	entryPrice := ltp
-	stopPrice := entryPrice * (1 - config.HardStopLossPct/100)
+	// Structural SL: 2% below the base consolidation, capped at HardStopLossPct
+	stopPrice := math.Max(baseLow*0.98, entryPrice*(1-config.SLCeilingPct/100))
 	effectiveCapital := config.TotalCapital * s.CapitalMultiplier
 	positionSize := effectiveCapital * config.MaxTradeAllocPct / 100
 	qty := int(math.Floor(positionSize / entryPrice))
@@ -256,9 +266,34 @@ func (s *ScannerAgent) detectCupWithHandle(token uint32, symbol string, ltp floa
 		return nil
 	}
 
-	// Cup: look back 60 days. Left lip = high near start, trough in middle, right lip = high near end
-	leftLip := highs[len(highs)-60]
-	rightLip := highs[len(highs)-16]
+	// Cup: look back 60 days. Use a 5-day window for each lip to avoid single-candle spikes
+	// (earnings, news) inflating the neckline and making breakouts impossible to trigger.
+	leftStart := len(highs) - 60
+	leftEnd := leftStart + 5
+	if leftEnd > len(highs) {
+		leftEnd = len(highs)
+	}
+	leftLip := highs[leftStart]
+	for _, h := range highs[leftStart:leftEnd] {
+		if h > leftLip {
+			leftLip = h
+		}
+	}
+
+	rightStart := len(highs) - 20
+	rightEnd := len(highs) - 12
+	if rightEnd > len(highs) {
+		rightEnd = len(highs)
+	}
+	if rightEnd <= rightStart {
+		rightEnd = rightStart + 1
+	}
+	rightLip := highs[rightStart]
+	for _, h := range highs[rightStart:rightEnd] {
+		if h > rightLip {
+			rightLip = h
+		}
+	}
 
 	// Find trough (lowest close in middle portion, days 15-45)
 	trough := closes[len(closes)-45]
@@ -311,7 +346,8 @@ func (s *ScannerAgent) detectCupWithHandle(token uint32, symbol string, ltp floa
 	}
 
 	entryPrice := ltp
-	stopPrice := entryPrice * (1 - config.HardStopLossPct/100)
+	// Structural SL: 2% below the handle consolidation, capped at HardStopLossPct
+	stopPrice := math.Max(handleLow*0.98, entryPrice*(1-config.SLCeilingPct/100))
 	effectiveCapital := config.TotalCapital * s.CapitalMultiplier
 	positionSize := effectiveCapital * config.MaxTradeAllocPct / 100
 	qty := int(math.Floor(positionSize / entryPrice))
@@ -407,25 +443,27 @@ func (s *ScannerAgent) detectTrendChannel(token uint32, symbol string, ltp float
 		return nil // Not near support
 	}
 
-	// FIX-07: Volume filter at support — low volume = healthy pullback
+	// FIX-07: Volume filter at support — low volume = healthy pullback.
 	// High volume at support = potential breakdown. Skip.
-	// ⚠️ EXTENSION: Volume check not in Blueprint for this pattern.
+	// Uses live GetVolume (today's cumulative) vs 20-day historical average.
+	// Bug fix: previous code used volumes[last] which is yesterday's EOD volume, not today's.
 	volumes, vOk := s.DailyCache.Volumes[token]
-	if vOk && len(volumes) > 20 {
+	if vOk && len(volumes) > 20 && s.GetVolume != nil {
 		var avgVol20 float64
 		for i := len(volumes) - 21; i < len(volumes)-1; i++ {
 			avgVol20 += volumes[i]
 		}
 		avgVol20 /= 20
-		if len(volumes) > 0 && volumes[len(volumes)-1] > avgVol20*1.10 {
-			return nil // Elevated selling volume near support
+		currentVol := float64(s.GetVolume(token))
+		if currentVol > 0 && currentVol > avgVol20*1.10 {
+			return nil // Elevated selling volume near support today
 		}
 	}
 
 	entryPrice := ltp
 	stopPrice := currentSupport * 0.98 // SL just below support
-	if ((entryPrice - stopPrice) / entryPrice * 100) > config.HardStopLossPct {
-		stopPrice = entryPrice * (1 - config.HardStopLossPct/100)
+	if ((entryPrice - stopPrice) / entryPrice * 100) > config.SLCeilingPct {
+		stopPrice = entryPrice * (1 - config.SLCeilingPct/100)
 	}
 
 	effectiveCapital := config.TotalCapital * s.CapitalMultiplier

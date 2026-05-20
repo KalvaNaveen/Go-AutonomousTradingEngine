@@ -132,7 +132,7 @@ func TestVCP_RejectsIfBelowEMA21(t *testing.T) {
 	s.DailyCache.Closes[1] = closes
 	s.DailyCache.Highs[1] = makeFlat(100, 105.0)
 	s.DailyCache.Lows[1] = makeFlat(100, 95.0)
-	s.DailyCache.EMA21[1] = 100.0 // EMA21 = 100, close = 90
+	s.DailyCache.EMA20[1] = 100.0 // EMA20 = 100, close = 90
 
 	sig := s.detectVCPBreakout(1, "TEST", 110.0, "NORMAL")
 	if sig != nil {
@@ -160,7 +160,7 @@ func TestVCP_RejectsIfVolumeDIDNotDryUp(t *testing.T) {
 	s.DailyCache.Highs[1] = highs
 	s.DailyCache.Lows[1] = lows
 	s.DailyCache.Volumes[1] = volumes
-	s.DailyCache.EMA21[1] = 80.0
+	s.DailyCache.EMA20[1] = 80.0
 
 	sig := s.detectVCPBreakout(1, "TEST", highs[len(highs)-1]+5, "NORMAL")
 	if sig != nil {
@@ -225,49 +225,55 @@ func TestCupHandle_Requires1DayConfirmation(t *testing.T) {
 // --- Section VI.1: Position Limits ---
 
 func TestConfig_MaxPositions6(t *testing.T) {
-	// Doc L108: "Maximum 5 to 6 stocks"
-	if config.MaxOpenPositions != 6 {
-		t.Errorf("MaxOpenPositions should be 6, got %d", config.MaxOpenPositions)
+	// At ₹1L capital: floor(90000/15000) = 6 positions
+	got := config.ComputeMaxPositions(100000)
+	if got != 6 {
+		t.Errorf("ComputeMaxPositions(100000) should be 6, got %d", got)
 	}
 }
 
-func TestConfig_TradeAllocation5to10(t *testing.T) {
-	// Doc L109: "5% to 10% of total portfolio per trade"
-	if config.MinTradeAllocPct != 5.0 {
-		t.Errorf("MinTradeAllocPct should be 5.0, got %.1f", config.MinTradeAllocPct)
+func TestConfig_TradeAllocation15to20(t *testing.T) {
+	// At ₹1L capital with 6 positions: 15-20% per trade (₹15K-₹20K)
+	if config.MinTradeAllocPct != 15.0 {
+		t.Errorf("MinTradeAllocPct should be 15.0, got %.1f", config.MinTradeAllocPct)
 	}
-	if config.MaxTradeAllocPct != 10.0 {
-		t.Errorf("MaxTradeAllocPct should be 10.0, got %.1f", config.MaxTradeAllocPct)
+	if config.MaxTradeAllocPct != 20.0 {
+		t.Errorf("MaxTradeAllocPct should be 20.0, got %.1f", config.MaxTradeAllocPct)
 	}
 }
 
 // --- Section VI.2: Stop-Loss ---
 
-func TestConfig_MaxSL7Percent(t *testing.T) {
-	// Doc L112: "Absolute Maximum SL: 7%"
-	if config.HardStopLossPct != 7.0 {
-		t.Errorf("HardStopLossPct should be 7.0, got %.1f", config.HardStopLossPct)
+func TestConfig_StructuralSLRange(t *testing.T) {
+	// SL floor: 1.5% below entry; SL ceiling: 3.0% below entry
+	if config.SLFloorPct != 1.5 {
+		t.Errorf("SLFloorPct should be 1.5, got %.1f", config.SLFloorPct)
+	}
+	if config.SLCeilingPct != 3.0 {
+		t.Errorf("SLCeilingPct should be 3.0, got %.1f", config.SLCeilingPct)
 	}
 }
 
-func TestConfig_IdealSL3to5(t *testing.T) {
-	// Doc L113: "Ideal Active SL: 3% to 5%"
-	if config.TightSLPct != 3.0 {
-		t.Errorf("TightSLPct should be 3.0, got %.1f", config.TightSLPct)
-	}
-	if config.IdealSLPct != 5.0 {
-		t.Errorf("IdealSLPct should be 5.0, got %.1f", config.IdealSLPct)
+func TestConfig_StructuralSLCompute(t *testing.T) {
+	// Prev candle low × 0.998, clamped to [entry×0.97, entry×0.985]
+	entry := 1000.0
+	prevLow := 985.0
+	sl := config.ComputeStructuralSL(entry, prevLow)
+	// structural = 985*0.998 = 983.03, floor = 985, ceiling = 970 → clamp to floor(985)
+	if sl < entry*(1-config.SLCeilingPct/100) || sl > entry*(1-config.SLFloorPct/100) {
+		t.Errorf("Structural SL %.2f is outside [%.2f, %.2f]",
+			sl, entry*(1-config.SLCeilingPct/100), entry*(1-config.SLFloorPct/100))
 	}
 }
 
 // --- Section VI.3: Add to Winners Only ---
 
-func TestSignal_StopPriceIs7Percent(t *testing.T) {
-	// Verify signal stop price = entry * (1 - 7/100)
+func TestSignal_StructuralSLCeiling(t *testing.T) {
+	// Structural SL ceiling: entry * (1 - SLCeilingPct/100) = entry * 0.97
 	entry := 100.0
-	expected := entry * (1 - config.HardStopLossPct/100) // 93.0
-	if expected != 93.0 {
-		t.Errorf("Stop price for entry=100 should be 93.0, got %.1f", expected)
+	ceiling := entry * (1 - config.SLCeilingPct/100) // 97.0
+	if ceiling != 97.0 {
+		t.Errorf("SL ceiling for entry=100 should be 97.0, got %.1f", ceiling)
 	}
 }
 
@@ -300,10 +306,13 @@ func TestContingency_WinResetsCounter(t *testing.T) {
 
 // --- Section VII.2: 21 EMA Exit ---
 
-func TestConfig_EMA21Period(t *testing.T) {
-	// Doc L132: "21-day EMA"
-	if config.EMA21Period != 21 {
-		t.Errorf("EMA21Period should be 21, got %d", config.EMA21Period)
+func TestConfig_EMAPeriods(t *testing.T) {
+	// Fast EMA10 for crossover entry, Trend EMA20 for confirmation + exit
+	if config.EMA10Period != 10 {
+		t.Errorf("EMA10Period should be 10, got %d", config.EMA10Period)
+	}
+	if config.EMA20Period != 20 {
+		t.Errorf("EMA20Period should be 20, got %d", config.EMA20Period)
 	}
 }
 
@@ -337,7 +346,7 @@ func TestReEntry_GreenCandleAboveEMA(t *testing.T) {
 	closes[len(closes)-2] = 98.0  // Prev close (lower)
 	closes[len(closes)-1] = 102.0 // Last close (green, above EMA)
 	s.DailyCache.Closes[1] = closes
-	s.DailyCache.EMA21[1] = 101.0 // EMA21 = 101
+	s.DailyCache.EMA20[1] = 101.0 // EMA20 = 101
 
 	sig := s.CheckReEntry(1, "TEST", "NORMAL")
 	if sig == nil {
@@ -357,7 +366,7 @@ func TestReEntry_RejectsRedCandle(t *testing.T) {
 	closes[len(closes)-2] = 103.0 // Prev close (higher)
 	closes[len(closes)-1] = 102.0 // Last close (red)
 	s.DailyCache.Closes[1] = closes
-	s.DailyCache.EMA21[1] = 101.0
+	s.DailyCache.EMA20[1] = 101.0
 
 	sig := s.CheckReEntry(1, "TEST", "NORMAL")
 	if sig != nil {
@@ -374,7 +383,7 @@ func TestReEntry_RejectsBelowEMA(t *testing.T) {
 	closes[len(closes)-2] = 98.0  // Prev
 	closes[len(closes)-1] = 99.0  // Green but below EMA
 	s.DailyCache.Closes[1] = closes
-	s.DailyCache.EMA21[1] = 101.0
+	s.DailyCache.EMA20[1] = 101.0
 
 	sig := s.CheckReEntry(1, "TEST", "NORMAL")
 	if sig != nil {
@@ -384,17 +393,17 @@ func TestReEntry_RejectsBelowEMA(t *testing.T) {
 
 // --- Section V: Position Sizing ---
 
-func TestPositionSizing_5to10Percent(t *testing.T) {
-	// Doc L109: "5% to 10% of total portfolio per trade"
-	capital := 500000.0
-	maxAlloc := capital * config.MaxTradeAllocPct / 100 // 50000
-	minAlloc := capital * config.MinTradeAllocPct / 100 // 25000
+func TestPositionSizing_15to20Percent(t *testing.T) {
+	// At ₹1L capital: 15-20% per trade = ₹15K-₹20K per position
+	capital := 100000.0
+	maxAlloc := capital * config.MaxTradeAllocPct / 100 // 20000
+	minAlloc := capital * config.MinTradeAllocPct / 100 // 15000
 
-	if maxAlloc != 50000 {
-		t.Errorf("Max allocation should be 50000, got %.0f", maxAlloc)
+	if maxAlloc != 20000 {
+		t.Errorf("Max allocation should be 20000, got %.0f", maxAlloc)
 	}
-	if minAlloc != 25000 {
-		t.Errorf("Min allocation should be 25000, got %.0f", minAlloc)
+	if minAlloc != 15000 {
+		t.Errorf("Min allocation should be 15000, got %.0f", minAlloc)
 	}
 }
 
@@ -404,11 +413,9 @@ func TestPositionSizing_5to10Percent(t *testing.T) {
 
 func makeMockCache() *DailyCache {
 	return &DailyCache{
-		SMA200:       make(map[uint32]float64),
 		ATR:          make(map[uint32]float64),
-		EMA25:        make(map[uint32]float64),
-		EMA21:        make(map[uint32]float64),
-		BBLower:      make(map[uint32]float64),
+		EMA10:        make(map[uint32]float64),
+		EMA20:        make(map[uint32]float64),
 		Closes:       make(map[uint32][]float64),
 		Highs:        make(map[uint32][]float64),
 		Lows:         make(map[uint32][]float64),

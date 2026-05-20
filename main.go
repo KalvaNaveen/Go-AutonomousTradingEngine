@@ -21,6 +21,7 @@ import (
 )
 
 func main() {
+	core.InitGlobalLogger()
 	// ══════════════════════════════════════════════════════════════
 	//  PHASE 0: Environment Setup
 	// ══════════════════════════════════════════════════════════════
@@ -97,8 +98,10 @@ func main() {
 		log.Println("[Engine] Paper Broker enabled (CNC swing mode)")
 	} else {
 		kb := broker.NewKiteBroker()
+		gttClient := broker.NewGTTClient()
 		execAgent.PlaceOrder = kb.PlaceOrder
 		execAgent.CancelOrder = kb.CancelOrder
+		execAgent.CancelGTT = gttClient.CancelGTT
 		// Wire FillMonitor REST hooks so it can poll order status & modify SL qty.
 		fillMonitor.GetOrderStatus = func(orderID string) (*core.OrderStatus, error) {
 			status, filled, pending, avg, err := kb.GetOrderStatus(orderID)
@@ -108,7 +111,10 @@ func main() {
 			return &core.OrderStatus{Status: status, FilledQty: filled, PendingQty: pending, AveragePrice: avg}, nil
 		}
 		fillMonitor.ModifyOrder = kb.ModifyOrder
-		log.Println("[Engine] LIVE broker connected (Kite)")
+		// Wire GTT SL placement — persists overnight, survives bot restarts
+		fillMonitor.PlaceGTT = gttClient.PlaceSLGTT
+		fillMonitor.CancelGTT = gttClient.CancelGTT
+		log.Println("[Engine] LIVE broker connected (Kite + GTT SL)")
 	}
 
 	// ══════════════════════════════════════════════════════════════
@@ -152,6 +158,47 @@ func main() {
 	log.Printf("[Engine] Token count: %d equity (scan) + %d benchmark (monitor only)",
 		len(scanner.Universe), len(benchmarkTokens))
 
+	// ══════════════════════════════════════════════════════════════
+	//  TickStore + WebSocket (for live SL monitoring & Auth Check)
+	// ══════════════════════════════════════════════════════════════
+	tickStore := storage.NewTickStore()
+
+	scanner.GetLTP = func(token uint32) float64 { return tickStore.GetLTPIfFresh(token) }
+	scanner.GetVWAP = func(token uint32) float64 { return tickStore.GetVWAP(token) }
+	scanner.GetVolume = func(token uint32) int64 { return tickStore.GetVolume(token) }
+	scanner.GetDepth = func(token uint32) map[string]float64 { return tickStore.GetDepth(token) }
+	scanner.GetCandles5m = func(token uint32) []agents.Candle { return tickStore.GetCandles5Min(token) }
+	scanner.GetORB = func(token uint32) (float64, float64) { return tickStore.GetORB(token) }
+	scanner.GetDayOpen = func(token uint32) float64 { return tickStore.GetDayOpen(token) }
+	scanner.ComputeRVol = func(token uint32) float64 { return 1.0 }
+	scanner.GetIndiaVIX = func() float64 { return tickStore.GetLTPIfFresh(config.IndiaVIXToken) }
+	scanner.GetADRatio = scanner.ComputeADRatio
+
+	execAgent.GetLTP = scanner.GetLTP
+
+	allTokens := dataAgent.GetAllTokens()
+	ws := storage.NewKiteWebSocket(tickStore, allTokens)
+	if config.KiteAPIKey != "" {
+		err := ws.Connect()
+		if err != nil {
+			log.Printf("[Engine] WebSocket connect failed with current token: %v. Triggering AutoLogin...", err)
+			login := core.NewAutoLogin()
+			if login.Run() {
+				ws.UpdateToken(config.KiteAccessToken)
+				if err2 := ws.Connect(); err2 != nil {
+					log.Printf("[Engine] WebSocket connect failed even after AutoLogin: %v", err2)
+				} else {
+					log.Printf("[Engine] WebSocket connected after AutoLogin. Subscribed %d tokens", len(allTokens))
+				}
+			} else {
+				log.Println("[Engine] AutoLogin failed. WebSocket is offline.")
+			}
+		} else {
+			log.Printf("[Engine] WebSocket connected. Subscribed %d tokens", len(allTokens))
+		}
+	}
+
+	// Now that token is potentially refreshed, preload Cache
 	dailyCache := storage.NewDailyCache()
 	log.Println("[Engine] Preloading daily cache (500d historical for ROC)...")
 	dailyCache.Preload(dataAgent.Universe)
@@ -260,33 +307,6 @@ func main() {
 		agents.SendTelegram(fmt.Sprintf("⚠️ *MAJOR EVENT*: `%s`\nBull Flag entries suppressed today.", eventName))
 	}
 
-	// ══════════════════════════════════════════════════════════════
-	//  TickStore + WebSocket (for live SL monitoring)
-	// ══════════════════════════════════════════════════════════════
-	tickStore := storage.NewTickStore()
-
-	scanner.GetLTP = func(token uint32) float64 { return tickStore.GetLTPIfFresh(token) }
-	scanner.GetVWAP = func(token uint32) float64 { return tickStore.GetVWAP(token) }
-	scanner.GetVolume = func(token uint32) int64 { return tickStore.GetVolume(token) }
-	scanner.GetDepth = func(token uint32) map[string]float64 { return tickStore.GetDepth(token) }
-	scanner.GetCandles5m = func(token uint32) []agents.Candle { return tickStore.GetCandles5Min(token) }
-	scanner.GetORB = func(token uint32) (float64, float64) { return tickStore.GetORB(token) }
-	scanner.GetDayOpen = func(token uint32) float64 { return tickStore.GetDayOpen(token) }
-	scanner.ComputeRVol = func(token uint32) float64 { return 1.0 }
-	scanner.GetIndiaVIX = func() float64 { return tickStore.GetLTPIfFresh(config.IndiaVIXToken) }
-	scanner.GetADRatio = func() float64 { return 0.5 }
-
-	execAgent.GetLTP = scanner.GetLTP
-
-	allTokens := dataAgent.GetAllTokens()
-	ws := storage.NewKiteWebSocket(tickStore, allTokens)
-	if config.KiteAPIKey != "" && config.KiteAccessToken != "" {
-		if err := ws.Connect(); err != nil {
-			log.Printf("[Engine] WebSocket connect failed: %v (will retry)", err)
-		} else {
-			log.Printf("[Engine] WebSocket connected. Subscribed %d tokens", len(allTokens))
-		}
-	}
 
 	// ══════════════════════════════════════════════════════════════
 	//  Scheduled Daily Token Refresh (8:30 AM)
@@ -316,12 +336,18 @@ func main() {
 		symbolToToken[sym] = token
 	}
 
-	// Backfill missing tokens to restored trades
+	// Backfill missing tokens to restored trades AND persist the fix to DB.
+	// Without the Save() call, every restart would re-load token=0 from SQLite,
+	// causing MonitorPositions to skip the position (LTP returns 0 → "continue").
 	execAgent.Mu.Lock()
 	for _, trade := range execAgent.ActiveTrades {
 		if trade.Token == 0 {
 			if matchedTok, exists := symbolToToken[trade.Symbol]; exists {
 				trade.Token = matchedTok
+				stateManager.Save(trade.EntryOID, trade) // Persist fix to DB
+				log.Printf("[Engine] Backfilled token for %s: %d (was 0)", trade.Symbol, matchedTok)
+			} else {
+				log.Printf("[Engine] ⚠️ Cannot backfill token for %s — symbol not in universe", trade.Symbol)
 			}
 		}
 	}
@@ -379,10 +405,11 @@ func main() {
 	execAgent.Mu.RUnlock()
 
 	agents.SendTelegram(fmt.Sprintf(
-		"🚀 *QUANTIX ENGINE v3.0 — SWING*\nMode: `%s`\nCapital: `₹%.0f`\nUniverse: `%d stocks`\nOpen Positions: `%d/%d`\nStrategy: `VCP Breakout + 21 EMA`\nHard SL: `%.0f%%`",
+		"🚀 *QUANTIX ENGINE v3.0 — SWING*\nMode: `%s`\nCapital: `₹%.0f`\nUniverse: `%d stocks`\nOpen Positions: `%d/%d`\nStrategy: `EMA10/20 Crossover + VCP`\nSL Range: `%.1f%%–%.1f%%`",
 		map[bool]string{true: "PAPER", false: "LIVE"}[config.PaperMode],
 		config.TotalCapital, len(dataAgent.Universe),
-		openCount, config.MaxOpenPositions, config.HardStopLossPct))
+		openCount, config.ComputeMaxPositions(config.TotalCapital),
+		config.SLFloorPct, config.SLCeilingPct))
 
 	log.Println("[Engine] ✅ Fully initialized. Entering swing trading loop...")
 
@@ -391,7 +418,7 @@ func main() {
 	// ══════════════════════════════════════════════════════════════
 	//  Swing trading: NO EOD squareoff. Positions held overnight.
 	//  During market hours: monitor hard SL + scan for new VCP breakouts.
-	//  At EOD (15:20): run 21 EMA exit check on daily closes.
+	//  At EOD (15:31): run EMA20 + sell pressure exit check on daily closes.
 
 	for { // Outer loop: one iteration per trading day
 		today := config.NowIST()
@@ -424,6 +451,7 @@ func main() {
 		scanner.NewSession()
 		tickStore.ResetDaily()
 		eodCheckDone := false
+		eodScanDone := false
 
 		// Swing tick loop — 1 second interval (not 200ms, swing doesn't need HFT speed)
 		ticker := time.NewTicker(1 * time.Second)
@@ -469,16 +497,18 @@ func main() {
 			}
 			scanCount++
 
-			// ── Phase 5: EOD Check — 21 EMA trailing exit (once at 15:20) ──
-			if t >= 1520 && !eodCheckDone {
-				log.Println("[Engine] ═══ EOD EMA CHECK (15:20) ═══")
+			// ── Phase 5: EOD Check — EMA20 trailing exit + sell pressure rule (once at 15:31) ──
+			// Running at 15:31 ensures Kite's day candle is finalized (market closes 15:30).
+			// At 15:20 the candle is still live and the close price is provisional.
+			if t >= 1531 && !eodCheckDone {
+				log.Println("[Engine] ═══ EOD EMA20 CHECK (15:31) ═══")
 
 				// Refresh daily cache for latest closes
 				dailyCache.Preload(dataAgent.Universe)
 				freshCache := dailyCache.ToScannerCache()
 				scanner.DailyCache = freshCache
 
-				// Run 21 EMA exit check on all positions
+				// Run EMA20 + sell pressure exit check on all positions
 				execAgent.RunDailyEMACheck(freshCache)
 
 				// Check for re-entries on stocks that were exited by EMA rule
@@ -490,11 +520,25 @@ func main() {
 				execAgent.DailySummaryAlert(currentRegime)
 
 				eodCheckDone = true
-				log.Println("[Engine] ═══ EOD EMA CHECK COMPLETE ═══")
+				log.Println("[Engine] ═══ EOD EMA CHECK COMPLETE (15:31) ═══")
+			}
+
+			// ── EOD Market Scan + News Preload (once at 15:45) ──
+			if t >= 1545 && !eodScanDone {
+				eodScanDone = true
+				// Warm news cache for tomorrow's pre-market session
+				go agents.PreloadNewsForUniverse(dataAgent.Universe)
+				go agents.RunEODMarketScan(agents.EODScanDeps{
+					LoadUniverse:    dataAgent.LoadEODScanUniverse,
+					PreloadCache:    dailyCache.Preload,
+					GetScannerCache: func() *agents.DailyCache { return dailyCache.ToScannerCache() },
+					GetLiveLTP:      func(token uint32) float64 { return tickStore.GetLTPIfFresh(token) },
+					GetLiveVolume:   func(token uint32) int64 { return tickStore.GetVolume(token) },
+				}, scanner)
 			}
 
 			// After market close — end the day loop (but DON'T squareoff!)
-			if t >= 1545 {
+			if t >= 1605 {
 				log.Println("[Engine] Market closed. Swing positions HELD overnight.")
 				ticker.Stop()
 				break dayLoop
@@ -508,6 +552,8 @@ func main() {
 		agents.SendTelegram("🌙 *ENGINE SLEEPING* — Swing positions held overnight.")
 		sleepUntilMorning()
 		log.Printf("[Engine] ═══ WAKING UP — %s ═══", config.NowIST().Format("2006-01-02 15:04"))
+		// Pre-market news warm-up — runs at 08:25 so cache is hot before 09:15 open
+		go agents.PreloadNewsForUniverse(dataAgent.Universe)
 	}
 }
 

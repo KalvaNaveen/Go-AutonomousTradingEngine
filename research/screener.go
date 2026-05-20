@@ -133,6 +133,16 @@ func FetchFundamentals(symbol string) (*Fundamentals, error) {
 		f.ProfitGrowth = parseScreenerGrowth(html, "Profit Growth")
 	}
 
+	// If all three key metrics parsed as zero, the HTML structure has changed or the page
+	// returned a non-standard layout. Treat as an allow-through (same as HTTP error path)
+	// rather than permanently blocking a valid stock on a parse failure.
+	if f.MarketCap == 0 && f.ROCE == 0 && f.ROE == 0 {
+		log.Printf("[Screener] %s: all metrics parsed as zero — likely HTML structure change, allowing through", symbol)
+		f.Passed = true
+		saveToCache(f)
+		return f, nil
+	}
+
 	// Doc III.1: MCap > 1000 Cr, ROCE > 20%, ROE > 20%, growth positive
 	f.Passed = f.MarketCap > 1000 && f.ROCE > 20 && f.ROE > 20
 	if f.SalesGrowth != 0 || f.ProfitGrowth != 0 {
