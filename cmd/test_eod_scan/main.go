@@ -65,7 +65,6 @@ func main() {
 	scanner.Universe = dataAgent.Universe
 	scanner.TokenToCompany = dataAgent.TokenToCompany
 	scanner.DailyCache = dailyCache.ToScannerCache()
-	scanner.FundamentalPassed = make(map[string]bool)
 
 	// Step 4: Run the EOD scan
 	log.Println("\n[Test] ═══ STEP 3: Running EOD Market Scan ═══")

@@ -383,30 +383,16 @@ func (j *Journal) GetAvailableDates() []string {
 	if j.db == nil {
 		return nil
 	}
-
 	rows, err := j.db.Query("SELECT DISTINCT date FROM trades ORDER BY date DESC")
 	if err != nil {
 		return nil
 	}
 	defer rows.Close()
-
 	var dates []string
 	for rows.Next() {
 		var d string
 		rows.Scan(&d)
 		dates = append(dates, d)
-	}
-
-	if len(dates) == 0 {
-		rows2, _ := j.db.Query("SELECT DISTINCT date FROM daily_summary ORDER BY date DESC")
-		if rows2 != nil {
-			defer rows2.Close()
-			for rows2.Next() {
-				var d string
-				rows2.Scan(&d)
-				dates = append(dates, d)
-			}
-		}
 	}
 	return dates
 }
