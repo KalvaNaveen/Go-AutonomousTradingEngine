@@ -7,8 +7,12 @@
 
 # Data files
 data/*.db
+data/*.db-wal
+data/*.db-shm
 data/*.txt
 data/*.csv
+data/screener_cache/
+data/config_override.json
 service_log.txt
 service_error.txt
 
