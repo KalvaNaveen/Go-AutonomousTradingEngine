@@ -393,14 +393,40 @@ func Run(cache *agents.DailyCache, universe map[uint32]string, cfg Config) *Resu
 // Uses the same detection math as the live scanner via exported agents helpers.
 func detectSignalAt(closes, highs, lows, volumes []float64, cfg Config) string {
 	strat := cfg.Strategy
+	ltp := closes[len(closes)-1]
 
-	// VCP Breakout
+	// VCP Breakout (Book Ch.4)
 	if strat == "ALL" || strat == "VCP_BREAKOUT" {
-		if resistance, _, formed := agents.DetectVCPFromSlice(closes, highs, lows, volumes); formed {
-			ltp := closes[len(closes)-1]
-			if ltp >= resistance {
-				return "VCP_BREAKOUT"
-			}
+		if resistance, _, formed := agents.DetectVCPFromSlice(closes, highs, lows, volumes); formed && ltp >= resistance {
+			return "VCP_BREAKOUT"
+		}
+	}
+
+	// Cup & Handle breakout (Book Ch.4)
+	if strat == "ALL" || strat == "CUP_HANDLE" {
+		if rimHigh, _, formed := agents.DetectCupHandleFromSlice(closes, highs, lows, volumes); formed && ltp >= rimHigh {
+			return "CUP_HANDLE"
+		}
+	}
+
+	// Flat Base breakout (Book Ch.4)
+	if strat == "ALL" || strat == "FLAT_BASE" {
+		if flatTop, _, formed := agents.DetectFlatBaseFromSlice(closes, highs, volumes); formed && ltp >= flatTop {
+			return "FLAT_BASE"
+		}
+	}
+
+	// Bull Flag breakout (Book Ch.4)
+	if strat == "ALL" || strat == "BULL_FLAG" {
+		if flagHigh, _, formed := agents.DetectBullFlagFromSlice(closes, highs, lows, volumes); formed && ltp >= flagHigh {
+			return "BULL_FLAG"
+		}
+	}
+
+	// Trend Channel breakout (Book Ch.4)
+	if strat == "ALL" || strat == "TREND_CHANNEL" {
+		if _, channelHigh, formed := agents.DetectTrendChannelFromSlice(closes, highs, lows); formed && ltp >= channelHigh {
+			return "TREND_CHANNEL"
 		}
 	}
 

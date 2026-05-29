@@ -53,6 +53,10 @@ const SELECT_OPTIONS = {
   strategy: [
     { value: 'ALL',           label: 'All Strategies' },
     { value: 'VCP_BREAKOUT',  label: 'VCP Breakout' },
+    { value: 'CUP_HANDLE',    label: 'Cup & Handle' },
+    { value: 'FLAT_BASE',     label: 'Flat Base' },
+    { value: 'BULL_FLAG',     label: 'Bull Flag' },
+    { value: 'TREND_CHANNEL', label: 'Trend Channel' },
   ],
 };
 
