@@ -79,6 +79,12 @@ type Result struct {
 	AvgHoldingBars  float64   `json:"avg_holding_bars"`
 	EquityCurve     []float64 `json:"equity_curve"`
 	Trades          []Trade   `json:"trades"`
+
+	// Diagnostics — explain WHY trades were (or weren't) taken.
+	NormalDays      int `json:"normal_days"`       // bars where regime allowed entries
+	DefensiveDays   int `json:"defensive_days"`    // bars blocked by DEFENSIVE regime
+	RawSignals      int `json:"raw_signals"`       // pattern breakouts detected (pre-regime)
+	BlockedByRegime int `json:"blocked_by_regime"` // signals skipped because regime was DEFENSIVE
 }
 
 // simPosition tracks one open simulated position.
@@ -151,6 +157,11 @@ func Run(cache *agents.DailyCache, universe map[uint32]string, cfg Config) *Resu
 	for day := startBar; day < totalBars-1; day++ {
 		// ── Regime filter ─────────────────────────────────────
 		regime := detectRegimeAt(cache, day)
+		if regime == "DEFENSIVE" {
+			result.DefensiveDays++
+		} else {
+			result.NormalDays++
+		}
 
 		// ── Manage open positions (always, regardless of regime) ──
 		for token, pos := range openPositions {
@@ -163,8 +174,10 @@ func Run(cache *agents.DailyCache, universe map[uint32]string, cfg Config) *Resu
 			}
 		}
 
-		// ── Scan for new entries (only when not DEFENSIVE) ────
-	    if regime != "DEFENSIVE" && len(openPositions) < maxPos {
+		// ── Scan for new entries. Candidates are collected regardless of regime
+		// (so RawSignals reflects true detector activity); positions are only
+		// OPENED when the regime is not DEFENSIVE (book: sit out weak markets). ──
+	    if len(openPositions) < maxPos {
 			// ── Pass 1: collect ALL candidates for this day ──────────────────
 			// Then rank by volume spike ratio so the highest-conviction breakout
 			// fills the slot — not just whichever token happens to come first.
@@ -269,6 +282,15 @@ func Run(cache *agents.DailyCache, universe map[uint32]string, cfg Config) *Resu
 					token: token, symbol: symbol, strat: strat,
 					nextOpen: nextOpen, sl: sl, qty: qty, volSpike: volSpike,
 				})
+			}
+
+			// Diagnostics: every candidate is a real pattern breakout detected.
+			result.RawSignals += len(candidates)
+			if regime == "DEFENSIVE" {
+				// Book rule: sit out weak markets. Count what we skipped, open nothing.
+				result.BlockedByRegime += len(candidates)
+				equityCurve = append(equityCurve, capital+unrealizedAt(cache, openPositions, day))
+				continue
 			}
 
 			// ── Pass 2: rank by volume spike descending, enter top N ─────────
