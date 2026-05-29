@@ -410,50 +410,16 @@ func Run(cache *agents.DailyCache, universe map[uint32]string, cfg Config) *Resu
 
 // ── Signal detection ─────────────────────────────────────────────
 
-// detectSignalAt checks all enabled strategies on pre-sliced OHLCV arrays.
-// Returns the strategy name of the first signal that fires, or "".
-// Uses the same detection math as the live scanner via exported agents helpers.
+// detectSignalAt checks the engine's sole entry setup on pre-sliced OHLCV arrays.
+// Returns the strategy name if the EMA pullback/bounce fired, or "".
+// Uses the same detection math as the live scanner (agents.DetectEMAPullbackFromSlice).
 func detectSignalAt(closes, highs, lows, volumes []float64, cfg Config) string {
 	strat := cfg.Strategy
-	ltp := closes[len(closes)-1]
-
-	// VCP Breakout (Book Ch.4)
-	if strat == "ALL" || strat == "VCP_BREAKOUT" {
-		if resistance, _, formed := agents.DetectVCPFromSlice(closes, highs, lows, volumes); formed && ltp >= resistance {
-			return "VCP_BREAKOUT"
+	if strat == "ALL" || strat == "EMA_PULLBACK" {
+		if _, formed := agents.DetectEMAPullbackFromSlice(closes, highs, lows, volumes); formed {
+			return "EMA_PULLBACK"
 		}
 	}
-
-	// Cup & Handle breakout (Book Ch.4)
-	if strat == "ALL" || strat == "CUP_HANDLE" {
-		if rimHigh, _, formed := agents.DetectCupHandleFromSlice(closes, highs, lows, volumes); formed && ltp >= rimHigh {
-			return "CUP_HANDLE"
-		}
-	}
-
-	// Flat Base breakout (Book Ch.4)
-	if strat == "ALL" || strat == "FLAT_BASE" {
-		if flatTop, _, formed := agents.DetectFlatBaseFromSlice(closes, highs, volumes); formed && ltp >= flatTop {
-			return "FLAT_BASE"
-		}
-	}
-
-	// Bull Flag breakout (Book Ch.4)
-	if strat == "ALL" || strat == "BULL_FLAG" {
-		if flagHigh, _, formed := agents.DetectBullFlagFromSlice(closes, highs, lows, volumes); formed && ltp >= flagHigh {
-			return "BULL_FLAG"
-		}
-	}
-
-	// Trend Channel breakout (Book Ch.4)
-	if strat == "ALL" || strat == "TREND_CHANNEL" {
-		if _, channelHigh, formed := agents.DetectTrendChannelFromSlice(closes, highs, lows); formed && ltp >= channelHigh {
-			return "TREND_CHANNEL"
-		}
-	}
-
-	// IPO_BASE is skipped — requires external IPO symbol list not available in backtest.
-
 	return ""
 }
 

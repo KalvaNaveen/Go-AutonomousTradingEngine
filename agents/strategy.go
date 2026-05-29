@@ -16,26 +16,14 @@ type StrategyAgent interface {
 	Detect(token uint32, symbol string, ltp float64, regime string, ctx StrategyContext) *Signal
 }
 
-// AllStrategies returns every registered standalone strategy agent in scan priority order.
-// Book Ch.4+5+11: Priority = strongest pattern → most autonomous entry.
-//
-// Order rationale:
-//  1. VCP        — highest win-rate; large base, clean risk/reward (Ch.4 p.55)
-//  2. Cup&Handle — next most reliable; rounded base, institutional accumulation (Ch.4 p.86)
-//  3. Flat Base  — very tight range above SMA200; reliable continuation (Ch.4 p.120)
-//  4. Bull Flag  — continuation after momentum run; high probability (Ch.4 p.68)
-//  5. Trend Channel — pullback to support; works in calm uptrends (Ch.4 p.103)
-//  6. IPO Base   — niche; only for genuine IPO stocks within 40-day window (Ch.4 p.119)
-//
-// These six are the only setups in "Swing Trading Simplified" (Ankur Patel).
-// Non-book setups (EMA-crossover entry, CMF confirmation) were removed entirely.
+// AllStrategies returns the engine's entry setups. This is a PURE-EMA engine:
+// the only entry is the EMA pullback/bounce from "Swing Trading Simplified"
+// (Ankur Patel) Ch.3 p.44-49 — a stock in a confirmed uptrend (10 EMA > 20 EMA,
+// both rising) pulls back to a key moving average on light volume and bounces.
+// All chart-pattern strategies (VCP, Cup & Handle, Flat Base, Bull Flag, Trend
+// Channel, IPO Base) were removed in favour of this single EMA-based setup.
 func AllStrategies() []StrategyAgent {
 	return []StrategyAgent{
-		&VCPStrategy{},
-		&CupHandleStrategy{},
-		&FlatBaseStrategy{},
-		&BullFlagStrategy{},
-		&TrendChannelStrategy{},
-		&IPOBaseStrategy{},
+		&EMAStrategy{},
 	}
 }

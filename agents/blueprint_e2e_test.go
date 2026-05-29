@@ -93,48 +93,64 @@ func TestATHFilter_AcceptsStockNearHigh(t *testing.T) {
 	}
 }
 
-// --- Section V.1: VCP Breakout ---
+// --- Section V.1: EMA Pullback (the engine's sole entry — Book Ch.3 p.44-49) ---
 
-func TestVCP_RejectsIfBelowEMA21(t *testing.T) {
-	// Doc L81: "setup is dead if stock closes below 21 EMA"
+func TestEMAPullback_RejectsDowntrend(t *testing.T) {
+	// No uptrend (10 EMA not > 20 EMA, not rising) → must NOT fire.
 	dc := makeMockCache()
-	closes := makeFlat(100, 100.0)
-	closes[len(closes)-1] = 90.0 // Last close below EMA20
-	dc.Closes[1] = closes
-	dc.Highs[1] = makeFlat(100, 105.0)
-	dc.Lows[1] = makeFlat(100, 95.0)
-	dc.EMA20[1] = 100.0
+	n := 90
+	closes := make([]float64, n)
+	highs := make([]float64, n)
+	lows := make([]float64, n)
+	volumes := make([]float64, n)
+	for i := 0; i < n; i++ {
+		c := 200.0 - float64(i) // steady downtrend
+		closes[i], highs[i], lows[i] = c, c+1, c-1
+		volumes[i] = 1000
+	}
+	dc.Closes[1], dc.Highs[1], dc.Lows[1], dc.Volumes[1] = closes, highs, lows, volumes
 
 	ctx := StrategyContext{Cache: dc, CapitalMultiplier: 1.0}
-	sig := (&VCPStrategy{}).Detect(1, "TEST", 110.0, "NORMAL", ctx)
-	if sig != nil {
-		t.Error("VCP should be rejected when close < 21 EMA")
+	if sig := (&EMAStrategy{}).Detect(1, "TEST", closes[n-1], "NORMAL", ctx); sig != nil {
+		t.Error("EMA pullback must be rejected in a downtrend")
 	}
 }
 
-func TestVCP_RejectsIfVolumeDIDNotDryUp(t *testing.T) {
-	// Doc L79: "volume MUST dry up during contraction"
+func TestEMAPullback_FiresOnBounce(t *testing.T) {
+	// Steady uptrend → pullback toward the 10 EMA on light volume → green bounce.
 	dc := makeMockCache()
-	closes, highs, lows := buildVCPPattern()
-	volumes := make([]float64, len(closes))
-	// Early: low volume, Late: HIGH volume (wrong — should dry up)
-	for i := range volumes {
-		if i < len(volumes)/2 {
-			volumes[i] = 100
-		} else {
-			volumes[i] = 500 // Volume INCREASED — invalid VCP
-		}
+	n := 90
+	closes := make([]float64, n)
+	highs := make([]float64, n)
+	lows := make([]float64, n)
+	volumes := make([]float64, n)
+	// Bars 0..82: steady rise (price extended above EMAs); heavier volume.
+	for i := 0; i < n; i++ {
+		c := 100.0 + float64(i)*1.0 // rise to ~189
+		closes[i], highs[i], lows[i] = c, c+1.0, c-1.0
+		volumes[i] = 2000
 	}
-	dc.Closes[1] = closes
-	dc.Highs[1] = highs
-	dc.Lows[1] = lows
-	dc.Volumes[1] = volumes
-	dc.EMA20[1] = 80.0
+	// Bars 83..88: pullback toward the 10 EMA on LIGHT volume (dip the lows).
+	for i := 83; i <= 88; i++ {
+		dip := closes[82] - 6.0 // pull back ~6 below the pre-pullback close
+		closes[i] = dip
+		highs[i] = dip + 1.0
+		lows[i] = dip - 1.0
+		volumes[i] = 700 // lighter than the prior 2000
+	}
+	// Last bar: green bounce back up, reclaiming the fast EMA.
+	closes[n-1] = closes[82] + 1.0
+	highs[n-1] = closes[n-1] + 1.0
+	lows[n-1] = closes[88]
+	volumes[n-1] = 700
+	dc.Closes[1], dc.Highs[1], dc.Lows[1], dc.Volumes[1] = closes, highs, lows, volumes
 
 	ctx := StrategyContext{Cache: dc, CapitalMultiplier: 1.0}
-	sig := (&VCPStrategy{}).Detect(1, "TEST", highs[len(highs)-1]+5, "NORMAL", ctx)
-	if sig != nil {
-		t.Error("VCP should be rejected when volume did NOT dry up")
+	sig := (&EMAStrategy{}).Detect(1, "TEST", closes[n-1], "NORMAL", ctx)
+	if sig == nil {
+		t.Error("EMA pullback should fire on a clean uptrend pullback-and-bounce")
+	} else if sig.Strategy != "EMA_PULLBACK" {
+		t.Errorf("expected EMA_PULLBACK, got %s", sig.Strategy)
 	}
 }
 
