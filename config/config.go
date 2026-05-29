@@ -142,16 +142,20 @@ const (
 
 // Data lookback windows
 const (
-	// EODLookbackDays is the history fetched for every equity in the universe.
-	// 500 bars ≈ 2 years of trading days. Needed for:
+	// EODLookbackDays is the history (calendar days) fetched for every equity.
+	// 1500 calendar days ≈ ~1000 trading bars (~4 years). Needed for:
 	//   • All-Time High proxy (ATH filter requires multi-year context)
-	//   • EMA10/EMA20 warm-up and VCP pattern detection (60 bars)
-	//   • Backtest engine: 2-year simulation window
-	EODLookbackDays = 500
+	//   • EMA10/EMA20 warm-up and VCP pattern detection
+	//   • Backtest engine: deep window spanning both bull and bear regimes so
+	//     strategies can be validated across market conditions (not just the
+	//     recent downtrend, where the book correctly sits out and trades 0).
+	EODLookbackDays = 1500
 
-	// RegimeLookbackDays is used only for the two regime-index tokens
-	// (NiftySpot, SmallcapToken) which need 420 bars: 200 for SMA200 + buffer.
-	RegimeLookbackDays = 420
+	// RegimeLookbackDays MUST equal EODLookbackDays so the Nifty/Smallcap regime
+	// arrays are the SAME length and date-aligned with the equity arrays — the
+	// backtest indexes regime by the same bar index as each stock, so a mismatch
+	// would check the wrong date's regime. (Index 0 = same calendar date for all.)
+	RegimeLookbackDays = 1500
 )
 
 // Section V: Technical Entry Setups
