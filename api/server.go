@@ -412,12 +412,6 @@ func (s *Server) handleBacktestRun(w http.ResponseWriter, r *http.Request) {
 	if cfg.Capital <= 0 {
 		cfg.Capital = config.TotalCapital
 	}
-	if cfg.CMFBuyThreshold == 0 {
-		cfg.CMFBuyThreshold = config.CMFBuyThreshold
-	}
-	if cfg.CMFSellThreshold == 0 {
-		cfg.CMFSellThreshold = config.CMFSellThreshold
-	}
 	if cfg.SLFloorPct == 0 {
 		cfg.SLFloorPct = config.SLFloorPct
 	}

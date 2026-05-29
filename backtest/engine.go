@@ -23,11 +23,9 @@ import (
 
 // Config holds all tunable parameters for one backtest run.
 type Config struct {
-	Strategy         string  `json:"strategy"`            // "ALL","EMA_CROSS","VCP_BREAKOUT","IPO_BASE"
+	Strategy         string  `json:"strategy"`            // "ALL","VCP_BREAKOUT","IPO_BASE"
 	StartBarOffset   int     `json:"start_bar_offset"`    // bars from end to simulate (e.g. 250 = ~1 year)
 	Capital          float64 `json:"capital"`
-	CMFBuyThreshold  float64 `json:"cmf_buy_threshold"`   // default 0.05 (Chaikin)
-	CMFSellThreshold float64 `json:"cmf_sell_threshold"`  // default -0.05
 	SLFloorPct       float64 `json:"sl_floor_pct"`        // default 1.5
 	SLCeilingPct     float64 `json:"sl_ceiling_pct"`      // default 3.0
 	MaxTradeAllocPct float64 `json:"max_trade_alloc_pct"` // default 20.0
@@ -396,13 +394,6 @@ func Run(cache *agents.DailyCache, universe map[uint32]string, cfg Config) *Resu
 func detectSignalAt(closes, highs, lows, volumes []float64, cfg Config) string {
 	strat := cfg.Strategy
 
-	// EMA Crossover
-	if strat == "ALL" || strat == "EMA_CROSS" {
-		if agents.DetectEMACrossFromSlice(closes, highs, lows, volumes, cfg.CMFBuyThreshold) {
-			return "EMA_CROSS"
-		}
-	}
-
 	// VCP Breakout
 	if strat == "ALL" || strat == "VCP_BREAKOUT" {
 		if resistance, _, formed := agents.DetectVCPFromSlice(closes, highs, lows, volumes); formed {
@@ -422,11 +413,7 @@ func detectSignalAt(closes, highs, lows, volumes []float64, cfg Config) string {
 
 func checkExit(cache *agents.DailyCache, token uint32, pos *simPosition, day int, cfg Config) (float64, string) {
 	closes := cache.Closes[token]
-	lows := cache.Lows[token]
-	highs := cache.Highs[token]
-	volumes := cache.Volumes[token]
-	minLen := min4(len(closes), len(highs), len(lows), len(volumes))
-	if day >= minLen {
+	if day >= len(closes) {
 		return 0, ""
 	}
 
@@ -440,15 +427,7 @@ func checkExit(cache *agents.DailyCache, token uint32, pos *simPosition, day int
 		return pos.sl, "HARD_SL"
 	}
 
-	// Trailing stop — ratchet up only, never down
-	gainPct := (ltp - pos.entryPrice) / pos.entryPrice * 100
-	if gainPct >= 25 && pos.entryPrice*1.10 > pos.sl {
-		pos.sl = pos.entryPrice * 1.10
-	} else if gainPct >= 15 && pos.entryPrice > pos.sl {
-		pos.sl = pos.entryPrice // trail to breakeven
-	}
-
-	// EMA20 exit: 2 consecutive red candles below EMA20
+	// EMA20 exit: single EOD close below EMA20 (Book Ch.6 p.167)
 	if day > 0 {
 		ema20 := computeLastEMA(closes[:day+1], config.EMA20Period)
 		if ema20 > 0 {
@@ -462,21 +441,6 @@ func checkExit(cache *agents.DailyCache, token uint32, pos *simPosition, day int
 				pos.redBelow = 0
 			}
 		}
-	}
-
-	// CMF sell pressure exit
-	if day >= config.CMFPeriod && len(lows) > 1 {
-		cmf := computeCMF(closes[:day+1], highs[:day+1], lows[:day+1], volumes[:day+1], config.CMFPeriod)
-		if cmf <= cfg.CMFSellThreshold && ltp < lows[day-1] {
-			return ltp, "CMF_SELL"
-		}
-	}
-
-	// Time stop: exit positions that haven't become profitable after TimeStopBars.
-	// Dead setups that drift flat or sideways tie up capital. 15 bars ≈ 3 trading weeks.
-	// Only fires when ltp ≤ entryPrice — if the position is in profit, let it run.
-	if day-pos.entryBar >= config.TimeStopBars && ltp <= pos.entryPrice {
-		return ltp, "TIME_STOP"
 	}
 
 	return 0, ""
@@ -509,27 +473,6 @@ func computeSMA(closes []float64, period int) float64 {
 		sum += c
 	}
 	return sum / float64(period)
-}
-
-func computeCMF(closes, highs, lows, volumes []float64, period int) float64 {
-	n := len(closes)
-	if n < period {
-		return 0
-	}
-	var sumMFV, sumVol float64
-	for i := n - period; i < n; i++ {
-		h, l, rng := highs[i], lows[i], highs[i]-lows[i]
-		if rng <= 0 || volumes[i] <= 0 {
-			continue
-		}
-		clv := (2*closes[i] - h - l) / rng
-		sumMFV += clv * volumes[i]
-		sumVol += volumes[i]
-	}
-	if sumVol == 0 {
-		return 0
-	}
-	return sumMFV / sumVol
 }
 
 func computeEMASeries(closes []float64, period int) []float64 {

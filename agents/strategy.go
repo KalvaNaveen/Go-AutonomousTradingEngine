@@ -27,8 +27,8 @@ type StrategyAgent interface {
 //  5. Trend Channel — pullback to support; works in calm uptrends (Ch.4 p.103)
 //  6. IPO Base   — niche; only for genuine IPO stocks within 40-day window (Ch.4 p.119)
 //
-// EMACrossStrategy (EMA10/20 crossover + CMF) is intentionally NOT registered: the book
-// never describes a stock-level EMA-crossover entry and CMF is not a book indicator.
+// These six are the only setups in "Swing Trading Simplified" (Ankur Patel).
+// Non-book setups (EMA-crossover entry, CMF confirmation) were removed entirely.
 func AllStrategies() []StrategyAgent {
 	return []StrategyAgent{
 		&VCPStrategy{},

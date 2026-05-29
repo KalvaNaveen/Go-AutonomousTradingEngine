@@ -174,7 +174,6 @@ func main() {
 	scanner.GetORB = func(token uint32) (float64, float64) { return tickStore.GetORB(token) }
 	scanner.GetDayOpen = func(token uint32) float64 { return tickStore.GetDayOpen(token) }
 	scanner.ComputeRVol = func(token uint32) float64 { return 1.0 }
-	scanner.GetIndiaVIX = func() float64 { return tickStore.GetLTPIfFresh(config.IndiaVIXToken) }
 	scanner.GetADRatio = scanner.ComputeADRatio
 
 	// (OI filter removed — F&O open interest is not in the book; the engine trades

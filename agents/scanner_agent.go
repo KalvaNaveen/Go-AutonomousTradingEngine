@@ -75,7 +75,6 @@ type ScannerAgent struct {
 	GetORB       func(uint32) (float64, float64)
 	GetDayOpen   func(uint32) float64
 	ComputeRVol  func(uint32) float64
-	GetIndiaVIX  func() float64
 	GetADRatio   func() float64
 
 	// Precomputed daily data
@@ -351,7 +350,7 @@ func (s *ScannerAgent) RunAllScans(regime string) []*Signal {
 
 	ctx := StrategyContext{
 		Cache:             s.DailyCache,
-		CapitalMultiplier: effectiveCapMult, // VIX-adjusted multiplier
+		CapitalMultiplier: effectiveCapMult, // progressive-risk multiplier (Ch.8 p.203)
 		GetVolume:         s.GetVolume,
 		IPOSymbols:        s.IPOSymbols,
 		IsMajorEventDay:   s.IsMajorEventDay,
@@ -494,34 +493,6 @@ func (s *ScannerAgent) RunAllScans(regime string) []*Signal {
 	return signals
 }
 
-
-// computeCMF calculates Chaikin Money Flow over the last `period` bars.
-// Retained only as a library helper for the backtest validation tool; not used by
-// the live book-pure trading path (CMF is not a book indicator).
-// CLV = (2×Close − High − Low) / (High − Low); ranges −1 to +1.
-// CMF = Σ(CLV×Volume) / Σ(Volume). Source: Chaikin Analytics (the indicator's creator).
-func computeCMF(closes, highs, lows, volumes []float64, period int) float64 {
-	n := len(closes)
-	if n < period || len(highs) < period || len(lows) < period || len(volumes) < period {
-		return 0
-	}
-	var sumMFV, sumVol float64
-	for i := n - period; i < n; i++ {
-		h := highs[i]
-		l := lows[i]
-		rng := h - l
-		if rng <= 0 || volumes[i] <= 0 {
-			continue
-		}
-		clv := (2*closes[i] - h - l) / rng
-		sumMFV += clv * volumes[i]
-		sumVol += volumes[i]
-	}
-	if sumVol == 0 {
-		return 0
-	}
-	return sumMFV / sumVol
-}
 
 // computeSMA calculates the simple moving average of the last `period` values.
 func computeSMA(closes []float64, period int) float64 {

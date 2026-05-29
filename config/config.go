@@ -230,8 +230,6 @@ func LoadOverride(path string) {
 	}
 	var ov struct {
 		Capital          float64 `json:"capital"`
-		CMFBuyThreshold  float64 `json:"cmf_buy_threshold"`
-		CMFSellThreshold float64 `json:"cmf_sell_threshold"`
 		SLFloorPct       float64 `json:"sl_floor_pct"`
 		SLCeilingPct     float64 `json:"sl_ceiling_pct"`
 		MaxTradeAllocPct float64 `json:"max_trade_alloc_pct"`
@@ -242,12 +240,6 @@ func LoadOverride(path string) {
 	}
 	if ov.Capital > 0 {
 		TotalCapital = ov.Capital
-	}
-	if ov.CMFBuyThreshold != 0 {
-		CMFBuyThreshold = ov.CMFBuyThreshold
-	}
-	if ov.CMFSellThreshold != 0 {
-		CMFSellThreshold = ov.CMFSellThreshold
 	}
 	if ov.SLFloorPct > 0 {
 		SLFloorPct = ov.SLFloorPct
@@ -350,29 +342,10 @@ const (
 	// Book Ch.6 p.167-168: "Close below the key MA — sell on that day." (Figs 6.4, 6.5)
 	RedCandlesBelowEMA = 1  // Single EOD close below EMA = exit (Ch.6 rule)
 
-	// TimeStopBars: exit a position that has not become profitable within this many
-	// trading bars. Avoids locking capital in dead setups that neither trigger SL nor
-	// show upside. 15 bars ≈ 3 trading weeks — enough for a breakout to confirm.
-	TimeStopBars = 15
-
-	// Chaikin Money Flow (CMF) — buying/selling pressure indicator.
-	// CMF(N) = Σ(CLV × Volume) / Σ(Volume)  where CLV = (2C-L-H)/(H-L)
-	// Ranges from -1 (all selling) to +1 (all buying).
-	// Thresholds from Chaikin Analytics (the indicator's creator):
-	//   > 0.05 = buying pressure sustained enough to confirm entry
-	//   < -0.05 = selling pressure sustained enough to trigger exit
-	CMFPeriod = 20 // Standard 20-day window (Chaikin's own default)
-
 	// PaperSlippagePct: realistic fill simulation for paper/backtest mode.
 	// NSE liquid stocks face ~0.1–0.3% adverse price movement between signal and fill.
 	// Applied as a percentage markup on the entry price in paper mode only.
 	PaperSlippagePct = 0.3
-)
-
-// CMF thresholds are vars so Apply Config can tune them at runtime.
-var (
-	CMFBuyThreshold  = 0.05  // Entry gate: CMF must be net positive
-	CMFSellThreshold = -0.05 // Exit gate: CMF net negative = sustained distribution
 )
 
 // VolumeSpikeMultiplier: used only for the live intraday volume check at signal time.
@@ -734,7 +707,7 @@ func ParseTime(s string) (int, int) {
 func PrintBanner() {
 	maxPos := ComputeMaxPositions(TotalCapital)
 	fmt.Println("═══════════════════════════════════════════")
-	fmt.Println("  QUANTIX ENGINE v5.0 — SMA200 + CMF System")
+	fmt.Println("  QUANTIX ENGINE v5.0 — True Book Replica (Swing Trading Simplified)")
 	fmt.Println("  Universe: Nifty Total Market 750")
 	fmt.Println("═══════════════════════════════════════════")
 	if PaperMode {
