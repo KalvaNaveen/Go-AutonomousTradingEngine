@@ -8,11 +8,14 @@ import (
 	"time"
 )
 
-// SlippagePct simulates market impact — buy costs more, sell receives less
-const SlippagePct = 0.0004 // 0.04%
+// SlippagePct simulates market impact — buy costs more, sell receives less.
+// Matches the backtest engine's default cfg.SlippagePct = 0.3% so paper P&L
+// is directly comparable to backtest results.
+const SlippagePct = 0.003 // 0.3%
 
-// BrokerageFee per order (Zerodha flat fee)
-const BrokerageFee = 20.0
+// BrokerageFee per order (Zerodha flat fee for equity delivery = ₹0, intraday = ₹20).
+// CNC (delivery) trades have zero Zerodha brokerage — only exchange charges apply.
+const BrokerageFee = 0.0
 
 // PaperOrder represents a virtual order in the paper order book
 type PaperOrder struct {
@@ -275,9 +278,12 @@ func (pb *RealisticPaperBroker) fillOrder(oid string, fillPrice float64) {
 	o.PendingQty = 0
 	o.AveragePrice = execPrice
 
-	// Charge brokerage
-	pb.TotalBrokerage += BrokerageFee
-	pb.RealisedPnl -= BrokerageFee
+	// Realistic NSE charges (STT, exchange, SEBI, stamp, GST) — same model as backtest
+	turnover := execPrice * float64(o.Quantity)
+	isBuy := o.TransactionType == "BUY"
+	charges := computeNSECharges(turnover, isBuy)
+	pb.TotalBrokerage += charges
+	pb.RealisedPnl -= charges
 
 	sym := o.Symbol
 	qty := o.Quantity
@@ -393,6 +399,28 @@ func (pb *RealisticPaperBroker) GetSummary() map[string]interface{} {
 		"available_margin": math.Round(pb.AvailableMargin*100) / 100,
 		"capital_deployed": math.Round(openExposure*100) / 100,
 	}
+}
+
+// computeNSECharges returns the total regulatory charges for one CNC equity leg.
+// Mirrors the backtest engine's charge model so paper P&L matches backtest P&L.
+//
+//	STT (sell side only for CNC delivery): 0.1% of turnover
+//	Exchange transaction charge: 0.00345% of turnover (NSE equity)
+//	SEBI turnover fee: 0.0001% of turnover
+//	Stamp duty (buy side only): 0.015% of turnover
+//	GST (18% on brokerage + exchange charges)
+func computeNSECharges(turnover float64, isBuy bool) float64 {
+	stt := 0.0
+	stamp := 0.0
+	if isBuy {
+		stamp = turnover * 0.00015 // 0.015% stamp duty on buy side
+	} else {
+		stt = turnover * 0.001 // 0.1% STT on sell side for CNC
+	}
+	exchange := turnover * 0.0000345 // NSE equity segment charge
+	sebi := turnover * 0.000001      // SEBI turnover fee
+	gst := (exchange + sebi) * 0.18  // 18% GST on exchange + SEBI fees
+	return stt + exchange + sebi + gst + stamp
 }
 
 // Stop terminates the background fill loop

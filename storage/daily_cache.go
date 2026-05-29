@@ -34,6 +34,8 @@ type DailyCache struct {
 
 type DailyCacheEntry struct {
 	Symbol       string
+	Dates        []string
+	Opens        []float64 // Daily open prices — backtest enters at next bar open
 	Closes       []float64
 	Highs        []float64
 	Lows         []float64
@@ -112,15 +114,19 @@ func (dc *DailyCache) Preload(universe map[uint32]string) bool {
 					continue
 				}
 
+				opens := make([]float64, len(dailyData))
 				closes := make([]float64, len(dailyData))
 				highs := make([]float64, len(dailyData))
 				lows := make([]float64, len(dailyData))
 				volumes := make([]float64, len(dailyData))
+				dates := make([]string, len(dailyData))
 				for i, d := range dailyData {
+					opens[i] = d.Open
 					closes[i] = d.Close
 					highs[i] = d.High
 					lows[i] = d.Low
 					volumes[i] = float64(d.Volume)
+					dates[i] = d.Date
 				}
 
 				ema10Slice := data.ComputeEMA(closes, config.EMA10Period)
@@ -162,6 +168,8 @@ func (dc *DailyCache) Preload(universe map[uint32]string) bool {
 				dc.mu.Lock()
 				dc.store[job.token] = &DailyCacheEntry{
 					Symbol:       job.symbol,
+					Dates:        dates,
+					Opens:        opens,
 					Closes:       closes,
 					Highs:        highs,
 					Lows:         lows,
@@ -210,6 +218,7 @@ func (dc *DailyCache) ToScannerCache() *agents.DailyCache {
 		ATR:          make(map[uint32]float64),
 		EMA10:        make(map[uint32]float64),
 		EMA20:        make(map[uint32]float64),
+		Opens:        make(map[uint32][]float64),
 		Closes:       make(map[uint32][]float64),
 		Highs:        make(map[uint32][]float64),
 		Lows:         make(map[uint32][]float64),
@@ -226,6 +235,7 @@ func (dc *DailyCache) ToScannerCache() *agents.DailyCache {
 		sc.ATR[token] = entry.ATR14
 		sc.EMA10[token] = entry.EMA10
 		sc.EMA20[token] = entry.EMA20
+		sc.Opens[token] = entry.Opens
 		sc.Closes[token] = entry.Closes
 		sc.Highs[token] = entry.Highs
 		sc.Lows[token] = entry.Lows
@@ -235,9 +245,17 @@ func (dc *DailyCache) ToScannerCache() *agents.DailyCache {
 		sc.PivotSupport[token] = entry.PivotSupport
 		sc.High52W[token] = entry.High52W
 		sc.RSScore[token] = entry.RSScore
+		if len(entry.Dates) > len(sc.TradingDates) {
+			sc.TradingDates = entry.Dates
+		}
 	}
 
 	return sc
+}
+
+// ExportAgentsCache is an alias for ToScannerCache — used by the backtest API handler.
+func (dc *DailyCache) ExportAgentsCache() *agents.DailyCache {
+	return dc.ToScannerCache()
 }
 
 func (dc *DailyCache) IsLoaded() bool {

@@ -135,16 +135,29 @@ func RunEODMarketScan(deps EODScanDeps, scanner *ScannerAgent) {
 		return
 	}
 
-	// Step 6: Build and send Telegram summary
+	// Step 6: Bird's Eye View — Ch.10 full market health report (sent separately)
+	// Must run AFTER cache is loaded so the breadth calculations have data.
+	// scanner.DailyCache may differ from scanCache (extended universe); update it.
+	origCache := scanner.DailyCache
+	scanner.DailyCache = scanCache
+	scanner.RunBirdsEyeView()
+	scanner.DailyCache = origCache
+
+	// Step 7: Build and send Telegram summary
 	summary := buildEODSummary(results, scanned, buyCount, sellCount, elapsed)
+	// Append Book Ch.11 scans: trigger candles, tight range, MOMO leaders
+	bookScans := EODBookScans(scanCache, eodUniverse, deps.GetLiveLTP, deps.GetLiveVolume)
+	if bookScans != "" {
+		summary += bookScans
+	}
 	SendTelegram(summary)
 
-	// Step 7: Send CSV via Telegram
+	// Step 8: Send CSV via Telegram
 	caption := fmt.Sprintf("📊 EOD Scan — %s | %d BUY | %d SELL",
 		config.NowIST().Format("02 Jan 2006"), buyCount, sellCount)
 	SendTelegramDocument(csvPath, caption)
 
-	// Step 8: Cleanup old CSV files
+	// Step 9: Cleanup old CSV files
 	cleanupOldCSVs()
 
 	log.Printf("[EODScan] ═══ EOD MARKET SCAN COMPLETE (%d results, %.1f sec) ═══",
@@ -339,6 +352,15 @@ func classifyStock(
 	if avgVolume > 0 && volume >= avgVolume*1.0 {
 		buyScore++
 	}
+	// 5b. Book Ch.11: Trigger candle — volume ≥ 3× AND price change ≥ 6.5% (p.272)
+	// Strong conviction breakout — double weight.
+	if avgVolume > 0 && volume >= avgVolume*config.TriggerCandleVolMultiplier &&
+		len(closes) >= 2 && closes[len(closes)-2] > 0 {
+		dayChange := (ltp - closes[len(closes)-2]) / closes[len(closes)-2] * 100
+		if dayChange >= config.TriggerCandlePricePct {
+			buyScore += 2 // Trigger candle = strong momentum launch
+		}
+	}
 	// 6. Technical pattern detected
 	if pattern != "" {
 		buyScore += 2 // Strong signal boost
@@ -400,30 +422,17 @@ func classifyStock(
 // detectPatternForEOD checks for known patterns without generating trade signals.
 // Returns the pattern name or "".
 func detectPatternForEOD(token uint32, symbol string, ltp float64, cache *DailyCache, scanner *ScannerAgent) string {
-	// Temporarily create a minimal scanner context for pattern detection
-	tempScanner := &ScannerAgent{
-		DailyCache:        cache,
+	ctx := StrategyContext{
+		Cache:             cache,
 		CapitalMultiplier: 1.0,
-		IPOSymbols:        scanner.IPOSymbols,
-		IsMajorEventDay:   false, // Don't suppress for EOD scan
 		GetVolume:         scanner.GetVolume,
-		GetLTP:            scanner.GetLTP,
+		IPOSymbols:        scanner.IPOSymbols,
+		IsMajorEventDay:   false, // Don't suppress patterns on EOD scan
 	}
-
-	if sig := tempScanner.detectVCPBreakout(token, symbol, ltp, "NORMAL"); sig != nil {
-		return "VCP_BREAKOUT"
-	}
-	if sig := tempScanner.detectBullFlag(token, symbol, ltp, "NORMAL"); sig != nil {
-		return "BULL_FLAG"
-	}
-	if sig := tempScanner.detectCupWithHandle(token, symbol, ltp, "NORMAL"); sig != nil {
-		return "CUP_HANDLE"
-	}
-	if sig := tempScanner.detectTrendChannel(token, symbol, ltp, "NORMAL"); sig != nil {
-		return "TREND_CHANNEL"
-	}
-	if sig := tempScanner.detectIPOBaseBreakout(token, symbol, ltp, "NORMAL"); sig != nil {
-		return "IPO_BASE"
+	for _, strat := range AllStrategies() {
+		if sig := strat.Detect(token, symbol, ltp, "NORMAL", ctx); sig != nil {
+			return sig.Strategy
+		}
 	}
 	return ""
 }
@@ -511,6 +520,138 @@ func generateEODCSV(results []EODScanResult) (string, error) {
 // ══════════════════════════════════════════════════════════════
 //  Telegram Summary Builder
 // ══════════════════════════════════════════════════════════════
+
+// ══════════════════════════════════════════════════════════════
+//  Book Ch.11: Supplementary Scan Results (appended to EOD summary)
+// ══════════════════════════════════════════════════════════════
+
+// EODBookScans runs the three extra scans from Book Ch.11:
+//  1. Trigger Candle Scan (p.272): volume ≥ 3× 50-day avg + price ≥ 6.5%
+//  2. Tight Range Scan (p.271): today ≤ ±2.5%, yesterday ≤ ±3.5%
+//  3. Monthly Gainers / MOMO Scan (p.269): % change thresholds across timeframes
+//
+// Returns Telegram-formatted text to append to the EOD summary.
+func EODBookScans(cache *DailyCache, universe map[uint32]string, getLTP func(uint32) float64, getVol func(uint32) int64) string {
+	if cache == nil || !cache.Loaded {
+		return ""
+	}
+
+	var triggerCandles, tightRange, momoLeaders []string
+
+	for token, symbol := range universe {
+		closes, cOk := cache.Closes[token]
+		volumes, vOk := cache.Volumes[token]
+		if !cOk || len(closes) < 2 {
+			continue
+		}
+
+		ltp := closes[len(closes)-1]
+		if getLTP != nil {
+			if live := getLTP(token); live > 0 {
+				ltp = live
+			}
+		}
+		if ltp < config.MinStockPrice {
+			continue
+		}
+
+		prevClose := closes[len(closes)-2]
+		if prevClose <= 0 {
+			continue
+		}
+		todayChangePct := (ltp - prevClose) / prevClose * 100
+
+		// ── 1. Trigger Candle Scan (Book p.272) ──────────────────────────────
+		// "Volume > 3× 50-day average AND price change > 6.5%"
+		if vOk && len(volumes) >= 51 {
+			var avg50 float64
+			for _, v := range volumes[len(volumes)-51 : len(volumes)-1] {
+				avg50 += v
+			}
+			avg50 /= 50
+			currentVol := float64(volumes[len(volumes)-1])
+			if getVol != nil {
+				if live := float64(getVol(token)); live > 0 {
+					currentVol = live
+				}
+			}
+			if avg50 > 0 && currentVol >= avg50*config.TriggerCandleVolMultiplier &&
+				todayChangePct >= config.TriggerCandlePricePct {
+				triggerCandles = append(triggerCandles,
+					fmt.Sprintf("`%s` +%.1f%% vol=%.0fx", symbol, todayChangePct, currentVol/avg50))
+			}
+		}
+
+		// ── 2. Tight Range Scan (Book p.271) ─────────────────────────────────
+		// "Today % change ≤ 2.5% (absolute), Yesterday ≤ 3.5% (absolute)"
+		if math.Abs(todayChangePct) <= 2.5 && len(closes) >= 3 {
+			prevPrevClose := closes[len(closes)-3]
+			if prevPrevClose > 0 {
+				yesterdayChangePct := math.Abs((prevClose - prevPrevClose) / prevPrevClose * 100)
+				if yesterdayChangePct <= 3.5 {
+					ema20s := computeEMASeries(closes, 20)
+					if len(ema20s) > 0 && ltp > ema20s[len(ema20s)-1] {
+						tightRange = append(tightRange,
+							fmt.Sprintf("`%s` today=%.1f%% prev=%.1f%%", symbol, todayChangePct, yesterdayChangePct))
+					}
+				}
+			}
+		}
+
+		// ── 3. Monthly Gainers / MOMO Scan (Book p.269) ──────────────────────
+		// Conditions: CMP > ₹30, 10-day > 20%, 30-day > 20%, 90-day > 30%, 180-day > 90%
+		if len(closes) >= 181 {
+			c10 := closes[len(closes)-11]
+			c30 := closes[len(closes)-31]
+			c90 := closes[len(closes)-91]
+			c180 := closes[len(closes)-181]
+			if c10 > 0 && c30 > 0 && c90 > 0 && c180 > 0 {
+				ch10 := (ltp - c10) / c10 * 100
+				ch30 := (ltp - c30) / c30 * 100
+				ch90 := (ltp - c90) / c90 * 100
+				ch180 := (ltp - c180) / c180 * 100
+				if ch10 > 20 && ch30 > 20 && ch90 > 30 && ch180 > 90 {
+					momoLeaders = append(momoLeaders,
+						fmt.Sprintf("`%s` 10d=+%.0f%% 90d=+%.0f%% 180d=+%.0f%%",
+							symbol, ch10, ch90, ch180))
+				}
+			}
+		}
+	}
+
+	out := ""
+	if len(triggerCandles) > 0 {
+		out += "\n🔥 *TRIGGER CANDLES* (3× vol + 6.5%% move):\n"
+		for i, s := range triggerCandles {
+			if i >= 8 {
+				out += fmt.Sprintf("... +%d more\n", len(triggerCandles)-8)
+				break
+			}
+			out += s + "\n"
+		}
+	}
+	if len(tightRange) > 0 {
+		out += "\n🎯 *TIGHT RANGE* (contraction setups):\n"
+		for i, s := range tightRange {
+			if i >= 8 {
+				out += fmt.Sprintf("... +%d more\n", len(tightRange)-8)
+				break
+			}
+			out += s + "\n"
+		}
+	}
+	if len(momoLeaders) > 0 {
+		out += "\n🚀 *MOMENTUM LEADERS* (MOMO scan):\n"
+		for i, s := range momoLeaders {
+			if i >= 8 {
+				out += fmt.Sprintf("... +%d more\n", len(momoLeaders)-8)
+				break
+			}
+			out += s + "\n"
+		}
+	}
+	return out
+}
 
 func buildEODSummary(results []EODScanResult, scanned, buyCount, sellCount int, elapsed time.Duration) string {
 	dateStr := config.NowIST().Format("02 Jan 2026")

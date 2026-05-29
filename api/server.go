@@ -4,6 +4,7 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"bnf_go_engine/agents"
+	"bnf_go_engine/backtest"
 	"bnf_go_engine/config"
 	"bnf_go_engine/core"
 	"bnf_go_engine/storage"
@@ -52,6 +54,9 @@ func (s *Server) Start(addr string) {
 	mux.HandleFunc("/api/trades/dates", s.handleTradesDates)
 	mux.HandleFunc("/api/summary", s.handleSummary)
 	mux.HandleFunc("/api/pnl-summary", s.handlePnlSummary)
+	mux.HandleFunc("/api/backtest/run", s.handleBacktestRun)
+	mux.HandleFunc("/api/backtest/history", s.handleBacktestHistory)
+	mux.HandleFunc("/api/config/apply", s.handleConfigApply)
 	mux.HandleFunc("/api/ws/live", s.handleWSLive)
 
 	distDir := filepath.Join(config.BaseDir, "dashboard", "dist")
@@ -134,7 +139,7 @@ func (s *Server) buildHealthData() map[string]interface{} {
 
 	return map[string]interface{}{
 		"status":       "running",
-		"engine":       "Quantix Engine v3.0",
+		"engine":       "Zenith Engine v3.0",
 		"paper_mode":   config.PaperMode,
 		"ws_connected": wsConnected,
 		"ticks_fresh":  ticksFresh,
@@ -159,17 +164,23 @@ func (s *Server) buildStatusData() map[string]interface{} {
 	openPositions := make([]map[string]interface{}, 0)
 	s.exec.Mu.RLock()
 	for oid, trade := range s.exec.ActiveTrades {
+		remainQty := trade.RemainingQty
+		if remainQty == 0 {
+			remainQty = trade.Qty
+		}
 		pos := map[string]interface{}{
-			"oid":         oid,
-			"symbol":      trade.Symbol,
-			"strategy":    trade.Strategy,
-			"entry_price": trade.EntryPrice,
-			"stop_price":  trade.StopPrice,
-			"target":      trade.TargetPrice,
-			"qty":         trade.Qty,
-			"is_short":    trade.IsShort,
-			"regime":      trade.Regime,
-			"entry_time":  trade.EntryTime.Format(time.RFC3339),
+			"oid":           oid,
+			"symbol":        trade.Symbol,
+			"strategy":      trade.Strategy,
+			"entry_price":   trade.EntryPrice,
+			"stop_price":    trade.StopPrice,
+			"target":        trade.TargetPrice,
+			"qty":           remainQty,
+			"is_short":      trade.IsShort,
+			"regime":        trade.Regime,
+			"entry_time":    trade.EntryTime.Format(time.RFC3339),
+			"entry_date":    trade.EntryDate.Format("2006-01-02"),
+			"product":       trade.Product,
 		}
 
 		if s.tickStore != nil && trade.Token > 0 {
@@ -177,12 +188,21 @@ func (s *Server) buildStatusData() map[string]interface{} {
 			if ltp > 0 {
 				var pnl float64
 				if trade.IsShort {
-					pnl = (trade.EntryPrice - ltp) * float64(trade.RemainingQty)
+					pnl = (trade.EntryPrice - ltp) * float64(remainQty)
 				} else {
-					pnl = (ltp - trade.EntryPrice) * float64(trade.RemainingQty)
+					pnl = (ltp - trade.EntryPrice) * float64(remainQty)
+				}
+				pnlPct := 0.0
+				if trade.EntryPrice > 0 {
+					if trade.IsShort {
+						pnlPct = (trade.EntryPrice - ltp) / trade.EntryPrice * 100
+					} else {
+						pnlPct = (ltp - trade.EntryPrice) / trade.EntryPrice * 100
+					}
 				}
 				pos["ltp"] = ltp
 				pos["unrealised_pnl"] = fmt.Sprintf("%.2f", pnl)
+				pos["pnl_pct"] = fmt.Sprintf("%.2f", pnlPct)
 			}
 		}
 		openPositions = append(openPositions, pos)
@@ -367,6 +387,83 @@ func (s *Server) handlePnlSummary(w http.ResponseWriter, r *http.Request) {
 			"breakdown":      monthlyBreakdown,
 		},
 	})
+}
+
+// ── Backtest handlers ────────────────────────────────────────────
+
+func (s *Server) handleBacktestRun(w http.ResponseWriter, r *http.Request) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			msg := fmt.Sprintf("%v", rec)
+			log.Printf("[Backtest] PANIC: %s", msg)
+			http.Error(w, fmt.Sprintf(`{"error":"backtest panic: %s"}`, msg), 500)
+		}
+	}()
+
+	if r.Method != "POST" {
+		http.Error(w, `{"error":"POST required"}`, 405)
+		return
+	}
+	var cfg backtest.Config
+	if err := json.NewDecoder(r.Body).Decode(&cfg); err != nil {
+		http.Error(w, `{"error":"invalid JSON"}`, 400)
+		return
+	}
+	if cfg.Capital <= 0 {
+		cfg.Capital = config.TotalCapital
+	}
+	if cfg.SLFloorPct == 0 {
+		cfg.SLFloorPct = config.SLFloorPct
+	}
+	if cfg.SLCeilingPct == 0 {
+		cfg.SLCeilingPct = config.SLCeilingPct
+	}
+	if cfg.MaxTradeAllocPct == 0 {
+		cfg.MaxTradeAllocPct = config.MaxTradeAllocPct
+	}
+
+	// Build agents.DailyCache snapshot from storage.DailyCache
+	agentsCache := s.dailyCache.ExportAgentsCache()
+	if agentsCache == nil || !agentsCache.Loaded {
+		http.Error(w, `{"error":"daily cache not loaded — start engine first"}`, 503)
+		return
+	}
+
+	result := backtest.Run(agentsCache, s.scanner.Universe, cfg)
+	if err := backtest.SaveResult(result); err != nil {
+		log.Printf("[Backtest] Save error: %v", err)
+	}
+	writeJSON(w, result)
+}
+
+func (s *Server) handleBacktestHistory(w http.ResponseWriter, r *http.Request) {
+	results, err := backtest.LoadHistory(20)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%v"}`, err), 500)
+		return
+	}
+	writeJSON(w, map[string]interface{}{"results": results})
+}
+
+func (s *Server) handleConfigApply(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, `{"error":"POST required"}`, 405)
+		return
+	}
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, `{"error":"read body"}`, 400)
+		return
+	}
+	path := filepath.Join("data", "config_override.json")
+	if err := os.WriteFile(path, body, 0644); err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%v"}`, err), 500)
+		return
+	}
+	// Live-reload: push override values into the running config vars immediately.
+	// The EMA agent picks up the new SL%, CMF threshold, and alloc on the next scan cycle.
+	config.LoadOverride(path)
+	writeJSON(w, map[string]string{"status": "ok", "path": path})
 }
 
 var upgrader = websocket.Upgrader{

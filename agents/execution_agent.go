@@ -59,6 +59,14 @@ type ExecutionAgent struct {
 
 	// RecentlyExitedByEMAAt tracks when each symbol was EMA-exited, for stale-entry cleanup.
 	RecentlyExitedByEMAAt map[string]time.Time
+
+	// Book Ch.8: Drawdown tracking (p.205 — "keep max drawdown below 5-7%")
+	// PeakCapital = highest realised equity since engine start.
+	// CumulativeRealizedPnL = net closed-trade PnL (positive or negative).
+	// DrawdownHalted = true when drawdown from peak exceeds MaxDrawdownHaltPct.
+	PeakCapital           float64
+	CumulativeRealizedPnL float64
+	DrawdownHalted        bool
 }
 
 // FIX-05: Re-entry max premium cap
@@ -92,6 +100,49 @@ func NewExecutionAgent(journal *core.Journal, state *core.StateManager) *Executi
 		CircuitAlerted:        make(map[uint32]bool),
 		ExitInProgress:        make(map[string]bool),
 		RecentlyExitedByEMAAt: make(map[string]time.Time),
+		PeakCapital:           config.TotalCapital, // initialise to starting capital
+	}
+}
+
+// computeOpenRiskPct returns the total open risk across all active positions
+// as a percentage of TotalCapital.
+// Open risk = Σ (EntryPrice − StopPrice) × RemainingQty  (Book Ch.8 p.194)
+func (e *ExecutionAgent) computeOpenRiskPct() float64 {
+	total := 0.0
+	for _, trade := range e.ActiveTrades {
+		if trade.EntryPrice > trade.StopPrice && trade.StopPrice > 0 {
+			total += (trade.EntryPrice - trade.StopPrice) * float64(trade.RemainingQty)
+		}
+	}
+	if config.TotalCapital <= 0 {
+		return 0
+	}
+	return total / config.TotalCapital * 100
+}
+
+// updateDrawdown recomputes the current drawdown from peak equity and sets DrawdownHalted.
+// Called after every trade close so the guard is always current.
+func (e *ExecutionAgent) updateDrawdown(closedPnL float64) {
+	e.CumulativeRealizedPnL += closedPnL
+	currentCapital := config.TotalCapital + e.CumulativeRealizedPnL
+	if currentCapital > e.PeakCapital {
+		e.PeakCapital = currentCapital
+	}
+	if e.PeakCapital <= 0 {
+		return
+	}
+	drawdownPct := (e.PeakCapital - currentCapital) / e.PeakCapital * 100
+	wasHalted := e.DrawdownHalted
+	e.DrawdownHalted = drawdownPct >= config.MaxDrawdownHaltPct
+	if e.DrawdownHalted && !wasHalted {
+		log.Printf("[Drawdown] HALT: drawdown %.1f%% ≥ %.0f%% — no new positions until recovery",
+			drawdownPct, config.MaxDrawdownHaltPct)
+		SendTelegram(fmt.Sprintf(
+			"🛑 *DRAWDOWN HALT*\nDrawdown: `%.1f%%` ≥ `%.0f%%`\nNo new positions until equity recovers.\nBook Ch.8 rule: keep max drawdown < 7%%",
+			drawdownPct, config.MaxDrawdownHaltPct))
+	} else if !e.DrawdownHalted && wasHalted {
+		log.Printf("[Drawdown] RESUMED: drawdown recovered below %.0f%%", config.MaxDrawdownHaltPct)
+		SendTelegram(fmt.Sprintf("✅ *DRAWDOWN HALT LIFTED* — resuming normal trading (drawdown recovered below %.0f%%)", config.MaxDrawdownHaltPct))
 	}
 }
 
@@ -135,6 +186,45 @@ func (e *ExecutionAgent) Execute(sig *Signal, regime string) bool {
 		}
 	}
 
+	// ── Book Ch.7 p.191 — Survive & Thrive: 2-underwater-positions gate ────────
+	// "If two of your open stock positions are not performing well, you have no
+	//  reason to open a third position."
+	// Count open positions where current LTP < entry price (underwater).
+	// When ≥ 2 are underwater, block all new non-topup entries.
+	if sig.Strategy != "VCP_TOPUP" && e.GetLTP != nil {
+		e.Mu.RLock()
+		underwaterCount := 0
+		for _, t := range e.ActiveTrades {
+			if ltp := e.GetLTP(t.Token); ltp > 0 && ltp < t.EntryPrice {
+				underwaterCount++
+			}
+		}
+		e.Mu.RUnlock()
+		if underwaterCount >= 2 {
+			log.Printf("[Execute] Ch.7 gate: %d underwater positions — blocking new entry for %s",
+				underwaterCount, sym)
+			return false
+		}
+	}
+
+	// Book Ch.8: Drawdown halt — no new positions when drawdown > 7% (p.205)
+	if e.DrawdownHalted && sig.Strategy != "VCP_TOPUP" {
+		log.Printf("[Execute] DRAWDOWN HALT active — skipping %s (drawdown > %.0f%%)",
+			sym, config.MaxDrawdownHaltPct)
+		return false
+	}
+
+	// Book Ch.8: Open risk cap — total open risk across positions ≤ 4% of capital (p.194)
+	// Checked before position count so we stop earlier when risk is saturated.
+	e.Mu.RLock()
+	openRisk := e.computeOpenRiskPct()
+	e.Mu.RUnlock()
+	if openRisk >= config.MaxOpenRiskPct && sig.Strategy != "VCP_TOPUP" {
+		log.Printf("[Execute] Open risk cap reached (%.1f%% ≥ %.0f%%) — skipping %s",
+			openRisk, config.MaxOpenRiskPct, sym)
+		return false
+	}
+
 	// Dynamic position cap based on current capital
 	maxPos := config.ComputeMaxPositions(config.TotalCapital)
 	e.Mu.RLock()
@@ -167,6 +257,9 @@ func (e *ExecutionAgent) Execute(sig *Signal, regime string) bool {
 		return false
 	}
 
+	// (Book has no fixed cash-reserve rule; deployment is bounded by open-risk 4-5%
+	// and position count 8-12 only — Ch.7 p.191, Ch.8 p.194-195.)
+
 	qty := sig.Qty
 	if qty <= 0 {
 		// Capital sizing produced 0 shares — likely below per-trade allocation
@@ -176,9 +269,20 @@ func (e *ExecutionAgent) Execute(sig *Signal, regime string) bool {
 		return false
 	}
 
-	// Pre-GTT news check — block on NEGATIVE BSE announcements.
-	// Fail-open: any network error returns NEUTRAL and trading proceeds.
-	if !CheckNewsBeforeEntry(sym) {
+
+	// Book Ch.7 p.191: Block new entries within ResultsAvoidanceDays of quarterly results.
+	// Book says: "Avoid holding through earnings unless you have a significant profit
+	// cushion to mitigate potential volatility." Extended here to also block new entries
+	// before known results dates (NSE corporate actions calendar). ENGINE EXTENSION on
+	// the spirit of the rule.
+	// Fail-open: if NSE calendar is unavailable, never blocks.
+	if HasUpcomingResults(sym) {
+		days := DaysToResults(sym)
+		log.Printf("[EarningsFilter] BLOCKED %s — results/board meeting in %d days (within %d-day window)",
+			sym, days, ResultsAvoidanceDays)
+		SendTelegram(fmt.Sprintf(
+			"⚠️ *EARNINGS BLOCK — %s*\nBoard meeting / results in `%d` days.\nBook Ch.10: avoid new entries near results. Wait until post-result stability.",
+			sym, days))
 		return false
 	}
 
@@ -187,7 +291,7 @@ func (e *ExecutionAgent) Execute(sig *Signal, regime string) bool {
 	// above LTP so the order has a realistic chance of filling on fast breakout moves.
 	limitPrice := sig.EntryPrice
 	switch sig.Strategy {
-	case "VCP_BREAKOUT", "BULL_FLAG", "IPO_BASE", "CUP_HANDLE":
+	case "VCP_BREAKOUT", "IPO_BASE":
 		limitPrice = sig.EntryPrice * 1.001 // 0.1% buffer — negligible cost, avoids misses
 	}
 
@@ -203,6 +307,20 @@ func (e *ExecutionAgent) Execute(sig *Signal, regime string) bool {
 		oid = fmt.Sprintf("GO_%s_%s_%d", sig.Strategy, sym, time.Now().UnixNano())
 	}
 
+	// Book Ch.12 p.283: 2R partial profit target.
+	// "When profit = 2× initial risk, sell 50% of position, let rest run."
+	// 2R target = entryPrice + 2 × (entryPrice - stopPrice)
+	twoRTarget := 0.0
+	twoRQty := 0
+	if sig.StopPrice > 0 && sig.StopPrice < limitPrice {
+		riskPerShare := limitPrice - sig.StopPrice
+		twoRTarget = limitPrice + 2*riskPerShare
+		twoRQty = int(float64(qty) * config.TwoRPartialSellPct / 100)
+		if twoRQty < 1 && qty >= 2 {
+			twoRQty = 1
+		}
+	}
+
 	now := config.NowIST()
 	trade := &core.Trade{
 		EntryOID:     oid,
@@ -213,6 +331,8 @@ func (e *ExecutionAgent) Execute(sig *Signal, regime string) bool {
 		EntryPrice:   limitPrice,
 		StopPrice:    sig.StopPrice,
 		TargetPrice:  sig.TargetPrice,
+		PartialTarget: twoRTarget, // 2R level for partial exit
+		PartialQty:   twoRQty,    // qty to sell at 2R
 		Qty:          qty,
 		RemainingQty: qty,
 		Token:        sig.Token,
@@ -258,6 +378,16 @@ func (e *ExecutionAgent) Execute(sig *Signal, regime string) bool {
 			e.Mu.Unlock()
 			e.State.Save(oid, updated)
 		}()
+	} else {
+		// Paper mode: simulate realistic fill with 0.3% market-impact slippage.
+		// Real limit orders on liquid NSE stocks face ~0.1–0.3% adverse slippage at entry.
+		slippedPrice := trade.EntryPrice * (1 + config.PaperSlippagePct/100)
+		trade.EntryPrice = slippedPrice
+		e.Mu.Lock()
+		e.ActiveTrades[oid] = trade
+		e.Mu.Unlock()
+		e.State.Save(oid, trade)
+		log.Printf("[Paper] %s filled at ₹%.2f (%.1f%% slippage applied)", sym, slippedPrice, config.PaperSlippagePct)
 	}
 
 	return true
@@ -307,27 +437,17 @@ func (e *ExecutionAgent) MonitorPositions(regime string) {
 		// Track LTP changes for circuit detection
 		e.trackLTPChange(token, ltp)
 
-		// Trailing stop — protect profits on winning positions.
-		// Tier 1: gain ≥15% → trail SL to breakeven (entry price).
-		// Tier 2: gain ≥25% → trail SL to entry+10% (lock in partial gain).
-		// Only trail upward — never move SL against the position.
-		if ltp > trade.EntryPrice && trade.EntryPrice > 0 {
-			gainPct := (ltp - trade.EntryPrice) / trade.EntryPrice * 100
-			var newStop float64
-			switch {
-			case gainPct >= 25:
-				newStop = trade.EntryPrice * 1.10
-			case gainPct >= 15:
-				newStop = trade.EntryPrice // breakeven
-			}
-			if newStop > trade.StopPrice {
-				log.Printf("[Trail] %s SL trailed ₹%.2f → ₹%.2f (gain=%.1f%%)",
-					trade.Symbol, trade.StopPrice, newStop, gainPct)
-				trade.StopPrice = newStop
-				trade.TrailStop = newStop
-				e.State.Save(oid, trade)
-			}
+		// Book Ch.12 p.283: 2R partial profit — sell 50% when gain = 2× initial risk.
+		// "When you reach 2R, take half off the table. The worst that can happen
+		//  now is a breakeven trade on the remaining shares."
+		if !trade.PartialFilled && trade.PartialTarget > 0 && trade.PartialQty > 0 &&
+			ltp >= trade.PartialTarget && trade.RemainingQty > trade.PartialQty {
+			log.Printf("[2R] %s: LTP ₹%.2f ≥ 2R target ₹%.2f — partial exit %d shares",
+				trade.Symbol, ltp, trade.PartialTarget, trade.PartialQty)
+			e.executePartialExit(oid, trade, "2R_PARTIAL_PROFIT", ltp, trade.PartialQty)
+			continue
 		}
+
 	}
 }
 
@@ -374,9 +494,7 @@ func (e *ExecutionAgent) RunDailyEMACheck(dailyCache *DailyCache) {
 			continue
 		}
 
-		highs, hOk := dailyCache.Highs[token]
 		lows, lOk := dailyCache.Lows[token]
-		volumes, vOk := dailyCache.Volumes[token]
 
 		ema20 := ComputeEMA20(closes)
 		if ema20 <= 0 {
@@ -384,93 +502,180 @@ func (e *ExecutionAgent) RunDailyEMACheck(dailyCache *DailyCache) {
 		}
 
 		lastClose := closes[len(closes)-1]
-		prevClose := closes[len(closes)-2]
 
-		// ── Rule 4: Volume+Price sell pressure exit ────────────────
-		// Exit next open if: 2 of last 3 days have CPR<0.35 + volume spike,
-		// AND LTP < yesterday's low (today's price confirming breakdown).
-		if hOk && lOk && vOk && len(highs) >= 4 && len(lows) >= 4 && len(volumes) >= 20 {
-			if e.Scanner != nil {
-				n := len(closes)
-				sellPressureDays := 0
-				for i := n - 3; i < n; i++ {
-					h := highs[i]
-					l := lows[i]
-					c := closes[i]
-					rng := h - l
-					if rng <= 0 {
-						continue
-					}
-					cpr := (c - l) / rng
-					// Volume spike: compare to 20-day avg
-					avgVol := 0.0
-					if len(volumes) >= 20 {
-						for _, v := range volumes[i-20 : i] {
-							avgVol += v
-						}
-						avgVol /= 20
-					}
-					volSpike := avgVol > 0 && volumes[i] > avgVol*config.VolumeSpikeMultiplier
-					if cpr < config.SellPressureRatio && volSpike {
-						sellPressureDays++
-					}
+		// ── Book Ch.7 p.191: Earnings / board meeting alert (NSE calendar) ────
+		// "Avoid holding through earnings unless you have a significant profit cushion."
+		// Uses real NSE corporate actions calendar (RefreshEarningsCalendar at startup).
+		// Alerts if results are within ResultsAvoidanceDays; doesn't force exit —
+		// the profit cushion rule means the trader decides whether to hold.
+		if HasUpcomingResults(trade.Symbol) {
+			days := DaysToResults(trade.Symbol)
+			pnlCushion := 0.0
+			if trade.EntryPrice > 0 {
+				pnlCushion = (lastClose - trade.EntryPrice) / trade.EntryPrice * 100
+			}
+			log.Printf("[Earnings] %s: results in %d days, profit cushion=%.1f%%",
+				trade.Symbol, days, pnlCushion)
+			if pnlCushion < 20.0 {
+				SendTelegram(fmt.Sprintf(
+					"⚠️ *EARNINGS ALERT — %s*\nBoard meeting / results in `%d` days.\nProfit cushion: `%.1f%%` (below 20%% threshold).\nBook Ch.10: consider exiting before results unless cushion ≥ 20%%.\nCurrent P&L: ₹`%+.0f`",
+					trade.Symbol, days, pnlCushion,
+					(lastClose-trade.EntryPrice)*float64(trade.RemainingQty)))
+			} else {
+				log.Printf("[Earnings] %s: results in %d days but profit cushion %.1f%% ≥ 20%% — holding",
+					trade.Symbol, days, pnlCushion)
+			}
+		}
+
+		// ── Book Ch.12 p.283: 3 consecutive strong up days → autonomous partial exit ──
+		// "Three back-to-back strong up days (≥1.5% each) = sell 25% into strength.
+		//  Don't wait for the EMA to break — sell into the euphoria."
+		if len(closes) >= 5 {
+			consecutiveStrongUp := 0
+			for k := 1; k <= 4; k++ {
+				if len(closes) < k+2 {
+					break
 				}
-				// Get live LTP to check against yesterday's low
-				ltp := 0.0
-				if e.GetLTP != nil && token > 0 {
-					ltp = e.GetLTP(token)
+				c := closes[len(closes)-k]
+				cPrev := closes[len(closes)-k-1]
+				if cPrev > 0 && (c-cPrev)/cPrev*100 >= 1.5 {
+					consecutiveStrongUp++
+				} else {
+					break
 				}
-				yesterdayLow := lows[len(lows)-2]
-				if sellPressureDays >= config.VolumePressureDaysNeeded && ltp > 0 && ltp < yesterdayLow {
-					log.Printf("[SellPressure] %s: EXIT — %d days CPR<%.2f+volume spike, LTP=%.2f < yesterdayLow=%.2f",
-						trade.Symbol, sellPressureDays, config.SellPressureRatio, ltp, yesterdayLow)
+			}
+			if consecutiveStrongUp >= 3 && !trade.PartialFilled {
+				partialQty := int(float64(trade.RemainingQty) * config.StrongDayPartialSellPct / 100)
+				if partialQty < 1 && trade.RemainingQty >= 2 {
+					partialQty = 1
+				}
+				if partialQty >= 1 && partialQty < trade.RemainingQty {
+					log.Printf("[StrongMove] %s: %d consecutive strong up days — AUTO partial exit %d shares",
+						trade.Symbol, consecutiveStrongUp, partialQty)
+					e.executePartialExit(oid, trade, "STRONG_DAYS_PARTIAL", lastClose, partialQty)
+				} else {
+					// Not enough qty for a partial — just alert
 					SendTelegram(fmt.Sprintf(
-						"🔴 *SELL PRESSURE EXIT — %s*\nCPR+Volume: `%d/3` days | LTP ₹`%.2f` < PrevLow ₹`%.2f`",
-						trade.Symbol, sellPressureDays, ltp, yesterdayLow))
-					e.forceExit(oid, trade, "SELL_PRESSURE_CPR", ltp)
-					e.RecentlyExitedByEMA[trade.Symbol] = token
-					e.EMAExitPrices[trade.Symbol] = ltp
-					e.RecentlyExitedByEMAAt[trade.Symbol] = time.Now()
-					continue
+						"📈 *STRONG MOVE ALERT — %s*\n`%d` consecutive strong up days (≥1.5%%)\nBook Ch.12: consider booking partial profits. P&L: ₹`%.0f`",
+						trade.Symbol, consecutiveStrongUp,
+						(lastClose-trade.EntryPrice)*float64(trade.RemainingQty)))
 				}
 			}
 		}
 
-		// ── Rule 5: EMA20 trailing exit (2 red candles below EMA) ──
-		isRedCandle := lastClose < prevClose
-		belowEMA := lastClose < ema20
+		// ── Book Ch.6 p.163: Extended-Move Sell (Selling into Strength) ────────
+		// "If you see a stock moving 25-30% in a matter of a few sessions, consider
+		//  it extended. Take profits — the stock is more likely to pull back or
+		//  consolidate after such a substantial run-up."
+		// Applies to LATE-stage extensions only (book p.163-166): early-stage
+		// extensions in a new uptrend are NOT sell signals. Heuristic: a position
+		// already up ≥15% from entry is treated as "late-stage" for this check.
+		if !trade.PartialFilled && trade.EntryPrice > 0 &&
+			len(closes) >= config.ExtendedMoveSessionsWindow+1 {
+			windowStart := len(closes) - config.ExtendedMoveSessionsWindow - 1
+			startPrice := closes[windowStart]
+			if startPrice > 0 {
+				movePct := (lastClose - startPrice) / startPrice * 100
+				gainFromEntry := (lastClose - trade.EntryPrice) / trade.EntryPrice * 100
+				if movePct >= config.ExtendedMoveMinPct && gainFromEntry >= 15.0 {
+					partialQty := int(float64(trade.RemainingQty) * config.ExtendedMovePartialSellPct / 100)
+					if partialQty < 1 && trade.RemainingQty >= 2 {
+						partialQty = 1
+					}
+					if partialQty >= 1 && partialQty < trade.RemainingQty {
+						log.Printf("[ExtendedMove] %s: %.1f%% in %d sessions — partial exit %d shares (Ch.6 p.163)",
+							trade.Symbol, movePct, config.ExtendedMoveSessionsWindow, partialQty)
+						e.executePartialExit(oid, trade, "EXTENDED_MOVE_SELL", lastClose, partialQty)
+					}
+				}
+			}
+		}
 
-		if isRedCandle && belowEMA {
-			e.RedCandlesBelow[oid]++
-			log.Printf("[EMA20] %s: Red candle #%d below EMA20 (Close=%.2f EMA=%.2f)",
-				trade.Symbol, e.RedCandlesBelow[oid], lastClose, ema20)
+		// ── Book Ch.6 p.173: Hybrid Selling Technique — 25-35% partial ─────────
+		// "Sell a portion of your position—typically around 25–35%—into strength.
+		//  For the remaining shares, you set a stop-loss at your buy price,
+		//  effectively making the rest of your position risk-free."
+		// Fires BEFORE 2R target is reached, capturing earlier strength.
+		if !trade.PartialFilled && trade.EntryPrice > 0 && trade.PartialTarget > 0 &&
+			lastClose < trade.PartialTarget {
+			gainFromEntry := (lastClose - trade.EntryPrice) / trade.EntryPrice * 100
+			if gainFromEntry >= config.HybridStrongMoveGainPct {
+				partialQty := int(float64(trade.RemainingQty) * config.HybridPartialSellPct / 100)
+				if partialQty < 1 && trade.RemainingQty >= 2 {
+					partialQty = 1
+				}
+				if partialQty >= 1 && partialQty < trade.RemainingQty {
+					log.Printf("[Hybrid] %s: %.1f%% gain — partial %d shares + SL→breakeven (Ch.6 p.173)",
+						trade.Symbol, gainFromEntry, partialQty)
+					e.executePartialExit(oid, trade, "HYBRID_25_35_PARTIAL", lastClose, partialQty)
+				}
+			}
+		}
 
-			if e.RedCandlesBelow[oid] >= config.RedCandlesBelowEMA {
-				log.Printf("[EMA20] %s: EXIT — %d red candles below EMA20",
-					trade.Symbol, e.RedCandlesBelow[oid])
-				e.forceExit(oid, trade, "EMA20_2RED_BELOW", lastClose)
-
+		// ── Book Ch.6 p.171-172: Downside Pivot Exit ────────────────────────────
+		// "Wait for the stock to form a downside pivot on the daily time frame.
+		//  This pivot indicates a shift in momentum." (BEL 2015 example: broke
+		//  below pivot low on 9 March → exit signal)
+		// Pivot low = lowest low in the past N bars (excluding the very latest bar).
+		// Exit when today's close violates that pivot AND we're already profitable
+		// (selling-into-weakness only locks in gains; full SL handles raw losses).
+		if lOk && len(lows) >= config.DownsidePivotLookback+1 && lastClose > trade.EntryPrice {
+			n := len(lows)
+			pivotLow := lows[n-config.DownsidePivotLookback-1]
+			for i := n - config.DownsidePivotLookback - 1; i < n-1; i++ {
+				if lows[i] < pivotLow {
+					pivotLow = lows[i]
+				}
+			}
+			if pivotLow > 0 && lastClose < pivotLow {
+				log.Printf("[DownsidePivot] %s: close ₹%.2f broke pivot low ₹%.2f — EXIT (Ch.6 p.171-172)",
+					trade.Symbol, lastClose, pivotLow)
+				e.forceExit(oid, trade, "DOWNSIDE_PIVOT_EXIT", lastClose)
 				e.RecentlyExitedByEMA[trade.Symbol] = token
 				e.EMAExitPrices[trade.Symbol] = lastClose
 				e.RecentlyExitedByEMAAt[trade.Symbol] = time.Now()
 				continue
 			}
-		} else {
-			if EMAResetBuffer > 0 {
-				if lastClose > ema20*(1+EMAResetBuffer) && lastClose > prevClose {
-					if e.RedCandlesBelow[oid] > 0 {
-						log.Printf("[EMA20] %s: Recovered above EMA20+buffer, reset counter (Close=%.2f EMA=%.2f)",
-							trade.Symbol, lastClose, ema20)
-					}
-					e.RedCandlesBelow[oid] = 0
+		}
+
+		// ── Book Ch.6 p.167-168 + Ch.12: EMA trailing exit ─────────────────────
+		// "Wait until the market closes. If the stock closes below the key moving
+		//  average — sell on that day. A stock might dip intraday but close above;
+		//  that is NOT an exit. A single EOD close below = exit."
+		//                                  — Ch.6, Figs 6.4 & 6.5 (TECHM, FINCABLES)
+		// Large base (VCP / Cup / VCP_REENTRY / VCP_TOPUP) → trail with EMA50.
+		// Mini base (Flag, Channel, EMA cross, IPO, Flat) → trail with EMA20.
+		isLargeBaseStrategy := trade.Strategy == "VCP_BREAKOUT" ||
+			trade.Strategy == "VCP_TOPUP" ||
+			trade.Strategy == "VCP_REENTRY" ||
+			trade.Strategy == "CUP_HANDLE"
+		if isLargeBaseStrategy {
+			ema50 := computeEMAForPeriod(closes, config.EMA50Period)
+			if ema50 > 0 {
+				if lastClose < ema50 {
+					log.Printf("[EMA50] %s (%s): EXIT — EOD close ₹%.2f below EMA50 ₹%.2f",
+						trade.Symbol, trade.Strategy, lastClose, ema50)
+					e.forceExit(oid, trade, "EMA50_CLOSE_BELOW_LARGEBASE", lastClose)
+					e.RecentlyExitedByEMA[trade.Symbol] = token
+					e.EMAExitPrices[trade.Symbol] = lastClose
+					e.RecentlyExitedByEMAAt[trade.Symbol] = time.Now()
+					continue
 				}
-			} else {
-				if e.RedCandlesBelow[oid] > 0 {
-					log.Printf("[EMA20] %s: Streak broken, reset counter (Close=%.2f EMA=%.2f)",
-						trade.Symbol, lastClose, ema20)
-				}
-				e.RedCandlesBelow[oid] = 0
+				continue // Large base uses EMA50 — skip EMA20 check below
 			}
+		}
+
+		// ── Rule 5: EMA20 trailing exit — single EOD close below EMA ────────────
+		// Book Ch.6 p.167: "Close below the key moving average — sell on that day."
+		// Figures 6.4 (TECHM) and 6.5 (FINCABLES): single close = exit signal.
+		if lastClose < ema20 {
+			log.Printf("[EMA20] %s: EXIT — EOD close ₹%.2f below EMA20 ₹%.2f",
+				trade.Symbol, lastClose, ema20)
+			e.forceExit(oid, trade, "EMA20_CLOSE_BELOW", lastClose)
+			e.RecentlyExitedByEMA[trade.Symbol] = token
+			e.EMAExitPrices[trade.Symbol] = lastClose
+			e.RecentlyExitedByEMAAt[trade.Symbol] = time.Now()
+			continue
 		}
 	}
 }
@@ -575,6 +780,57 @@ func (e *ExecutionAgent) CheckTopUps(scanner *ScannerAgent, regime string) {
 }
 
 // ══════════════════════════════════════════════════════════════
+//  executePartialExit — Book Ch.12: sell a portion of a position
+//  Used for 2R partial profit and 3-strong-day partial exit.
+//  Updates RemainingQty + PartialFilled in state. Thread-safe:
+//  caller must already hold e.Mu.Lock() (MonitorPositions does).
+// ══════════════════════════════════════════════════════════════
+
+func (e *ExecutionAgent) executePartialExit(oid string, trade *core.Trade, reason string, exitPrice float64, qty int) {
+	if qty <= 0 || qty >= trade.RemainingQty {
+		return
+	}
+	pnlPartial := (exitPrice - trade.EntryPrice) * float64(qty)
+
+	if e.PlaceOrder != nil {
+		_, err := e.PlaceOrder(trade.Symbol, qty, true, "MARKET", 0)
+		if err != nil {
+			log.Printf("[PartialExit] %s sell %d shares FAILED: %v", trade.Symbol, qty, err)
+			SendTelegram(fmt.Sprintf("⚠️ PARTIAL EXIT FAILED: `%s` qty=%d reason=%s err=%v",
+				trade.Symbol, qty, reason, err))
+			return
+		}
+	}
+
+	trade.RemainingQty -= qty
+	trade.PartialFilled = true
+	trade.RealisedPnl += pnlPartial
+
+	// ── Book Ch.6 p.173 — Hybrid Technique: move SL to breakeven after partial ──
+	// "Sell 25% into strength, then move your stop-loss to your buy price.
+	//  The remaining position is now risk-free."
+	breakevenMoved := false
+	if exitPrice > trade.EntryPrice && trade.StopPrice < trade.EntryPrice {
+		trade.StopPrice = trade.EntryPrice
+		breakevenMoved = true
+		log.Printf("[Breakeven] %s: SL moved to entry ₹%.2f after partial profit — remaining position is risk-free",
+			trade.Symbol, trade.EntryPrice)
+	}
+
+	e.State.Save(oid, trade)
+
+	msg := fmt.Sprintf(
+		"💰 *PARTIAL EXIT — %s*\n`%s` sold `%d` shares @ ₹`%.2f`\nPartial P&L: ₹`%+.0f` | Remaining: `%d` shares\nReason: `%s`",
+		trade.Symbol, reason, qty, exitPrice, pnlPartial, trade.RemainingQty, reason)
+	if breakevenMoved {
+		msg += fmt.Sprintf("\n🔒 SL moved to breakeven ₹`%.2f` — remaining position risk-free (Ch.6 Hybrid)", trade.EntryPrice)
+	}
+	log.Printf("[PartialExit] %s: sold %d shares @ ₹%.2f (%s) partial P&L=₹%.0f remaining=%d breakevenMoved=%v",
+		trade.Symbol, qty, exitPrice, reason, pnlPartial, trade.RemainingQty, breakevenMoved)
+	SendTelegram(msg)
+}
+
+// ══════════════════════════════════════════════════════════════
 //  forceExit — Close a swing position
 // ══════════════════════════════════════════════════════════════
 
@@ -643,6 +899,9 @@ func (e *ExecutionAgent) forceExit(oid string, trade *core.Trade, reason string,
 	}
 
 	pnl := (exitPrice - trade.EntryPrice) * float64(exitQty) // Long-only
+
+	// Book Ch.8: Update drawdown tracking after every close (p.205)
+	e.updateDrawdown(pnl)
 
 	e.State.Close(oid)
 	e.Journal.LogTrade(&core.TradeLog{

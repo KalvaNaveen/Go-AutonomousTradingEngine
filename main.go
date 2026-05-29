@@ -41,6 +41,9 @@ func main() {
 	}
 
 	config.Reload()
+	// Apply any saved dashboard overrides (data/config_override.json).
+	// This wires "Apply Config" into the live EMA agent from the very first scan.
+	config.LoadOverride(config.BaseDir + string(os.PathSeparator) + "data" + string(os.PathSeparator) + "config_override.json")
 	config.PrintBanner()
 
 	// ══════════════════════════════════════════════════════════════
@@ -171,8 +174,10 @@ func main() {
 	scanner.GetORB = func(token uint32) (float64, float64) { return tickStore.GetORB(token) }
 	scanner.GetDayOpen = func(token uint32) float64 { return tickStore.GetDayOpen(token) }
 	scanner.ComputeRVol = func(token uint32) float64 { return 1.0 }
-	scanner.GetIndiaVIX = func() float64 { return tickStore.GetLTPIfFresh(config.IndiaVIXToken) }
 	scanner.GetADRatio = scanner.ComputeADRatio
+
+	// (OI filter removed — F&O open interest is not in the book; the engine trades
+	//  cash equity on price/volume action only.)
 
 	execAgent.GetLTP = scanner.GetLTP
 
@@ -208,43 +213,7 @@ func main() {
 	//  Research Automation (Sections II-IV of Blueprint)
 	// ══════════════════════════════════════════════════════════════
 
-	// Section III.1: Screener.in fundamental filter (MCap>1000, ROCE>20%, ROE>20%, Sales+Profit growing)
-	// Doc V header: "Only execute on stocks that passed the fundamental screens"
-	scanner.FundamentalPassed = make(map[string]bool)
-	go func() {
-		log.Println("[Research] Running Screener.in fundamental filter...")
-		var symbols []string
-		for _, sym := range dataAgent.Universe {
-			symbols = append(symbols, sym)
-		}
-		for i, sym := range symbols {
-			f, err := research.FetchFundamentals(sym)
-			if err != nil {
-				log.Printf("[Screener] Error %s: %v — allowing", sym, err)
-				scanner.FundamentalPassed[sym] = true // Allow on error
-			} else {
-				scanner.FundamentalPassed[sym] = f.Passed
-				if f.Passed {
-					log.Printf("[Screener] ✅ %s (MCap=%.0f, ROCE=%.1f%%, ROE=%.1f%%)",
-						sym, f.MarketCap, f.ROCE, f.ROE)
-				} else {
-					log.Printf("[Screener] ❌ %s BLOCKED (MCap=%.0f, ROCE=%.1f%%, ROE=%.1f%%)",
-						sym, f.MarketCap, f.ROCE, f.ROE)
-				}
-			}
-			// Rate limit: 3 seconds between requests to avoid Screener.in 429
-			if i < len(symbols)-1 {
-				time.Sleep(3 * time.Second)
-			}
-		}
-		passed := 0
-		for _, v := range scanner.FundamentalPassed {
-			if v {
-				passed++
-			}
-		}
-		log.Printf("[Research] Screener.in: %d/%d stocks passed fundamental filter", passed, len(symbols))
-	}()
+	// (Fundamental/Screener.in filter removed — book is purely technical/price-action.)
 
 	// Section II.2: Nifty/Gold ratio (using GOLDBEES from Kite, not TradingView)
 	go func() {
@@ -523,11 +492,9 @@ func main() {
 				log.Println("[Engine] ═══ EOD EMA CHECK COMPLETE (15:31) ═══")
 			}
 
-			// ── EOD Market Scan + News Preload (once at 15:45) ──
+			// ── EOD Market Scan (once at 15:45) ──
 			if t >= 1545 && !eodScanDone {
 				eodScanDone = true
-				// Warm news cache for tomorrow's pre-market session
-				go agents.PreloadNewsForUniverse(dataAgent.Universe)
 				go agents.RunEODMarketScan(agents.EODScanDeps{
 					LoadUniverse:    dataAgent.LoadEODScanUniverse,
 					PreloadCache:    dailyCache.Preload,
@@ -552,8 +519,6 @@ func main() {
 		agents.SendTelegram("🌙 *ENGINE SLEEPING* — Swing positions held overnight.")
 		sleepUntilMorning()
 		log.Printf("[Engine] ═══ WAKING UP — %s ═══", config.NowIST().Format("2006-01-02 15:04"))
-		// Pre-market news warm-up — runs at 08:25 so cache is hot before 09:15 open
-		go agents.PreloadNewsForUniverse(dataAgent.Universe)
 	}
 }
 
