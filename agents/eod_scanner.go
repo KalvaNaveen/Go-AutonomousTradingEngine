@@ -636,37 +636,36 @@ func EODBookScans(cache *DailyCache, universe map[uint32]string, getLTP func(uin
 	return out
 }
 
-// buildEODSummary builds the Telegram EOD report in two sections:
-//   Section 1 — Top 15 most convincing BUY setups (EMA pullback, ranked by RS)
-//   Section 2 — Top 10 momentum stocks (biggest % movers today)
+// buildEODSummary builds the Telegram EOD report — one unified section:
+// Top 15 high-momentum BUY setups ranked by RS score (EMA pullback + quality filters).
 func buildEODSummary(results []EODScanResult, scanned, buyCount, sellCount int, elapsed time.Duration) string {
 	dateStr := config.NowIST().Format("02 Jan 2006")
+	_ = sellCount
+	_ = elapsed
+	_ = buyCount
 
-	// ── Section 1: Top 15 BUY setups (RS >= MinRSScore) ─────────────────────
+	// Filter: BUY signal + RS >= MinRSScore, already sorted by RS desc from caller
 	var buys []EODScanResult
 	for _, r := range results {
 		if r.Signal == "BUY" && r.RSScore >= config.MinRSScore {
 			buys = append(buys, r)
 		}
 	}
-	// Already sorted by RS desc from the caller's sort step
 
-	msg := fmt.Sprintf("📊 *EOD SWING SCAN — %s*\n", dateStr)
+	msg := fmt.Sprintf("📊 *SWING WATCHLIST — %s*\n", dateStr)
 	msg += "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-	msg += fmt.Sprintf("🔎 `%d` stocks | 🟢 `%d` quality setups (RS≥%d)\n", scanned, len(buys), config.MinRSScore)
+	msg += fmt.Sprintf("🔎 `%d` stocks scanned | 🟢 `%d` setups (RS≥%d)\n", scanned, len(buys), config.MinRSScore)
 	msg += "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-	_ = sellCount
-	_ = elapsed
-	_ = buyCount
 
 	if len(buys) == 0 {
-		msg += fmt.Sprintf("\n❌ No setups with RS ≥ %d today. Market momentum is weak.\n", config.MinRSScore)
+		msg += fmt.Sprintf("\n❌ No setups with RS≥%d today. Market momentum is weak.\n", config.MinRSScore)
 	} else {
 		limit := 15
 		if len(buys) < limit {
 			limit = len(buys)
 		}
-		msg += fmt.Sprintf("\n🟢 *TOP %d BUY SETUPS* _(EMA Pullback)_\n\n", limit)
+		msg += fmt.Sprintf("\n🟢 *TOP %d — EMA Pullback + High Momentum*\n", limit)
+		msg += "_Ranked by Relative Strength (RS)_\n\n"
 		for i := 0; i < limit; i++ {
 			r := buys[i]
 			rsTag := eodRSEmoji(r.RSScore)
@@ -697,56 +696,12 @@ func buildEODSummary(results []EODScanResult, scanned, buyCount, sellCount int, 
 					nearHighTag = fmt.Sprintf(" | `%.1f%%` from 52W High", dist)
 				}
 			}
-			msg += fmt.Sprintf("*%d. %s* %s%s\n   ₹`%.0f`%s%s\n\n",
-				i+1, r.Symbol, rsTag, patTag,
+			msg += fmt.Sprintf("*%d. %s* %s%s | RS `%d`\n   ₹`%.0f`%s%s\n\n",
+				i+1, r.Symbol, rsTag, patTag, r.RSScore,
 				r.LTP, volTag, nearHighTag)
 		}
 		if len(buys) > 15 {
 			msg += fmt.Sprintf("_... +%d more in CSV_\n", len(buys)-15)
-		}
-	}
-
-	// ── Section 2: Top 10 momentum movers (biggest % change today) ────────────
-	// Use all results (BUY + SELL) sorted by MarketCap as a proxy for % change
-	// We don't have intraday % change in EODScanResult so we use RS as momentum proxy.
-	// Top RS scorers that are BUY = strongest momentum.
-	type mover struct {
-		symbol string
-		ltp    float64
-		rs     int
-		mcap   float64
-	}
-	var movers []mover
-	seen := make(map[string]bool)
-	for _, r := range results {
-		if r.Signal == "BUY" && !seen[r.Symbol] {
-			movers = append(movers, mover{r.Symbol, r.LTP, r.RSScore, r.MarketCap})
-			seen[r.Symbol] = true
-		}
-	}
-	// Sort by RS desc for top momentum
-	for i := 0; i < len(movers)-1; i++ {
-		for j := i + 1; j < len(movers); j++ {
-			if movers[j].rs > movers[i].rs {
-				movers[i], movers[j] = movers[j], movers[i]
-			}
-		}
-	}
-	if len(movers) > 0 {
-		msg += "\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
-		msg += "🚀 *TOP MOMENTUM* _(Highest RS Score)_\n\n"
-		limit2 := 10
-		if len(movers) < limit2 {
-			limit2 = len(movers)
-		}
-		for i := 0; i < limit2; i++ {
-			m := movers[i]
-			mcapStr := ""
-			if m.mcap > 0 {
-				mcapStr = fmt.Sprintf(" | MCap `₹%.0fCr`", m.mcap)
-			}
-			msg += fmt.Sprintf("`%d.` *%s* — ₹`%.0f` | RS `%d`%s\n",
-				i+1, m.symbol, m.ltp, m.rs, mcapStr)
 		}
 	}
 
