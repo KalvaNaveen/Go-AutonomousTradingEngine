@@ -11,57 +11,8 @@ import (
 //  Every test maps to a specific doc line/section.
 // ══════════════════════════════════════════════════════════════
 
-// --- Section II.1: SMA200 Regime Detection (Faber 2007) ---
-
-func TestROCRegime_AggressiveNearZero(t *testing.T) {
-	// AGGRESSIVE: Nifty above SMA200 AND 21-day ROC ≥ 5%
-	s := NewScannerAgent()
-	s.DailyCache = makeMockCache()
-	// 400 bars at 100.0, last bar at 110.0 → SMA200≈100.05, ROC(21)=10% → AGGRESSIVE
-	niftyCloses := makeFlat(400, 100.0)
-	niftyCloses[len(niftyCloses)-1] = 110.0
-	s.DailyCache.Closes[config.NiftySpotToken] = niftyCloses
-	s.DailyCache.Closes[config.SmallcapToken] = makeFlat(450, 100.0)
-	s.DailyCache.Loaded = true
-
-	regime := s.DetectRegime()
-	if regime != "AGGRESSIVE" {
-		t.Errorf("Nifty above SMA200 + ROC≥5%% should be AGGRESSIVE, got %s", regime)
-	}
-}
-
-func TestROCRegime_DefensiveNear45(t *testing.T) {
-	// DEFENSIVE: Nifty below SMA200 (Faber 2007 primary rule)
-	s := NewScannerAgent()
-	s.DailyCache = makeMockCache()
-	// 400 bars at 100.0, last bar at 80.0 → SMA200≈100, current=80 < SMA200 → DEFENSIVE
-	niftyCloses := makeFlat(400, 100.0)
-	niftyCloses[len(niftyCloses)-1] = 80.0
-	s.DailyCache.Closes[config.NiftySpotToken] = niftyCloses
-	s.DailyCache.Closes[config.SmallcapToken] = makeFlat(450, 100.0)
-	s.DailyCache.Loaded = true
-
-	regime := s.DetectRegime()
-	if regime != "DEFENSIVE" {
-		t.Errorf("Nifty below SMA200 should be DEFENSIVE, got %s", regime)
-	}
-}
-
-func TestROCRegime_NoNewSignalsInDefensive(t *testing.T) {
-	// Doc: DEFENSIVE = don't open new positions
-	s := NewScannerAgent()
-	s.DailyCache = makeMockCache()
-	s.DailyCache.Loaded = true
-	s.Universe = map[uint32]string{1: "TEST"}
-
-	signals := s.RunAllScans("DEFENSIVE")
-	if len(signals) != 0 {
-		t.Errorf("DEFENSIVE regime should produce 0 signals, got %d", len(signals))
-	}
-}
-
-// (Fundamental-filter tests removed — the Screener.in fundamental gate is not in the
-//  book; "Swing Trading Simplified" is purely technical/price-action.)
+// (Regime gate removed — engine scans all market conditions. Individual stock
+//  filters act as the gate. See scanner_agent.go passesPhase2Filter.)
 
 // --- Section III.2: Near ATH Filter ---
 
@@ -111,7 +62,7 @@ func TestEMAPullback_RejectsDowntrend(t *testing.T) {
 	dc.Closes[1], dc.Highs[1], dc.Lows[1], dc.Volumes[1] = closes, highs, lows, volumes
 
 	ctx := StrategyContext{Cache: dc, CapitalMultiplier: 1.0}
-	if sig := (&EMAStrategy{}).Detect(1, "TEST", closes[n-1], "NORMAL", ctx); sig != nil {
+	if sig := (&EMAStrategy{}).Detect(1, "TEST", closes[n-1], ctx); sig != nil {
 		t.Error("EMA pullback must be rejected in a downtrend")
 	}
 }
@@ -138,15 +89,20 @@ func TestEMAPullback_FiresOnBounce(t *testing.T) {
 		lows[i] = dip - 1.0
 		volumes[i] = 700 // lighter than the prior 2000
 	}
-	// Last bar: green bounce back up, reclaiming the fast EMA.
+	// Last bar: green bounce — open below close, expanding volume (confirms demand).
 	closes[n-1] = closes[82] + 1.0
 	highs[n-1] = closes[n-1] + 1.0
 	lows[n-1] = closes[88]
-	volumes[n-1] = 700
+	volumes[n-1] = 1800 // above pullback avg (700) — expanding volume required
+	opens := make([]float64, n)
+	for i := range opens {
+		opens[i] = closes[i] - 0.5 // every bar opens below its close (green)
+	}
 	dc.Closes[1], dc.Highs[1], dc.Lows[1], dc.Volumes[1] = closes, highs, lows, volumes
+	dc.Opens[1] = opens
 
 	ctx := StrategyContext{Cache: dc, CapitalMultiplier: 1.0}
-	sig := (&EMAStrategy{}).Detect(1, "TEST", closes[n-1], "NORMAL", ctx)
+	sig := (&EMAStrategy{}).Detect(1, "TEST", closes[n-1], ctx)
 	if sig == nil {
 		t.Error("EMA pullback should fire on a clean uptrend pullback-and-bounce")
 	} else if sig.Strategy != "EMA_PULLBACK" {
@@ -284,12 +240,12 @@ func TestReEntry_GreenCandleAboveEMA(t *testing.T) {
 	s.DailyCache.Closes[1] = closes
 	s.DailyCache.EMA20[1] = 101.0 // EMA20 = 101
 
-	sig := s.CheckReEntry(1, "TEST", "NORMAL")
+	sig := s.CheckReEntry(1, "TEST")
 	if sig == nil {
 		t.Error("Should generate re-entry signal when green candle reclaims 21 EMA")
 	}
-	if sig != nil && sig.Strategy != "VCP_REENTRY" {
-		t.Errorf("Re-entry strategy should be VCP_REENTRY, got %s", sig.Strategy)
+	if sig != nil && sig.Strategy != "EMA_REENTRY" {
+		t.Errorf("Re-entry strategy should be EMA_REENTRY, got %s", sig.Strategy)
 	}
 }
 
@@ -304,7 +260,7 @@ func TestReEntry_RejectsRedCandle(t *testing.T) {
 	s.DailyCache.Closes[1] = closes
 	s.DailyCache.EMA20[1] = 101.0
 
-	sig := s.CheckReEntry(1, "TEST", "NORMAL")
+	sig := s.CheckReEntry(1, "TEST")
 	if sig != nil {
 		t.Error("Should NOT re-enter on red candle (close < prev)")
 	}
@@ -321,7 +277,7 @@ func TestReEntry_RejectsBelowEMA(t *testing.T) {
 	s.DailyCache.Closes[1] = closes
 	s.DailyCache.EMA20[1] = 101.0
 
-	sig := s.CheckReEntry(1, "TEST", "NORMAL")
+	sig := s.CheckReEntry(1, "TEST")
 	if sig != nil {
 		t.Error("Should NOT re-enter when close is below 21 EMA")
 	}
@@ -433,6 +389,7 @@ func makeMockCache() *DailyCache {
 		ATR:          make(map[uint32]float64),
 		EMA10:        make(map[uint32]float64),
 		EMA20:        make(map[uint32]float64),
+		Opens:        make(map[uint32][]float64),
 		Closes:       make(map[uint32][]float64),
 		Highs:        make(map[uint32][]float64),
 		Lows:         make(map[uint32][]float64),
@@ -445,16 +402,6 @@ func makeMockCache() *DailyCache {
 		Loaded:       true,
 	}
 }
-
-func makeMockCacheWithStock(token uint32, symbol string, price float64) *DailyCache {
-	dc := makeMockCache()
-	dc.Closes[token] = makeFlat(100, price)
-	dc.Highs[token] = makeFlat(100, price*1.05)
-	dc.Lows[token] = makeFlat(100, price*0.95)
-	dc.High52W[token] = price * 1.02
-	return dc
-}
-
 func makeFlat(n int, val float64) []float64 {
 	s := make([]float64, n)
 	for i := range s {
@@ -463,53 +410,48 @@ func makeFlat(n int, val float64) []float64 {
 	return s
 }
 
-func buildVCPPattern() (closes, highs, lows []float64) {
-	n := 80
-	closes = make([]float64, n)
-	highs = make([]float64, n)
-	lows = make([]float64, n)
+// ── Regression tests for bugs found in June 2026 forensic review ──────────────
 
-	resistance := 100.0
-	for i := 0; i < n; i++ {
-		closes[i] = resistance
-		highs[i] = resistance + 2
-		lows[i] = resistance - 2
+// TestRecordWin_RestoresCapitalMultiplier — regression for bug where RecordWin()
+// did not restore CapitalMultiplier after consecutive SLs reduced it.
+// The win-recovery ladder (3→60%, 5→80%, 7→100%) must mirror the backtest engine.
+func TestRecordWin_RestoresCapitalMultiplier(t *testing.T) {
+	s := NewScannerAgent()
+	for i := 0; i < config.ConsecutiveSLCutoff; i++ {
+		s.RecordSLHit()
 	}
-	// Pullback 1: 25% depth (days 10-20)
-	for i := 10; i < 20; i++ {
-		lows[i] = resistance * 0.75
-		closes[i] = resistance * 0.80
-		highs[i] = resistance * 0.85
+	if s.CapitalMultiplier != config.ReducedCapitalPct {
+		t.Fatalf("setup: expected %.2f after %d SLs, got %.2f",
+			config.ReducedCapitalPct, config.ConsecutiveSLCutoff, s.CapitalMultiplier)
 	}
-	// Recovery
-	for i := 20; i < 30; i++ {
-		closes[i] = resistance
-		highs[i] = resistance + 1
-		lows[i] = resistance - 1
+
+	// 3 wins → 60%
+	s.RecordWin(); s.RecordWin(); s.RecordWin()
+	if s.CapitalMultiplier < 0.60 {
+		t.Errorf("after 3 wins: want CapitalMultiplier≥0.60, got %.2f", s.CapitalMultiplier)
 	}
-	// Pullback 2: 10% depth (days 30-38)
-	for i := 30; i < 38; i++ {
-		lows[i] = resistance * 0.90
-		closes[i] = resistance * 0.92
-		highs[i] = resistance * 0.93
+	// 5 wins → 80%
+	s.RecordWin(); s.RecordWin()
+	if s.CapitalMultiplier < 0.80 {
+		t.Errorf("after 5 wins: want CapitalMultiplier≥0.80, got %.2f", s.CapitalMultiplier)
 	}
-	// Recovery
-	for i := 38; i < 48; i++ {
-		closes[i] = resistance
-		highs[i] = resistance + 1
-		lows[i] = resistance - 1
+	// 7 wins → 100%
+	s.RecordWin(); s.RecordWin()
+	if s.CapitalMultiplier < 1.0 {
+		t.Errorf("after 7 wins: want CapitalMultiplier=1.0, got %.2f", s.CapitalMultiplier)
 	}
-	// Pullback 3: 5% depth (days 48-55)
-	for i := 48; i < 55; i++ {
-		lows[i] = resistance * 0.95
-		closes[i] = resistance * 0.96
-		highs[i] = resistance * 0.97
-	}
-	// Final recovery to resistance
-	for i := 55; i < n; i++ {
-		closes[i] = resistance
-		highs[i] = resistance + 1
-		lows[i] = resistance - 1
-	}
-	return
 }
+
+// TestRecordSLHit_ResetsWinCounter — a new SL hit must reset the consecutive win counter
+// so a subsequent win chain starts fresh from zero.
+func TestRecordSLHit_ResetsWinCounter(t *testing.T) {
+	s := NewScannerAgent()
+	s.RecordWin(); s.RecordWin() // 2 wins
+	s.RecordSLHit()              // SL hit — should reset win chain
+	s.RecordWin()                // only 1 win after reset
+	// After 1 win (below ladder threshold of 3), multiplier must still be 1.0 (was never reduced)
+	if s.CapitalMultiplier != 1.0 {
+		t.Errorf("CapitalMultiplier should remain 1.0 (no SL reduction + 1 win), got %.2f", s.CapitalMultiplier)
+	}
+}
+

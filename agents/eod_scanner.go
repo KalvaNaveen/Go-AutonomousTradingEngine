@@ -18,7 +18,7 @@ import (
 // ══════════════════════════════════════════════════════════════
 //  EOD Market Scanner — Daily Nifty 750 Technical Scan
 // ══════════════════════════════════════════════════════════════
-//  Runs at 15:45 IST on trading days.
+//  Runs at 16:00 IST on trading days.
 //  Scans the Nifty Total Market (~750 stocks) using existing
 //  technical indicators, classifies as BUY/SELL, generates a
 //  CSV report, and sends it via Telegram.
@@ -57,7 +57,7 @@ type EODScanDeps struct {
 	GetLiveVolume func(token uint32) int64
 }
 
-// RunEODMarketScan is the top-level function called from main.go at 15:45.
+// RunEODMarketScan is the top-level function called from main.go at 16:00.
 // It loads the Nifty 750 universe, fetches/uses daily cache, runs analysis,
 // generates a CSV, and sends the report via Telegram.
 func RunEODMarketScan(deps EODScanDeps, scanner *ScannerAgent) {
@@ -135,17 +135,27 @@ func RunEODMarketScan(deps EODScanDeps, scanner *ScannerAgent) {
 		return
 	}
 
-	// Step 6: Bird's Eye View — Ch.10 full market health report (sent separately)
-	// Must run AFTER cache is loaded so the breadth calculations have data.
-	// scanner.DailyCache may differ from scanCache (extended universe); update it.
+	// Step 6: Bird's Eye View — Ch.10 full market health report (sent separately).
+	// Use the extended scanCache for breadth (more stocks = better breadth signal),
+	// but merge in the original cache's regime tokens (Nifty, Smallcap) so that
+	// Nifty price and SMA200 are available. Without this, Bird's Eye shows Nifty=0.
 	origCache := scanner.DailyCache
-	scanner.DailyCache = scanCache
+	mergedCache := scanCache
+	for _, tok := range []uint32{config.NiftySpotToken, config.SmallcapToken} {
+		if closes, ok := origCache.Closes[tok]; ok {
+			if mergedCache.Closes == nil {
+				mergedCache.Closes = make(map[uint32][]float64)
+			}
+			mergedCache.Closes[tok] = closes
+		}
+	}
+	scanner.DailyCache = mergedCache
 	scanner.RunBirdsEyeView()
 	scanner.DailyCache = origCache
 
 	// Step 7: Build and send Telegram summary
 	summary := buildEODSummary(results, scanned, buyCount, sellCount, elapsed)
-	// Append Book Ch.11 scans: trigger candles, tight range, MOMO leaders
+	// Append Book Ch.11 scans: trigger candles, MOMO leaders
 	bookScans := EODBookScans(scanCache, eodUniverse, deps.GetLiveLTP, deps.GetLiveVolume)
 	if bookScans != "" {
 		summary += bookScans
@@ -215,7 +225,7 @@ func analyzeStock(
 		}
 	}
 
-	// SMA 200 — computed from closes (cache no longer stores SMA200; EOD lookback=150 so rarely available)
+	// SMA 200 — computed from closes (cache no longer stores SMA200)
 	sma200Val := 0.0
 	if len(closes) >= 200 {
 		sum := 0.0
@@ -430,7 +440,7 @@ func detectPatternForEOD(token uint32, symbol string, ltp float64, cache *DailyC
 		IsMajorEventDay:   false, // Don't suppress patterns on EOD scan
 	}
 	for _, strat := range AllStrategies() {
-		if sig := strat.Detect(token, symbol, ltp, "NORMAL", ctx); sig != nil {
+		if sig := strat.Detect(token, symbol, ltp, ctx); sig != nil {
 			return sig.Strategy
 		}
 	}
@@ -525,10 +535,9 @@ func generateEODCSV(results []EODScanResult) (string, error) {
 //  Book Ch.11: Supplementary Scan Results (appended to EOD summary)
 // ══════════════════════════════════════════════════════════════
 
-// EODBookScans runs the three extra scans from Book Ch.11:
+// EODBookScans runs two extra scans from Book Ch.11:
 //  1. Trigger Candle Scan (p.272): volume ≥ 3× 50-day avg + price ≥ 6.5%
-//  2. Tight Range Scan (p.271): today ≤ ±2.5%, yesterday ≤ ±3.5%
-//  3. Monthly Gainers / MOMO Scan (p.269): % change thresholds across timeframes
+//  2. Monthly Gainers / MOMO Scan (p.269): % change thresholds across timeframes
 //
 // Returns Telegram-formatted text to append to the EOD summary.
 func EODBookScans(cache *DailyCache, universe map[uint32]string, getLTP func(uint32) float64, getVol func(uint32) int64) string {
@@ -536,7 +545,7 @@ func EODBookScans(cache *DailyCache, universe map[uint32]string, getLTP func(uin
 		return ""
 	}
 
-	var triggerCandles, tightRange, momoLeaders []string
+	var triggerCandles, momoLeaders []string
 
 	for token, symbol := range universe {
 		closes, cOk := cache.Closes[token]
@@ -582,23 +591,7 @@ func EODBookScans(cache *DailyCache, universe map[uint32]string, getLTP func(uin
 			}
 		}
 
-		// ── 2. Tight Range Scan (Book p.271) ─────────────────────────────────
-		// "Today % change ≤ 2.5% (absolute), Yesterday ≤ 3.5% (absolute)"
-		if math.Abs(todayChangePct) <= 2.5 && len(closes) >= 3 {
-			prevPrevClose := closes[len(closes)-3]
-			if prevPrevClose > 0 {
-				yesterdayChangePct := math.Abs((prevClose - prevPrevClose) / prevPrevClose * 100)
-				if yesterdayChangePct <= 3.5 {
-					ema20s := computeEMASeries(closes, 20)
-					if len(ema20s) > 0 && ltp > ema20s[len(ema20s)-1] {
-						tightRange = append(tightRange,
-							fmt.Sprintf("`%s` today=%.1f%% prev=%.1f%%", symbol, todayChangePct, yesterdayChangePct))
-					}
-				}
-			}
-		}
-
-		// ── 3. Monthly Gainers / MOMO Scan (Book p.269) ──────────────────────
+		// ── 2. Monthly Gainers / MOMO Scan (Book p.269) ──────────────────────
 		// Conditions: CMP > ₹30, 10-day > 20%, 30-day > 20%, 90-day > 30%, 180-day > 90%
 		if len(closes) >= 181 {
 			c10 := closes[len(closes)-11]
@@ -630,16 +623,6 @@ func EODBookScans(cache *DailyCache, universe map[uint32]string, getLTP func(uin
 			out += s + "\n"
 		}
 	}
-	if len(tightRange) > 0 {
-		out += "\n🎯 *TIGHT RANGE* (contraction setups):\n"
-		for i, s := range tightRange {
-			if i >= 8 {
-				out += fmt.Sprintf("... +%d more\n", len(tightRange)-8)
-				break
-			}
-			out += s + "\n"
-		}
-	}
 	if len(momoLeaders) > 0 {
 		out += "\n🚀 *MOMENTUM LEADERS* (MOMO scan):\n"
 		for i, s := range momoLeaders {
@@ -653,46 +636,136 @@ func EODBookScans(cache *DailyCache, universe map[uint32]string, getLTP func(uin
 	return out
 }
 
+// buildEODSummary builds the Telegram EOD report in two sections:
+//   Section 1 — Top 15 most convincing BUY setups (EMA pullback, ranked by RS)
+//   Section 2 — Top 10 momentum stocks (biggest % movers today)
 func buildEODSummary(results []EODScanResult, scanned, buyCount, sellCount int, elapsed time.Duration) string {
-	dateStr := config.NowIST().Format("02 Jan 2026")
-	sep := "━━━━━━━━━━━━━━━━━━━━━━━━"
+	dateStr := config.NowIST().Format("02 Jan 2006")
 
-	msg := fmt.Sprintf(
-		"📊 *EOD MARKET SCAN — %s*\n%s\n🔎 Scanned: `%d` stocks\n🟢 BUY: `%d` | 🔴 SELL: `%d`\n⏱ Time: `%.0f sec`\n",
-		dateStr, sep, scanned, buyCount, sellCount, elapsed.Seconds())
-
-	// Top 10 BUY picks
-	buyPicks := 0
+	// ── Section 1: Top 15 BUY setups ──────────────────────────────────────────
+	var buys []EODScanResult
 	for _, r := range results {
-		if r.Signal == "BUY" && buyPicks < 10 {
-			if buyPicks == 0 {
-				msg += fmt.Sprintf("\n🟢 *TOP BUY PICKS*\n")
-			}
-			buyPicks++
-			patternTag := ""
+		if r.Signal == "BUY" {
+			buys = append(buys, r)
+		}
+	}
+	// Already sorted by RS desc from the caller's sort step
+
+	msg := fmt.Sprintf("📊 *EOD SWING SCAN — %s*\n", dateStr)
+	msg += "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+	msg += fmt.Sprintf("🔎 `%d` stocks scanned | 🟢 `%d` BUY setups found\n", scanned, buyCount)
+	msg += "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+	_ = sellCount
+	_ = elapsed
+
+	if len(buys) == 0 {
+		msg += "\n❌ No convincing BUY setups today. Market may be consolidating.\n"
+	} else {
+		limit := 15
+		if len(buys) < limit {
+			limit = len(buys)
+		}
+		msg += fmt.Sprintf("\n🟢 *TOP %d BUY SETUPS* _(EMA Pullback)_\n\n", limit)
+		for i := 0; i < limit; i++ {
+			r := buys[i]
+			rsTag := eodRSEmoji(r.RSScore)
+			patTag := ""
 			if r.Pattern != "" {
-				patternTag = fmt.Sprintf(" | `%s`", r.Pattern)
+				patTag = " ✅"
 			}
-			msg += fmt.Sprintf("`%d.` `%s` — ₹`%.0f` | RS:`%d`%s\n",
-				buyPicks, r.Symbol, r.LTP, r.RSScore, patternTag)
+			// Volume vs average
+			volTag := ""
+			if r.AvgVolume > 0 {
+				vr := r.Volume / r.AvgVolume
+				switch {
+				case vr >= 2.0:
+					volTag = fmt.Sprintf(" | Vol: 🔥`%.1fx` avg", vr)
+				case vr >= 1.3:
+					volTag = fmt.Sprintf(" | Vol: ⚡`%.1fx` avg", vr)
+				default:
+					volTag = fmt.Sprintf(" | Vol: `%.1fx` avg", vr)
+				}
+			}
+			// Distance from 52W high
+			nearHighTag := ""
+			if r.High52W > 0 && r.LTP > 0 {
+				dist := (r.High52W - r.LTP) / r.High52W * 100
+				if dist <= 2.0 {
+					nearHighTag = " | 🏔 Near ATH"
+				} else if dist <= 8.0 {
+					nearHighTag = fmt.Sprintf(" | `%.1f%%` from 52W High", dist)
+				}
+			}
+			msg += fmt.Sprintf("*%d. %s* %s%s\n   ₹`%.0f`%s%s\n\n",
+				i+1, r.Symbol, rsTag, patTag,
+				r.LTP, volTag, nearHighTag)
+		}
+		if len(buys) > 15 {
+			msg += fmt.Sprintf("_... +%d more in CSV_\n", len(buys)-15)
 		}
 	}
 
-	// Top 10 SELL picks
-	sellPicks := 0
+	// ── Section 2: Top 10 momentum movers (biggest % change today) ────────────
+	// Use all results (BUY + SELL) sorted by MarketCap as a proxy for % change
+	// We don't have intraday % change in EODScanResult so we use RS as momentum proxy.
+	// Top RS scorers that are BUY = strongest momentum.
+	type mover struct {
+		symbol string
+		ltp    float64
+		rs     int
+		mcap   float64
+	}
+	var movers []mover
+	seen := make(map[string]bool)
 	for _, r := range results {
-		if r.Signal == "SELL" && sellPicks < 10 {
-			if sellPicks == 0 {
-				msg += fmt.Sprintf("\n🔴 *TOP SELL PICKS*\n")
+		if r.Signal == "BUY" && !seen[r.Symbol] {
+			movers = append(movers, mover{r.Symbol, r.LTP, r.RSScore, r.MarketCap})
+			seen[r.Symbol] = true
+		}
+	}
+	// Sort by RS desc for top momentum
+	for i := 0; i < len(movers)-1; i++ {
+		for j := i + 1; j < len(movers); j++ {
+			if movers[j].rs > movers[i].rs {
+				movers[i], movers[j] = movers[j], movers[i]
 			}
-			sellPicks++
-			msg += fmt.Sprintf("`%d.` `%s` — ₹`%.0f` | RS:`%d`\n",
-				sellPicks, r.Symbol, r.LTP, r.RSScore)
+		}
+	}
+	if len(movers) > 0 {
+		msg += "\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
+		msg += "🚀 *TOP MOMENTUM* _(Highest RS Score)_\n\n"
+		limit2 := 10
+		if len(movers) < limit2 {
+			limit2 = len(movers)
+		}
+		for i := 0; i < limit2; i++ {
+			m := movers[i]
+			mcapStr := ""
+			if m.mcap > 0 {
+				mcapStr = fmt.Sprintf(" | MCap `₹%.0fCr`", m.mcap)
+			}
+			msg += fmt.Sprintf("`%d.` *%s* — ₹`%.0f` | RS `%d`%s\n",
+				i+1, m.symbol, m.ltp, m.rs, mcapStr)
 		}
 	}
 
-	msg += fmt.Sprintf("\n📎 _Full CSV report attached below._")
+	msg += "\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
+	msg += "📎 _Full CSV attached below_"
 	return msg
+}
+
+// eodRSEmoji returns fire/star emoji based on RS tier.
+func eodRSEmoji(rs int) string {
+	switch {
+	case rs >= 95:
+		return "🔥"
+	case rs >= 80:
+		return "⭐"
+	case rs >= 60:
+		return "✅"
+	default:
+		return ""
+	}
 }
 
 // ══════════════════════════════════════════════════════════════

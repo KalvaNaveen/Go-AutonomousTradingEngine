@@ -67,6 +67,7 @@ var (
 	KiteAPIKey        = envStr("KITE_API_KEY", "")
 	KiteAPISecret     = envStr("KITE_API_SECRET", "")
 	KiteAccessToken   = envStr("KITE_ACCESS_TOKEN", "")
+	KiteEncToken      = "" // captured from kite.zerodha.com session cookie after login
 	KiteRedirectURL   = envStr("KITE_REDIRECT_URL", "https://127.0.0.1")
 	ZerodhaUserID     = envStr("ZERODHA_USER_ID", "")
 	ZerodhaPassword   = envStr("ZERODHA_PASSWORD", "")
@@ -125,45 +126,34 @@ var TotalCapital = envFloat("TRADING_CAPITAL", 100000)
 //  SWING TRADING STRATEGY CONSTANTS
 // ══════════════════════════════════════════════════════════════
 
-// Phase 1: Market Timing — SMA200-based regime detection
-// Source: Faber (2007) "A Quantitative Approach to Tactical Asset Allocation",
-// validated on US, international, and emerging markets including India.
-// Rule: index above its 200-day SMA = uptrend (NORMAL/AGGRESSIVE).
-//       index below its 200-day SMA = downtrend (DEFENSIVE).
-// AGGRESSIVE boost: 21-day ROC > 5% (one month of positive momentum).
-// 21-day ROC = standard one-month momentum period in academic momentum literature.
+// Phase 1: Market Timing — Book Ch.10 p.252-253: The 10 & 20 Rule
+// "If one is a long-only swing trader, they should wait for the relevant indices
+//  to trade above the 10 and the 20 EMAs, where the 10 EMA should be positioned
+//  above the 20 EMA."
+// NORMAL: Nifty 50 passes the rule. AGGRESSIVE: both Nifty + Smallcap pass.
+// DEFENSIVE: rule fails.
 const (
-	RegimeSMAPeriod         = 200  // 200-day SMA — primary trend filter (Faber 2007)
-	RegimeMomentumPeriod    = 21   // 21-day window = 1 calendar month of trading days
-	RegimeMomentumThreshold = 5.0  // Nifty up >5% in 21 days → AGGRESSIVE regime
-	ConsecutiveSLCutoff     = 5    // 5 consecutive SL hits → reduce capital
-	ReducedCapitalPct       = 0.35 // Reduce to ~35% capital on contingency
+	// RegimeSMAPeriod / RegimeMomentumPeriod: informational only — used in the
+	// Bird's Eye report for context display. The trading regime is driven solely
+	// by the book's 10 & 20 Rule (Ch.10 p.252-253).
+	RegimeSMAPeriod      = 200 // informational: SMA200 shown in bird's eye report
+	RegimeMomentumPeriod = 21  // informational: 21-day ROC shown in bird's eye report
+
+	ConsecutiveSLCutoff = 5    // 5 consecutive SL hits → reduce capital
+	ReducedCapitalPct   = 0.35 // Reduce to ~35% capital on contingency
 )
 
 // Data lookback windows
 const (
-	// EODLookbackDays is the history (calendar days) fetched for every equity.
-	// 1500 calendar days ≈ ~1000 trading bars (~4 years). Needed for:
-	//   • All-Time High proxy (ATH filter requires multi-year context)
-	//   • EMA10/EMA20 warm-up and VCP pattern detection
-	//   • Backtest engine: deep window spanning both bull and bear regimes so
-	//     strategies can be validated across market conditions (not just the
-	//     recent downtrend, where the book correctly sits out and trades 0).
-	EODLookbackDays = 1500
+	// EODLookbackDays: calendar days used as fallback when historical.db is unavailable.
+	// 1825 calendar days = 5 years. The DB-first Preload uses its own 1825-day constant;
+	// this value is only hit when the DB cannot be opened.
+	EODLookbackDays = 1825
 
-	// RegimeLookbackDays MUST equal EODLookbackDays so the Nifty/Smallcap regime
-	// arrays are the SAME length and date-aligned with the equity arrays — the
-	// backtest indexes regime by the same bar index as each stock, so a mismatch
-	// would check the wrong date's regime. (Index 0 = same calendar date for all.)
-	RegimeLookbackDays = 1500
+	// RegimeLookbackDays kept equal to EODLookbackDays for date-alignment in backtest.
+	RegimeLookbackDays = 1825
 )
 
-// Section V: Technical Entry Setups
-const (
-	VCPLookbackDays     = 120  // Minervini: VCPs form over 3 weeks–6 months; 120 bars ≈ 6 months
-	VCPMinPullbacks     = 2    // Minervini: 2–5 contractions valid; 3 was too strict for 60-bar window
-	VCPContractionRatio = 0.98 // Each pullback depth must be < 98% of the prior
-)
 
 // ATHProximityPct: stock must be within this % of its 52-week high to pass the
 // Phase 2 filter. Configurable via env ATH_PROXIMITY_PCT (default 10%).
@@ -198,18 +188,11 @@ var (
 	SLFloorPct  = 3.0 // SL never tighter than this % (avoids noise stop-out)
 	SLCeilingPct = 5.0 // SL never wider than this % (user hard limit)
 
-	// MaxPositionsOverride: when > 0 it overrides the dynamic formula in ComputeMaxPositions.
-	// Set via Apply Config (max_positions field). 0 = use dynamic capital ÷ ₹15K formula.
-	MaxPositionsOverride = 0
 )
 
 // ComputeMaxPositions returns the open-position cap for the given capital.
-// If MaxPositionsOverride > 0 (set via Apply Config) that value is used directly.
-// Otherwise falls back to the dynamic formula: floor(capital×0.90 / ₹15K), capped at 15.
+// Formula: floor(capital × 0.90 / ₹15K), capped at MaxPositionsHardCap.
 func ComputeMaxPositions(capital float64) int {
-	if MaxPositionsOverride > 0 {
-		return MaxPositionsOverride
-	}
 	if capital <= 0 {
 		return 1
 	}
@@ -237,7 +220,6 @@ func LoadOverride(path string) {
 		SLFloorPct       float64 `json:"sl_floor_pct"`
 		SLCeilingPct     float64 `json:"sl_ceiling_pct"`
 		MaxTradeAllocPct float64 `json:"max_trade_alloc_pct"`
-		MaxPositions     int     `json:"max_positions"`
 	}
 	if err := json.Unmarshal(data, &ov); err != nil {
 		return
@@ -254,7 +236,6 @@ func LoadOverride(path string) {
 	if ov.MaxTradeAllocPct > 0 {
 		MaxTradeAllocPct = ov.MaxTradeAllocPct
 	}
-	MaxPositionsOverride = ov.MaxPositions // 0 = revert to dynamic formula
 }
 
 // ComputeStructuralSL returns the stop-loss price for a long entry.
@@ -337,26 +318,13 @@ func ComputeATR(highs, lows, closes []float64, period int) float64 {
 
 // Section VII: Exits — EMA-based mechanical exit
 // EMA10 = fast trend filter; EMA20 = trend confirmation and exit trigger.
-// 63 EMA is used ONLY for VCP invalidation, NOT for entries or exits.
 const (
-	EMA10Period        = 10 // Fast EMA — crossover entry signal
-	EMA20Period        = 20 // Trend EMA — entry confirmation + exit trigger
-	EMA63Period        = 63 // VCP invalidation check only
-	// RedCandlesBelowEMA is legacy — exit now triggers on a SINGLE EOD close below EMA.
-	// Book Ch.6 p.167-168: "Close below the key MA — sell on that day." (Figs 6.4, 6.5)
-	RedCandlesBelowEMA = 1  // Single EOD close below EMA = exit (Ch.6 rule)
-
-	// PaperSlippagePct: realistic fill simulation for paper/backtest mode.
-	// NSE liquid stocks face ~0.1–0.3% adverse price movement between signal and fill.
-	// Applied as a percentage markup on the entry price in paper mode only.
-	PaperSlippagePct = 0.3
+	EMA10Period        = 10 // Fast EMA — entry signal
+	EMA20Period        = 20 // Trend EMA — exit trigger (close below = sell)
+	// RedCandlesBelowEMA: book Ch.6 — single EOD close below EMA = exit.
+	RedCandlesBelowEMA = 1
 )
 
-// VolumeSpikeMultiplier: used only for the live intraday volume check at signal time.
-// Ensures breakout has real participation, not just a quiet drift through EMA.
-// Configurable via env VOLUME_SPIKE_MULTIPLIER (default 1.5×).
-// Lower values (e.g. 1.2) allow earlier signals; raise to 2.0 for stricter confirmation.
-var VolumeSpikeMultiplier = envFloat("VOLUME_SPIKE_MULTIPLIER", 1.5)
 
 // ── Book Ch.3 / Ch.11: Trigger Candle thresholds ────────────────────────────
 // A trigger candle marks the START of momentum — a young stock's launch day.
@@ -373,6 +341,11 @@ const (
 // Prevents buying into parabolic/extended stocks with unfavorable risk-reward.
 const (
 	EMA50Period       = 50   // 50-day EMA — extension reference
+
+	// MACD — fast=EMA10, slow=EMA20 (same as our trend EMAs), signal=EMA9
+	// MACD line = EMA10 - EMA20. Histogram = MACD - Signal.
+	// We only use histogram DIRECTION on the bounce bar (not crossover).
+	MACDSignalPeriod = 9 // EMA of the MACD line → signal line
 	Extension50EMAPct = 30.0 // skip if LTP > EMA50 × 1.30
 )
 
@@ -402,14 +375,6 @@ const GapUpFilterPct = 3.0
 // (Minimum cash-reserve constant removed — the book caps deployment only via
 //  open-risk 4-5% and position count 8-12, not a fixed cash buffer.)
 
-// ── Book Ch.12: Partial profit rules (p.283) ──────────────────────────────────
-// "When profit reaches 2× your initial risk (2R), sell 50% of the position
-//  and let the remainder run with the EMA trailing stop."
-// "On 3 consecutive strong up days (≥1.5% each), sell 25% into strength."
-const (
-	TwoRPartialSellPct      = 50.0 // sell this % of position at 2R
-	StrongDayPartialSellPct = 25.0 // sell this % on 3 strong consecutive days
-)
 
 // ── Book Ch.9: Weekly chart alignment (p.220) ─────────────────────────────────
 // "Before entering on the daily chart, check the weekly chart is also in uptrend
@@ -417,7 +382,6 @@ const (
 // Weekly EMA periods — Book Ch.11 p.268: "10-week EMA above 30-week EMA"
 // Weekly scan: price > 10W EMA AND 10W EMA > 30W EMA.
 const (
-	WeeklyEMAPeriod  = 20 // legacy — kept for backward compat; not used in scan
 	Weekly10EMAPeriod = 10 // Ch.11 p.268: 10-week EMA (fast trend filter)
 	Weekly30EMAPeriod = 30 // Ch.11 p.268: 30-week EMA (long-term trend filter)
 )
@@ -493,26 +457,6 @@ const (
 )
 
 // ── Book Ch.6 p.171-172: Downside Pivot Exit ──────────────────────────────────
-// "Wait for the stock to form a downside pivot on the daily time frame. This pivot
-//  indicates a shift in momentum and can be a signal to consider selling your
-//  holdings." (BEL 2015 example: broke below pivot low on 9 March)
-// A downside pivot = recent swing low (lowest low over a short lookback window)
-// that gets violated by a daily close below it.
-const (
-	DownsidePivotLookback = 10 // bars to scan for the most recent swing low
-)
-
-// ── Book Ch.6 p.163: Extended-Move Sell ───────────────────────────────────────
-// "If you see a stock moving 25-30% in a matter of a few sessions, consider it
-//  extended. This presents an ideal opportunity to take profits, as the stock is
-//  more likely to pull back or consolidate after such a substantial run-up."
-// IMPORTANT: applies to LATE-stage extensions only. Early-stage extensions
-// (stock emerging from long-term bear trend / consolidation) are NOT sell signals.
-const (
-	ExtendedMoveSessionsWindow = 6    // "few sessions" = 6 bars (~1 week+1)
-	ExtendedMoveMinPct         = 25.0 // book's lower bound; ≥25% in ≤6 sessions = extended
-	ExtendedMovePartialSellPct = 50.0 // book says "take profits" — sell half by default
-)
 
 // ── Book Ch.7 p.179-180: ATR-Based Stop Method ────────────────────────────────
 // "You might set your stop-loss at 1 ATR away from your entry point." Example:
@@ -536,18 +480,6 @@ const (
 	BreadthConfirmationSessions = 3 // need 3 consecutive sessions for a regime shift
 )
 
-// ── Book Ch.6 p.173: Hybrid Selling Technique partial = 25-35% ────────────────
-// "Sell a portion of your position—typically around 25–35%—into strength.
-//  This allows you to lock in some profits while the stock is still rising.
-//  For the remaining shares, you set a stop-loss at your buy price, effectively
-//  making the rest of your position risk-free."
-// NOTE: This is separate from the 2R partial (50% at 2R per p.162 R-multiple guide).
-// HybridPartialSellPct fires when stock makes strong upward move post-entry but
-// before reaching 2R, capturing the "selling into strength" intent of Ch.6.
-const (
-	HybridPartialSellPct  = 30.0 // mid-point of book's 25-35% range
-	HybridStrongMoveGainPct = 15.0 // trigger when position is up ≥15% (before 2R)
-)
 
 // ── Book Ch.4 p.127: Higher Low in Base (quality filter) ──────────────────────
 // "During a basing period, it's important to spot signs of buying interest. One
@@ -572,14 +504,6 @@ const (
 	BreakoutAttemptsFailRetracePct  = 2.0 // attempt must have closed back ≥2% below the high
 )
 
-// ── Book Ch.4: Flat Base pattern (p.120) ──────────────────────────────────────
-// "A stock that consolidates in a very tight range for 5+ weeks while volume
-//  dries up — above its SMA200. One of the most reliable continuation patterns."
-const (
-	FlatBaseMinBars    = 25  // 5 weeks × 5 trading days
-	FlatBaseMaxBars    = 100 // ~5 months max (after that it's no longer a base)
-	FlatBaseMaxRangePct = 5.0 // range must be < 5% of the high to be "flat"
-)
 
 // ── Book Ch.8: Risk-based position sizing ────────────────────────────────────
 // "Quantity = Risk / (Entry − Stop-Loss)"  where Risk = Capital × RiskPerTradePct
@@ -592,47 +516,6 @@ const (
 	MaxDrawdownHaltPct = 7.0 // halt new trades when drawdown > 7% (p.205: "keep below 5-7%")
 )
 
-// ── Book Ch.4: Bull Flag / Mini Base Pattern Constants ───────────────────────
-// Bull flag = pole (sharp rise) + flag (tight consolidation) + breakout.
-// Book p.68-85: "After a strong impulsive move, the stock rests in a tight
-// range before the next leg up. Volume must dry up during the flag."
-const (
-	FlagSearchWindow   = 90   // bars to search for a pole
-	FlagPoleMinBars    = 5    // pole must span at least 5 bars
-	FlagPoleMaxBars    = 25   // pole can span up to 25 bars
-	FlagPoleMinGainPct = 15.0 // pole must gain at least 15% to qualify
-	FlagMinBars        = 3    // flag consolidation: minimum 3 bars
-	FlagMaxBars        = 12   // flag consolidation: maximum 12 bars
-	FlagMaxRangePct    = 10.0 // flag range must be < 10% (tight)
-	FlagMaxRetracePct  = 50.0 // flag cannot retrace > 50% of the pole
-)
-
-// ── Book Ch.4: Cup & Handle Pattern Constants ─────────────────────────────────
-// Cup & Handle = rounded bottom over weeks + small handle + breakout above rim.
-// Book p.86-102: "The cup should be U-shaped, not V-shaped.
-// The handle should be tight and short, with volume drying up."
-const (
-	CupSearchWindow    = 200  // bars to search for the cup formation
-	CupMinBars         = 30   // cup must span at least 30 bars (6 weeks)
-	CupMaxBars         = 150  // cup can span up to 150 bars (~7 months)
-	CupMinDepthPct     = 10.0 // cup must drop at least 10% from the rim
-	CupMaxDepthPct     = 33.0 // cup cannot drop more than 33% from the rim
-	CupRimRecoveryPct  = 5.0  // right rim must recover to within 5% of left rim
-	HandleMinBars      = 3    // handle: minimum 3 bars
-	HandleMaxBars      = 15   // handle: maximum 15 bars (3 weeks)
-)
-
-// ── Book Ch.4: Trend Channel Pattern Constants ────────────────────────────────
-// Trend channel = rising channel with higher highs and higher lows.
-// Buy on pullback to the lower channel line.
-// Book p.103-118: "The third touch of the channel line is the buy point."
-const (
-	ChannelLookback      = 60   // bars to look back for channel formation
-	ChannelMinPivots     = 3    // minimum swing highs/lows to define a channel
-	ChannelEntryBandPct  = 3.0  // LTP must be within 3% above the lower channel line
-	ChannelMinWidthPct   = 5.0  // channel must be at least 5% wide
-	ChannelMaxWidthPct   = 25.0 // channel cannot be more than 25% wide
-)
 
 // ── Instrument Tokens ───────────────────────────────────────
 // Universe: Nifty Total Market 750 (Nifty 500 + Nifty Microcap 250).
@@ -666,19 +549,16 @@ var SectorTokens = map[string]uint32{
 	"NIFTY PSE":    262665,
 }
 
-// ── Timing (Swing — no intraday squareoff) ──────────────────
+// ── Timing ──────────────────────────────────────────────────
 const (
-	MarketOpenTime      = "09:15"
-	MarketCloseTime     = "15:30"
-	EODCheckTime        = "15:31" // Run daily EMA exit check after market close (candle finalized at 15:30)
-	EODScanTime         = "15:45" // Run full market scan near close
-	EODScanCleanupDays  = 30      // Auto-delete CSV files older than this
+	MarketOpenTime     = "09:15"
+	MarketCloseTime    = "15:30"
+	EODScanCleanupDays = 30 // Auto-delete CSV files older than this
 )
 
 // ── Paths ───────────────────────────────────────────────────
 var (
 	BaseDir   string
-	StateDB   string
 	JournalDB string
 )
 
@@ -693,7 +573,6 @@ func init() {
 	} else {
 		BaseDir = "."
 	}
-	StateDB = BaseDir + string(os.PathSeparator) + "data" + string(os.PathSeparator) + "engine_state.db"
 	JournalDB = BaseDir + string(os.PathSeparator) + "data" + string(os.PathSeparator) + "journal.db"
 }
 
@@ -709,20 +588,14 @@ func ParseTime(s string) (int, int) {
 }
 
 func PrintBanner() {
-	maxPos := ComputeMaxPositions(TotalCapital)
 	fmt.Println("═══════════════════════════════════════════")
-	fmt.Println("  QUANTIX ENGINE v5.0 — True Book Replica (Swing Trading Simplified)")
+	fmt.Println("  ZENITH SIGNAL ENGINE v5.0")
+	fmt.Println("  Swing Trading Simplified — Signal Only")
 	fmt.Println("  Universe: Nifty Total Market 750")
 	fmt.Println("═══════════════════════════════════════════")
-	if PaperMode {
-		fmt.Println("  Mode: PAPER (Virtual Fills)")
-	} else {
-		fmt.Println("  Mode: LIVE (Real Orders)")
-	}
-	fmt.Printf("  Capital: ₹%.0f | Max Positions: %d (dynamic)\n", TotalCapital, maxPos)
-	fmt.Printf("  SL: %.1f-%.1f%% structural | Trade Size: %.0f-%.0f%%\n", SLFloorPct, SLCeilingPct, MinTradeAllocPct, MaxTradeAllocPct)
-	fmt.Printf("  EMA%d (fast) + EMA%d (trend) + EMA%d (extension/trail) | Exit: %d red candles below EMA%d\n", EMA10Period, EMA20Period, EMA50Period, RedCandlesBelowEMA, EMA20Period)
-	fmt.Printf("  Risk/trade: %.0f%% | Open risk cap: %.0f%% | Drawdown halt: %.0f%%\n", RiskPerTradePct, MaxOpenRiskPct, MaxDrawdownHaltPct)
-	fmt.Printf("  Lookback: %d days equity | %d days regime\n", EODLookbackDays, RegimeLookbackDays)
+	fmt.Printf("  Strategy: EMA Pullback Bounce (Ch.3)\n")
+	fmt.Printf("  SL: %.1f-%.1f%% structural\n", SLFloorPct, SLCeilingPct)
+	fmt.Printf("  EMA%d (fast) + EMA%d (trend) | Exit: close below EMA%d\n", EMA10Period, EMA20Period, EMA20Period)
+	fmt.Printf("  Lookback: %d days | Alerts via Telegram\n", EODLookbackDays)
 	fmt.Println("═══════════════════════════════════════════")
 }

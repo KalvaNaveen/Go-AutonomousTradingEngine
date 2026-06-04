@@ -26,6 +26,9 @@ type KiteWebSocket struct {
 	connected   bool
 	readStarted bool // tracks whether readLoop goroutine is running
 	reconnects  int
+	// IsNonTradingPeriod is injected from main so reconnect() can skip
+	// retries on holidays/weekends. If nil, falls back to basic time check.
+	IsNonTradingPeriod func() bool
 }
 
 func NewKiteWebSocket(store *TickStore, tokens []uint32) *KiteWebSocket {
@@ -253,8 +256,37 @@ func (kws *KiteWebSocket) parseTick(pkt []byte) {
 	kws.store.OnTick(token, ltp, vol, dayOpen, dayHigh, dayLow, changePct, bidQty, askQty, exchangeTS)
 }
 
+// isNonTradingPeriod returns true when the market is closed (weekend,
+// outside 09:00–15:45 IST, or a holiday if IsNonTradingPeriod is wired).
+func (kws *KiteWebSocket) isNonTradingPeriod() bool {
+	if kws.IsNonTradingPeriod != nil {
+		return kws.IsNonTradingPeriod()
+	}
+	now := config.NowIST()
+	if now.Weekday() == time.Saturday || now.Weekday() == time.Sunday {
+		return true
+	}
+	hhmm := now.Hour()*100 + now.Minute()
+	return hhmm < 900 || hhmm >= 1545
+}
+
+// sleepUntilMarketMorning parks the goroutine until 09:00 IST next day.
+func sleepUntilMarketMorning() {
+	now := config.NowIST()
+	next := time.Date(now.Year(), now.Month(), now.Day()+1, 9, 0, 0, 0, config.IST)
+	log.Printf("[WS] Non-trading period — sleeping until %s", next.Format("2006-01-02 15:04 IST"))
+	time.Sleep(time.Until(next))
+}
+
 func (kws *KiteWebSocket) reconnect() bool {
 	for attempt := 1; attempt <= 300; attempt++ {
+		// Don't hammer reconnects outside market hours (holidays, weekends, overnight).
+		if kws.isNonTradingPeriod() {
+			sleepUntilMarketMorning()
+			attempt = 0 // reset counter — overnight gap is not a failure
+			continue
+		}
+
 		backoff := time.Duration(min(attempt*2, 30)) * time.Second
 		log.Printf("[WS] Reconnect attempt %d/300 in %v", attempt, backoff)
 		time.Sleep(backoff)
@@ -289,21 +321,6 @@ func (kws *KiteWebSocket) Close() {
 	}
 }
 
-// AddTokens subscribes additional tokens to the WebSocket (used by F&O module
-// to add NFO option tokens after the initial equity subscription).
-func (kws *KiteWebSocket) AddTokens(tokens []uint32) {
-	if len(tokens) == 0 {
-		return
-	}
-	kws.mu.Lock()
-	kws.tokens = append(kws.tokens, tokens...)
-	kws.mu.Unlock()
-
-	// Subscribe and set mode for new tokens
-	kws.subscribe(tokens)
-	kws.setMode("full", tokens)
-	log.Printf("[WS] Added %d tokens (total now: %d)", len(tokens), len(kws.tokens))
-}
 
 func (kws *KiteWebSocket) UpdateToken(newToken string) {
 	kws.mu.Lock()

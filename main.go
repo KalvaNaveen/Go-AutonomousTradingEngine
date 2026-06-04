@@ -5,13 +5,10 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"os/exec"
 	"sync"
 	"time"
 
 	"bnf_go_engine/agents"
-	"bnf_go_engine/api"
-	"bnf_go_engine/broker"
 	"bnf_go_engine/config"
 	"bnf_go_engine/core"
 	"bnf_go_engine/research"
@@ -80,45 +77,11 @@ func main() {
 	// ══════════════════════════════════════════════════════════════
 	//  Initialize Core Systems
 	// ══════════════════════════════════════════════════════════════
-	stateManager := core.NewStateManager()
-	journal := core.NewJournal()
 	scanner := agents.NewScannerAgent()
-	execAgent := agents.NewExecutionAgent(journal, stateManager)
-	execAgent.Scanner = scanner
-	fillMonitor := core.NewFillMonitor(stateManager)
+	signalAgent := agents.NewSignalAlertAgent()
+	signalAgent.Scanner = scanner
 
 	waitForNetwork()
-
-	// ══════════════════════════════════════════════════════════════
-	//  Broker (Paper or Live)
-	// ══════════════════════════════════════════════════════════════
-	var paperBroker *broker.RealisticPaperBroker
-	if config.PaperMode {
-		paperBroker = broker.NewRealisticPaperBroker(config.TotalCapital)
-		defer paperBroker.Stop()
-		execAgent.PlaceOrder = paperBroker.PlaceOrder
-		execAgent.CancelOrder = paperBroker.CancelOrder
-		log.Println("[Engine] Paper Broker enabled (CNC swing mode)")
-	} else {
-		kb := broker.NewKiteBroker()
-		gttClient := broker.NewGTTClient()
-		execAgent.PlaceOrder = kb.PlaceOrder
-		execAgent.CancelOrder = kb.CancelOrder
-		execAgent.CancelGTT = gttClient.CancelGTT
-		// Wire FillMonitor REST hooks so it can poll order status & modify SL qty.
-		fillMonitor.GetOrderStatus = func(orderID string) (*core.OrderStatus, error) {
-			status, filled, pending, avg, err := kb.GetOrderStatus(orderID)
-			if err != nil {
-				return nil, err
-			}
-			return &core.OrderStatus{Status: status, FilledQty: filled, PendingQty: pending, AveragePrice: avg}, nil
-		}
-		fillMonitor.ModifyOrder = kb.ModifyOrder
-		// Wire GTT SL placement — persists overnight, survives bot restarts
-		fillMonitor.PlaceGTT = gttClient.PlaceSLGTT
-		fillMonitor.CancelGTT = gttClient.CancelGTT
-		log.Println("[Engine] LIVE broker connected (Kite + GTT SL)")
-	}
 
 	// ══════════════════════════════════════════════════════════════
 	//  Load Universe & Preload Daily Cache
@@ -179,11 +142,30 @@ func main() {
 	// (OI filter removed — F&O open interest is not in the book; the engine trades
 	//  cash equity on price/volume action only.)
 
-	execAgent.GetLTP = scanner.GetLTP
+	signalAgent.GetLTP = scanner.GetLTP
+
+	// Load NSE holidays synchronously NOW so IsNonTradingPeriod() has data
+	// before the WebSocket connect decision below. The daily refresh goroutine
+	// is started later (after full init) to keep startup ordering clean.
+	refreshNSEHolidays()
 
 	allTokens := dataAgent.GetAllTokens()
 	ws := storage.NewKiteWebSocket(tickStore, allTokens)
-	if config.KiteAPIKey != "" {
+	// Wire holiday awareness into the WebSocket so its reconnect loop knows
+	// not to retry on holidays, weekends, or outside market hours.
+	ws.IsNonTradingPeriod = func() bool {
+		now := config.NowIST()
+		if now.Weekday() == time.Saturday || now.Weekday() == time.Sunday {
+			return true
+		}
+		if isNSEHoliday(now) {
+			return true
+		}
+		hhmm := now.Hour()*100 + now.Minute()
+		return hhmm < 900 || hhmm >= 1545
+	}
+
+	if config.KiteAPIKey != "" && !ws.IsNonTradingPeriod() {
 		err := ws.Connect()
 		if err != nil {
 			log.Printf("[Engine] WebSocket connect failed with current token: %v. Triggering AutoLogin...", err)
@@ -201,12 +183,24 @@ func main() {
 		} else {
 			log.Printf("[Engine] WebSocket connected. Subscribed %d tokens", len(allTokens))
 		}
+	} else if config.KiteAPIKey != "" {
+		log.Println("[Engine] Non-trading day/time — skipping WebSocket connect at startup")
 	}
 
-	// Now that token is potentially refreshed, preload Cache
+	// Now that token is potentially refreshed, preload Cache.
+	// Include sector index tokens (NIFTY BANK, IT, AUTO…) so that Bird's Eye
+	// sector strength has data. They are NOT added to scanner.Universe (no pattern
+	// scan on indices) — just loaded into the cache for breadth calculations.
 	dailyCache := storage.NewDailyCache()
 	log.Println("[Engine] Preloading daily cache (500d historical for ROC)...")
-	dailyCache.Preload(dataAgent.Universe)
+	preloadUniverse := make(map[uint32]string, len(dataAgent.Universe)+len(config.SectorTokens))
+	for t, s := range dataAgent.Universe {
+		preloadUniverse[t] = s
+	}
+	for name, tok := range config.SectorTokens {
+		preloadUniverse[tok] = name
+	}
+	dailyCache.Preload(preloadUniverse)
 	scanner.DailyCache = dailyCache.ToScannerCache()
 
 	// ══════════════════════════════════════════════════════════════
@@ -296,62 +290,7 @@ func main() {
 	}()
 
 	// ══════════════════════════════════════════════════════════════
-	//  Crash Recovery — Restore Swing Positions
-	// ══════════════════════════════════════════════════════════════
-	execAgent.RestoreFromState()
-
-	symbolToToken := make(map[string]uint32)
-	for token, sym := range dataAgent.Universe {
-		symbolToToken[sym] = token
-	}
-
-	// Backfill missing tokens to restored trades AND persist the fix to DB.
-	// Without the Save() call, every restart would re-load token=0 from SQLite,
-	// causing MonitorPositions to skip the position (LTP returns 0 → "continue").
-	execAgent.Mu.Lock()
-	for _, trade := range execAgent.ActiveTrades {
-		if trade.Token == 0 {
-			if matchedTok, exists := symbolToToken[trade.Symbol]; exists {
-				trade.Token = matchedTok
-				stateManager.Save(trade.EntryOID, trade) // Persist fix to DB
-				log.Printf("[Engine] Backfilled token for %s: %d (was 0)", trade.Symbol, matchedTok)
-			} else {
-				log.Printf("[Engine] ⚠️ Cannot backfill token for %s — symbol not in universe", trade.Symbol)
-			}
-		}
-	}
-	execAgent.Mu.Unlock()
-
-	if paperBroker != nil {
-		paperBroker.GetLTP = func(symbol string) float64 {
-			if tok, ok := symbolToToken[symbol]; ok {
-				return tickStore.GetLTPIfFresh(tok)
-			}
-			return 0
-		}
-		paperBroker.GetDepth = func(symbol string) (float64, float64) { return 0, 0 }
-	}
-
-	// ══════════════════════════════════════════════════════════════
-	//  API Server (Dashboard Backend)
-	// ══════════════════════════════════════════════════════════════
-	const dashboardPort = "8085"
-	killOldProcess(dashboardPort)
-	apiServer := api.NewServer(journal, execAgent, scanner, tickStore, dailyCache)
-	go apiServer.Start(":" + dashboardPort)
-	log.Printf("[Engine] Dashboard: http://127.0.0.1:%s", dashboardPort)
-
-	if !config.PaperMode {
-		fillMonitor.PlaceOrder = execAgent.PlaceOrder
-		fillMonitor.CancelOrder = execAgent.CancelOrder
-		fillMonitor.AlertFn = func(msg string) { agents.SendTelegram(msg) }
-		// Hand FillMonitor to ExecutionAgent so each LIMIT entry is polled to fill.
-		execAgent.FillMonitor = fillMonitor
-	}
-
-	// Refresh NSE holiday list at startup and once daily at 06:00 IST so the
-	// hardcoded fallback isn't relied on for routine holidays.
-	go refreshNSEHolidays()
+	// Refresh NSE holiday list once daily at 06:00 IST.
 	go func() {
 		for {
 			now := config.NowIST()
@@ -364,137 +303,63 @@ func main() {
 		}
 	}()
 
-	go launchDashboardUI()
-
-	// ══════════════════════════════════════════════════════════════
-	//  STARTUP COMPLETE
-	// ══════════════════════════════════════════════════════════════
-	execAgent.Mu.RLock()
-	openCount := len(execAgent.ActiveTrades)
-	execAgent.Mu.RUnlock()
-
 	agents.SendTelegram(fmt.Sprintf(
-		"🚀 *QUANTIX ENGINE v3.0 — SWING*\nMode: `%s`\nCapital: `₹%.0f`\nUniverse: `%d stocks`\nOpen Positions: `%d/%d`\nStrategy: `EMA10/20 Crossover + VCP`\nSL Range: `%.1f%%–%.1f%%`",
-		map[bool]string{true: "PAPER", false: "LIVE"}[config.PaperMode],
-		config.TotalCapital, len(dataAgent.Universe),
-		openCount, config.ComputeMaxPositions(config.TotalCapital),
+		"🚀 *ZENITH SIGNAL ENGINE — Online*\n"+
+			"Universe: `%d stocks`\n"+
+			"Strategy: `EMA Pullback Bounce`\n"+
+			"SL: `%.1f%%–%.1f%%` structural\n"+
+			"📡 Type *scan* to scan market anytime\n"+
+			"⏰ EOD alerts auto-sent at 16:00 IST",
+		len(scanner.Universe),
 		config.SLFloorPct, config.SLCeilingPct))
 
-	log.Println("[Engine] ✅ Fully initialized. Entering swing trading loop...")
+	// Start Telegram bot — listens for manual "scan" commands from your chat
+	agents.StartTelegramBot(scanner, signalAgent)
+
+	log.Println("[Engine] ✅ Initialized. Telegram bot active. EOD alerts at 16:00 IST.")
 
 	// ══════════════════════════════════════════════════════════════
-	//  MAIN SWING TRADING LOOP — 24/7 Multi-Day Operation
+	//  MAIN LOOP — Signal-only, EOD alerts at 15:31
 	// ══════════════════════════════════════════════════════════════
-	//  Swing trading: NO EOD squareoff. Positions held overnight.
-	//  During market hours: monitor hard SL + scan for new VCP breakouts.
-	//  At EOD (15:31): run EMA20 + sell pressure exit check on daily closes.
 
-	for { // Outer loop: one iteration per trading day
+	for {
 		today := config.NowIST()
-		dayOfWeek := today.Weekday()
 
-		// Weekend skip
-		if dayOfWeek == time.Saturday || dayOfWeek == time.Sunday {
-			log.Printf("[Engine] %s — sleeping until Monday", dayOfWeek.String())
+		if today.Weekday() == time.Saturday || today.Weekday() == time.Sunday {
 			sleepUntilMorning()
 			continue
 		}
-
-		// FIX-13: NSE Holiday check
 		if isNSEHoliday(today) {
-			log.Printf("[Engine] NSE Holiday — sleeping until next trading day")
+			log.Println("[Engine] NSE Holiday — sleeping")
 			sleepUntilMorning()
 			continue
 		}
 
-		// After-hours check
-		t0 := today.Hour()*100 + today.Minute()
-		if t0 >= 1605 {
-			sleepUntilMorning()
-			continue
-		}
-
-		log.Printf("[Engine] ═══ TRADING DAY: %s (%s) ═══",
-			today.Format("2006-01-02"), dayOfWeek.String())
-
+		log.Printf("[Engine] ═══ TRADING DAY: %s ═══", today.Format("2006-01-02"))
 		scanner.NewSession()
 		tickStore.ResetDaily()
-		eodCheckDone := false
-		eodScanDone := false
+		alertsDone := false
 
-		// Swing tick loop — 1 second interval (not 200ms, swing doesn't need HFT speed)
-		ticker := time.NewTicker(1 * time.Second)
-		currentRegime := "UNKNOWN"
-		lastRegimeCheck := time.Time{}
-		scanCount := 0
-
+		ticker := time.NewTicker(30 * time.Second)
 	dayLoop:
 		for range ticker.C {
 			now := config.NowIST()
 			t := now.Hour()*100 + now.Minute()
 
-			// Kill switch file check
-			killFile := config.BaseDir + string(os.PathSeparator) + "data" + string(os.PathSeparator) + "kill_switch.txt"
-			if _, err := os.Stat(killFile); err == nil {
-				execAgent.FlattenAll("KILL_SWITCH")
-				agents.SendTelegram("🛑 *KILL SWITCH* — All swing positions flattened")
-			}
+			// ── EOD run at 16:00 (market close + 30 min, candle fully finalized) ──
+			if t >= 1600 && !alertsDone {
+				log.Println("[Engine] ═══ EOD RUN (16:00) ═══")
 
-			// Pre-market wait
-			if t < 915 {
-				continue
-			}
-
-			// ── Phase 4: Hard SL monitoring (every second during market hours) ──
-			execAgent.MonitorPositions(currentRegime)
-
-			// ── Phase 1: Regime detection (every 30 minutes) ──
-			if time.Since(lastRegimeCheck) > 30*time.Minute || currentRegime == "UNKNOWN" {
-				newRegime := scanner.DetectRegime()
-				if newRegime != "" {
-					currentRegime = newRegime
-				}
-				lastRegimeCheck = time.Now()
-			}
-
-			// ── Phase 2+3: VCP Breakout scanning (every 30 seconds) ──
-			if scanCount%30 == 0 {
-				signals := scanner.RunAllScans(currentRegime)
-				for _, sig := range signals {
-					execAgent.Execute(sig, currentRegime)
-				}
-			}
-			scanCount++
-
-			// ── Phase 5: EOD Check — EMA20 trailing exit + sell pressure rule (once at 15:31) ──
-			// Running at 15:31 ensures Kite's day candle is finalized (market closes 15:30).
-			// At 15:20 the candle is still live and the close price is provisional.
-			if t >= 1531 && !eodCheckDone {
-				log.Println("[Engine] ═══ EOD EMA20 CHECK (15:31) ═══")
-
-				// Refresh daily cache for latest closes
 				dailyCache.Preload(dataAgent.Universe)
 				freshCache := dailyCache.ToScannerCache()
 				scanner.DailyCache = freshCache
 
-				// Run EMA20 + sell pressure exit check on all positions
-				execAgent.RunDailyEMACheck(freshCache)
+				// SELL first — stocks that crossed below EMA10
+				signalAgent.RunEODSellAlerts(scanner.Universe)
+				// BUY — new 2-green-candle-above-EMA10 setups
+				signalAgent.RunEODBuyAlerts(scanner.Universe)
 
-				// Check for re-entries on stocks that were exited by EMA rule
-				execAgent.CheckReEntries(scanner, currentRegime)
-
-				// Phase 3: Check for top-up opportunities on existing positions
-				execAgent.CheckTopUps(scanner, currentRegime)
-				// Daily summary
-				execAgent.DailySummaryAlert(currentRegime)
-
-				eodCheckDone = true
-				log.Println("[Engine] ═══ EOD EMA CHECK COMPLETE (15:31) ═══")
-			}
-
-			// ── EOD Market Scan (once at 15:45) ──
-			if t >= 1545 && !eodScanDone {
-				eodScanDone = true
+				// Full EOD market scan (BUY breadth, Trigger Candles, MOMO leaders, CSV)
 				go agents.RunEODMarketScan(agents.EODScanDeps{
 					LoadUniverse:    dataAgent.LoadEODScanUniverse,
 					PreloadCache:    dailyCache.Preload,
@@ -502,21 +367,19 @@ func main() {
 					GetLiveLTP:      func(token uint32) float64 { return tickStore.GetLTPIfFresh(token) },
 					GetLiveVolume:   func(token uint32) int64 { return tickStore.GetVolume(token) },
 				}, scanner)
+
+				alertsDone = true
+				log.Println("[Engine] ═══ EOD RUN COMPLETE ═══")
 			}
 
-			// After market close — end the day loop (but DON'T squareoff!)
 			if t >= 1605 {
-				log.Println("[Engine] Market closed. Swing positions HELD overnight.")
 				ticker.Stop()
 				break dayLoop
 			}
 		}
 
-		// Post-market: sync EOD data
-		log.Println("[Engine] Running post-market EOD data sync...")
 		dailyCache.SyncEODToHistoricalDB(dataAgent.Universe)
-
-		agents.SendTelegram("🌙 *ENGINE SLEEPING* — Swing positions held overnight.")
+		agents.SendTelegram("🌙 *ENGINE SLEEPING* — Next alerts tomorrow at 16:00.")
 		sleepUntilMorning()
 		log.Printf("[Engine] ═══ WAKING UP — %s ═══", config.NowIST().Format("2006-01-02 15:04"))
 	}
@@ -536,12 +399,6 @@ func sleepUntilMorning() {
 	}
 }
 
-func launchDashboardUI() {
-	const url = "http://127.0.0.1:8085"
-	time.Sleep(1 * time.Second)
-	exec.Command("cmd", "/c", "start", url).Start()
-}
-
 func waitForNetwork() {
 	client := &http.Client{Timeout: 3 * time.Second}
 	for i := 0; i < 5; i++ {
@@ -554,71 +411,9 @@ func waitForNetwork() {
 	}
 }
 
-func killOldProcess(port string) {
-	out, err := exec.Command("cmd", "/c", fmt.Sprintf("netstat -ano | findstr :%s | findstr LISTENING", port)).Output()
-	if err != nil || len(out) == 0 {
-		return
-	}
-	lines := splitLines(fmt.Sprintf("%s", out))
-	for _, line := range lines {
-		fields := splitFields(line)
-		if len(fields) >= 5 {
-			pid := fields[len(fields)-1]
-			if pid != "0" {
-				exec.Command("taskkill", "/F", "/PID", pid).Run()
-				time.Sleep(500 * time.Millisecond)
-			}
-		}
-	}
-}
-
-func splitLines(s string) []string {
-	var lines []string
-	start := 0
-	for i := 0; i < len(s); i++ {
-		if s[i] == '\n' {
-			line := s[start:i]
-			if len(line) > 0 && line[len(line)-1] == '\r' {
-				line = line[:len(line)-1]
-			}
-			if len(line) > 0 {
-				lines = append(lines, line)
-			}
-			start = i + 1
-		}
-	}
-	if start < len(s) {
-		lines = append(lines, s[start:])
-	}
-	return lines
-}
-
-func splitFields(s string) []string {
-	var fields []string
-	inField := false
-	start := 0
-	for i := 0; i <= len(s); i++ {
-		if i == len(s) || s[i] == ' ' || s[i] == '\t' {
-			if inField {
-				fields = append(fields, s[start:i])
-				inField = false
-			}
-		} else if !inField {
-			start = i
-			inField = true
-		}
-	}
-	return fields
-}
-
-// NSE holidays are loaded once at startup from research.FetchNSEHolidays() and
-// refreshed daily at 06:00 IST. Falls back to the hardcoded 2026 list below
-// only if the live fetch fails (e.g., no network at boot).
-//
-// Source: https://www.nseindia.com/resources/exchange-communication-holidays
+// NSE holidays loaded at startup from research.FetchNSEHolidays(), refreshed daily at 06:00.
 var (
-	nseHolidaysMu sync.RWMutex
-	// MM-DD keys (year-agnostic), matching research.FetchNSEHolidays's format.
+	nseHolidaysMu   sync.RWMutex
 	nseHolidaysMMDD = map[string]string{}
 )
 

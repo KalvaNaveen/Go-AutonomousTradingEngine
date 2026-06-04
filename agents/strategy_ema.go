@@ -24,7 +24,7 @@ type EMAStrategy struct{}
 
 func (e *EMAStrategy) Name() string { return "EMA_PULLBACK" }
 
-func (e *EMAStrategy) Detect(token uint32, symbol string, ltp float64, regime string, ctx StrategyContext) *Signal {
+func (e *EMAStrategy) Detect(token uint32, symbol string, ltp float64, ctx StrategyContext) *Signal {
 	// Book Ch.5: suppress new entries on major event days.
 	if ctx.IsMajorEventDay {
 		return nil
@@ -37,7 +37,8 @@ func (e *EMAStrategy) Detect(token uint32, symbol string, ltp float64, regime st
 		return nil
 	}
 
-	pullbackLow, formed := DetectEMAPullbackFromSlice(closes, highs, lows, volumes)
+	opens := ctx.Cache.Opens[token]
+	pullbackLow, formed := DetectEMAPullbackFromSlice(opens, closes, highs, lows, volumes)
 	if !formed {
 		return nil
 	}
@@ -61,7 +62,7 @@ func (e *EMAStrategy) Detect(token uint32, symbol string, ltp float64, regime st
 	log.Printf("[EMA] PULLBACK BOUNCE: %s LTP=%.2f SL=%.2f Qty=%d (risk-based)", symbol, ltp, stopPrice, qty)
 	return &Signal{
 		Strategy:   "EMA_PULLBACK",
-		Symbol:     symbol, Token: token, Regime: regime,
+		Symbol:     symbol, Token: token,
 		EntryPrice: entryPrice, StopPrice: stopPrice,
 		Qty: qty, Product: "CNC",
 	}
@@ -71,8 +72,14 @@ func (e *EMAStrategy) Detect(token uint32, symbol string, ltp float64, regime st
 // p.44-49) on pre-sliced OHLCV arrays. Pure-data form — used by both the live
 // scanner and the backtest engine. Returns (pullbackLow, formed); the bounce
 // itself is the entry signal (no separate breakout level).
-func DetectEMAPullbackFromSlice(closes, highs, lows, volumes []float64) (pullbackLow float64, formed bool) {
-	need := config.EMA50Period + 20
+// DetectEMAPullbackFromSlice — strict Book Ch.3 p.44-49 implementation.
+//
+// Three conditions, exactly as written:
+//  1. Uptrend: 10 EMA > 20 EMA, both rising          (p.47)
+//  2. Pullback: price touched 10 or 20 EMA on light volume (p.45-47)
+//  3. Bounce:  green candle that closes above 10 EMA  (p.47)
+func DetectEMAPullbackFromSlice(opens, closes, highs, lows, volumes []float64) (pullbackLow float64, formed bool) {
+	need := config.EMA20Period + 10
 	if len(closes) < need || len(lows) < need {
 		return
 	}
@@ -82,34 +89,31 @@ func DetectEMAPullbackFromSlice(closes, highs, lows, volumes []float64) (pullbac
 
 	ema10s := computeEMASeries(closes, config.EMA10Period)
 	ema20s := computeEMASeries(closes, config.EMA20Period)
-	ema50s := computeEMASeries(closes, config.EMA50Period)
-	if len(ema10s) < 6 || len(ema20s) < 6 || len(ema50s) < 1 {
+	if len(ema10s) < 6 || len(ema20s) < 6 {
 		return
 	}
 	ema10 := ema10s[len(ema10s)-1]
 	ema20 := ema20s[len(ema20s)-1]
-	ema50 := ema50s[len(ema50s)-1]
-	ema10Prev := ema10s[len(ema10s)-6] // ~5 bars ago
+	ema10Prev := ema10s[len(ema10s)-6]
 	ema20Prev := ema20s[len(ema20s)-6]
 
-	// ── Ch.3 p.47: confirmed uptrend — 10 EMA > 20 EMA > 50 EMA, 10 & 20 rising ──
-	if !(ema10 > ema20 && ema20 > ema50) {
+	// ── Rule 1: 10 EMA > 20 EMA, both rising (Ch.3 p.47) ────────────────────
+	if ema10 <= ema20 {
 		return
 	}
-	if !(ema10 > ema10Prev && ema20 > ema20Prev) {
-		return // EMAs must be sloping higher
-	}
-	if lastClose < ema50 {
-		return // price must remain above the long-term trend
+	if ema10 <= ema10Prev || ema20 <= ema20Prev {
+		return
 	}
 
-	// ── Ch.3 p.45-47: pullback to a key EMA (10/20/50) — the average "catches up"
-	// and acts as support. Over the recent window the low must reach an EMA band. ──
-	const pullbackWindow = 7
-	const touchTol = 0.02 // within 2% of an EMA = "found support"
+	// ── Rule 2: Pullback — price touched 10 or 20 EMA on light volume ────────
+	// Book p.45: "stocks tend to find support at the 10 EMA for the short term,
+	// and the 20 EMA for the mid-term."
+	// Book p.47: "During the pullback period, prices typically decreased with low volume."
+	const pullbackWindow = 10 // look back 10 bars for an EMA touch
+	const touchTol = 0.02     // within 2% counts as "found support"
 	touched := false
 	pullbackLow = lows[n-1]
-	for i := n - pullbackWindow; i < n; i++ {
+	for i := n - pullbackWindow; i < n-1; i++ { // exclude today's bounce bar
 		if i < 0 {
 			continue
 		}
@@ -117,13 +121,16 @@ func DetectEMAPullbackFromSlice(closes, highs, lows, volumes []float64) (pullbac
 		if lo < pullbackLow {
 			pullbackLow = lo
 		}
-		for _, ema := range []float64{ema10, ema20, ema50} {
+		for _, ema := range []float64{ema10, ema20} {
 			if ema <= 0 {
 				continue
 			}
-			// low dipped into the EMA support band, or dipped below then closed back near it
-			if (lo <= ema*(1+touchTol) && lo >= ema*(1-touchTol)) ||
-				(lo <= ema && closes[i] >= ema*(1-touchTol)) {
+			// Low dipped into the EMA support band
+			if lo <= ema*(1+touchTol) && lo >= ema*(1-touchTol) {
+				touched = true
+			}
+			// Or dipped below EMA but closed back near it (wick touch)
+			if lo < ema && closes[i] >= ema*(1-touchTol) {
 				touched = true
 			}
 		}
@@ -132,49 +139,56 @@ func DetectEMAPullbackFromSlice(closes, highs, lows, volumes []float64) (pullbac
 		return
 	}
 
-	// Prior extension: before the pullback the stock was meaningfully ABOVE the
-	// 10 EMA — a genuine momentum-phase pullback, not a stock hugging the average.
-	idx := n - pullbackWindow - 3
-	if idx < 0 {
-		return
-	}
-	if closes[idx] < ema10*1.01 {
-		return
-	}
-
-	// ── Ch.3 p.45/47: the pullback happens on LIGHT (declining) volume ──
-	if volumes != nil && len(volumes) >= 25 {
+	// Light volume during pullback (book p.47)
+	if volumes != nil && len(volumes) >= n && n >= pullbackWindow+10 {
 		var pullVol, baseVol float64
-		pc := 0
-		for i := n - pullbackWindow; i < n; i++ {
+		pc, bc := 0, 0
+		for i := n - pullbackWindow; i < n-1; i++ {
 			if i >= 0 {
 				pullVol += volumes[i]
 				pc++
 			}
 		}
-		bc := 0
-		for i := n - 25; i < n-pullbackWindow; i++ {
+		for i := n - pullbackWindow - 10; i < n-pullbackWindow; i++ {
 			if i >= 0 {
 				baseVol += volumes[i]
 				bc++
 			}
 		}
-		if pc > 0 && bc > 0 {
-			pullVol /= float64(pc)
-			baseVol /= float64(bc)
-			if baseVol > 0 && pullVol >= baseVol {
-				return // pullback not on lighter volume — not a clean shallow pullback
+		if pc > 0 && bc > 0 && baseVol/float64(bc) > 0 {
+			if pullVol/float64(pc) >= baseVol/float64(bc) {
+				return // pullback not on lighter volume
 			}
 		}
 	}
 
-	// ── Bounce confirmation: price reclaims the fast EMA on an up (green) bar ──
-	// (book: the stock "finds support... and continues its upward trajectory")
+	// ── Rule 3: Bounce — green candle closing above 10 EMA (Ch.3 p.47) ──────
+	// "This provides an opportunity for new buyers to enter the market."
 	if lastClose <= ema10 {
-		return
+		return // must close back above the fast EMA
 	}
 	if lastClose <= prevClose {
-		return
+		return // must be an up day vs prior close
+	}
+	// Green candle: close > open (same bar)
+	if opens != nil && len(opens) >= n && opens[n-1] > 0 {
+		if lastClose <= opens[n-1] {
+			return
+		}
+	}
+
+	// ── MACD Histogram direction — momentum confirmation on bounce bar ────────
+	// Fast = EMA10, Slow = EMA20 (same EMAs as our trend check — no new params).
+	// We only check one thing: histogram must be RISING on the bounce bar.
+	//   histogram[n-1] > histogram[n-2]
+	// This confirms the EMA10−EMA20 gap is expanding (momentum accelerating),
+	// not dead-cat-bouncing on a still-falling MACD.
+	// Skip-safe: if not enough data for the signal line, we do not block the signal.
+	hist := computeMACDHistogram(closes, config.EMA10Period, config.EMA20Period, config.MACDSignalPeriod)
+	if hist != nil && len(hist) >= 2 {
+		if hist[len(hist)-1] <= hist[len(hist)-2] {
+			return // histogram falling on bounce bar → momentum not confirmed
+		}
 	}
 
 	formed = true

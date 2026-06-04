@@ -13,7 +13,7 @@ type StrategyContext struct {
 // StrategyAgent is the contract every standalone strategy implements.
 type StrategyAgent interface {
 	Name() string
-	Detect(token uint32, symbol string, ltp float64, regime string, ctx StrategyContext) *Signal
+	Detect(token uint32, symbol string, ltp float64, ctx StrategyContext) *Signal
 }
 
 // AllStrategies returns the engine's entry setups. This is a PURE-EMA engine:

@@ -65,19 +65,26 @@ func isRegimeToken(token uint32) bool {
 	return token == config.NiftySpotToken || token == config.SmallcapToken
 }
 
-// Preload fetches historical EOD data for all universe tokens.
-// Equity tokens use EODLookbackDays (150); regime index tokens use
-// RegimeLookbackDays (420) for the monthly ROC calculation.
-// Uses 3 parallel workers to respect Kite's ~3 req/sec rate limit.
+// Preload loads 5 years of OHLCV for every universe token.
+// Strategy: DB-first. On startup it reads historical.db (fast, no API calls).
+// Only the gap between the latest DB row and today is fetched from Kite API,
+// then written back to DB. First-ever run seeds the full 5-year history.
 func (dc *DailyCache) Preload(universe map[uint32]string) bool {
-	log.Printf("[DailyCache] Preloading %d tokens (equity:%dd, regime:%dd) with 3 workers...",
-		len(universe), config.EODLookbackDays, config.RegimeLookbackDays)
+	const fiveYearsCalendar = 1825
+
+	histDB, dbErr := openHistoricalDB()
+	if dbErr != nil {
+		log.Printf("[DailyCache] ⚠️  historical.db unavailable (%v) — falling back to live API only", dbErr)
+	} else {
+		defer histDB.Close()
+	}
+
+	log.Printf("[DailyCache] Preloading %d tokens (DB-first, 5yr history)...", len(universe))
 
 	type tokenJob struct {
 		token  uint32
 		symbol string
 	}
-
 	jobs := make(chan tokenJob, len(universe))
 	for token, symbol := range universe {
 		jobs <- tokenJob{token, symbol}
@@ -85,105 +92,69 @@ func (dc *DailyCache) Preload(universe map[uint32]string) bool {
 	close(jobs)
 
 	var mu sync.Mutex
-	loaded := 0
-	failed := 0
+	loaded, failed := 0, 0
 	total := len(universe)
 
 	var wg sync.WaitGroup
-	numWorkers := 3
-
-	for w := 0; w < numWorkers; w++ {
+	for w := 0; w < 3; w++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for job := range jobs {
-				lookback := config.EODLookbackDays
-				if isRegimeToken(job.token) {
-					lookback = config.RegimeLookbackDays
-				}
+				var bars []dailyBar
+				hitAPI := false
 
-				dailyData, err := dc.fetchDaily(job.token, lookback)
-				if err != nil || len(dailyData) < 25 {
-					mu.Lock()
-					failed++
-					mu.Unlock()
-					if err != nil {
-						log.Printf("[DailyCache] %s failed: %v", job.symbol, err)
+				if histDB != nil {
+					latest := latestDateInDB(histDB, job.token)
+					today := config.NowIST().Format("2006-01-02")
+					yesterday := config.NowIST().AddDate(0, 0, -1).Format("2006-01-02")
+
+					if latest == "" {
+						// First-ever load: seed full 5-year history from Kite API
+						fromDate := config.NowIST().AddDate(0, 0, -fiveYearsCalendar).Format("2006-01-02")
+						newBars, err := dc.fetchDailyRange(job.token, fromDate, today)
+						if err == nil && len(newBars) > 0 {
+							appendBarsToDB(histDB, job.token, newBars)
+						}
+						hitAPI = true
+					} else if latest < yesterday {
+						// Incremental update: fetch only the missing gap
+						newBars, err := dc.fetchDailyRange(job.token, latest, today)
+						if err == nil && len(newBars) > 0 {
+							appendBarsToDB(histDB, job.token, newBars)
+						}
+						hitAPI = true
 					}
-					time.Sleep(350 * time.Millisecond)
-					continue
-				}
+					// else: DB is current (today or yesterday) — no API call needed
 
-				opens := make([]float64, len(dailyData))
-				closes := make([]float64, len(dailyData))
-				highs := make([]float64, len(dailyData))
-				lows := make([]float64, len(dailyData))
-				volumes := make([]float64, len(dailyData))
-				dates := make([]string, len(dailyData))
-				for i, d := range dailyData {
-					opens[i] = d.Open
-					closes[i] = d.Close
-					highs[i] = d.High
-					lows[i] = d.Low
-					volumes[i] = float64(d.Volume)
-					dates[i] = d.Date
-				}
-
-				ema10Slice := data.ComputeEMA(closes, config.EMA10Period)
-				ema10Val := 0.0
-				if len(ema10Slice) > 0 {
-					ema10Val = ema10Slice[len(ema10Slice)-1]
-				}
-
-				ema20Slice := data.ComputeEMA(closes, config.EMA20Period)
-				ema20Val := 0.0
-				if len(ema20Slice) > 0 {
-					ema20Val = ema20Slice[len(ema20Slice)-1]
-				}
-
-				avgVol := 1.0
-				if len(volumes) >= 20 {
-					s := 0.0
-					for _, v := range volumes[len(volumes)-20:] {
-						s += v
+					// Read full history from DB (up to 5 years of trading bars)
+					dbBars, err := readBarsFromDB(histDB, job.token, fiveYearsCalendar*2)
+					if err == nil && len(dbBars) >= 25 {
+						bars = dbBars
 					}
-					avgVol = s / 20.0
 				}
 
-				avgTurn := 0.0
-				if len(volumes) >= 20 && len(closes) >= 20 {
-					s := 0.0
-					off := len(volumes) - 20
-					for i := 0; i < 20; i++ {
-						s += volumes[off+i] * closes[off+i] / 1e7
+				// Fallback: DB unavailable or returned < 25 bars → call Kite API directly
+				if len(bars) < 25 {
+					apiBars, err := dc.fetchDaily(job.token, fiveYearsCalendar)
+					if err != nil || len(apiBars) < 25 {
+						mu.Lock()
+						failed++
+						mu.Unlock()
+						if err != nil {
+							log.Printf("[DailyCache] %s failed: %v", job.symbol, err)
+						}
+						time.Sleep(350 * time.Millisecond)
+						continue
 					}
-					avgTurn = s / 20.0
+					bars = apiBars
+					if histDB != nil {
+						appendBarsToDB(histDB, job.token, bars)
+					}
+					hitAPI = true
 				}
 
-				atr14 := computeATR(highs, lows, closes, 14)
-				pivot := computePivotSupport(closes, lows)
-				high52 := maxSlice(closes)
-				low52 := minSlice(closes)
-
-				dc.mu.Lock()
-				dc.store[job.token] = &DailyCacheEntry{
-					Symbol:       job.symbol,
-					Dates:        dates,
-					Opens:        opens,
-					Closes:       closes,
-					Highs:        highs,
-					Lows:         lows,
-					Volumes:      volumes,
-					EMA10:        ema10Val,
-					EMA20:        ema20Val,
-					AvgDailyVol:  avgVol,
-					TurnoverCr:   math.Round(avgTurn*100) / 100,
-					PivotSupport: pivot,
-					ATR14:        math.Round(atr14*100) / 100,
-					High52W:      math.Round(high52*100) / 100,
-					Low52W:       math.Round(low52*100) / 100,
-				}
-				dc.mu.Unlock()
+				dc.buildEntryFromBars(job.token, job.symbol, bars)
 
 				mu.Lock()
 				loaded++
@@ -192,7 +163,10 @@ func (dc *DailyCache) Preload(universe map[uint32]string) bool {
 				}
 				mu.Unlock()
 
-				time.Sleep(350 * time.Millisecond)
+				// Rate limit only when we actually called the Kite API
+				if hitAPI {
+					time.Sleep(350 * time.Millisecond)
+				}
 			}
 		}()
 	}
@@ -205,8 +179,80 @@ func (dc *DailyCache) Preload(universe map[uint32]string) bool {
 	dc.mu.Unlock()
 
 	log.Printf("[DailyCache] Loaded %d/%d tokens. Failed: %d. Ready: %v",
-		loaded, len(universe), failed, dc.loaded)
+		loaded, total, failed, dc.loaded)
 	return dc.loaded
+}
+
+// buildEntryFromBars converts a []dailyBar slice into a DailyCacheEntry and stores it.
+func (dc *DailyCache) buildEntryFromBars(token uint32, symbol string, bars []dailyBar) {
+	opens := make([]float64, len(bars))
+	closes := make([]float64, len(bars))
+	highs := make([]float64, len(bars))
+	lows := make([]float64, len(bars))
+	volumes := make([]float64, len(bars))
+	dates := make([]string, len(bars))
+	for i, d := range bars {
+		opens[i] = d.Open
+		closes[i] = d.Close
+		highs[i] = d.High
+		lows[i] = d.Low
+		volumes[i] = float64(d.Volume)
+		dates[i] = d.Date
+	}
+
+	ema10Slice := data.ComputeEMA(closes, config.EMA10Period)
+	ema10Val := 0.0
+	if len(ema10Slice) > 0 {
+		ema10Val = ema10Slice[len(ema10Slice)-1]
+	}
+	ema20Slice := data.ComputeEMA(closes, config.EMA20Period)
+	ema20Val := 0.0
+	if len(ema20Slice) > 0 {
+		ema20Val = ema20Slice[len(ema20Slice)-1]
+	}
+
+	avgVol := 1.0
+	if len(volumes) >= 20 {
+		s := 0.0
+		for _, v := range volumes[len(volumes)-20:] {
+			s += v
+		}
+		avgVol = s / 20.0
+	}
+	avgTurn := 0.0
+	if len(volumes) >= 20 && len(closes) >= 20 {
+		s := 0.0
+		off := len(volumes) - 20
+		for i := 0; i < 20; i++ {
+			s += volumes[off+i] * closes[off+i] / 1e7
+		}
+		avgTurn = s / 20.0
+	}
+
+	atr14 := computeATR(highs, lows, closes, 14)
+	pivot := computePivotSupport(closes, lows)
+	high52 := maxSlice(closes)
+	low52 := minSlice(closes)
+
+	dc.mu.Lock()
+	dc.store[token] = &DailyCacheEntry{
+		Symbol:       symbol,
+		Dates:        dates,
+		Opens:        opens,
+		Closes:       closes,
+		Highs:        highs,
+		Lows:         lows,
+		Volumes:      volumes,
+		EMA10:        ema10Val,
+		EMA20:        ema20Val,
+		AvgDailyVol:  avgVol,
+		TurnoverCr:   math.Round(avgTurn*100) / 100,
+		PivotSupport: pivot,
+		ATR14:        math.Round(atr14*100) / 100,
+		High52W:      math.Round(high52*100) / 100,
+		Low52W:       math.Round(low52*100) / 100,
+	}
+	dc.mu.Unlock()
 }
 
 // ToScannerCache converts to the agents.DailyCache format expected by scanner.
@@ -264,14 +310,6 @@ func (dc *DailyCache) IsLoaded() bool {
 	return dc.loaded
 }
 
-func (dc *DailyCache) GetAvgDailyVol(token uint32) float64 {
-	dc.mu.RLock()
-	defer dc.mu.RUnlock()
-	if e, ok := dc.store[token]; ok {
-		return e.AvgDailyVol
-	}
-	return 1.0
-}
 
 // ── Kite REST Historical Data ────────────────────────────────
 
@@ -284,15 +322,91 @@ type dailyBar struct {
 	Volume int64
 }
 
+// ══════════════════════════════════════════════════════════════
+//  Historical DB helpers — persistent 5-year price store
+// ══════════════════════════════════════════════════════════════
+
+func historicalDBPath() string {
+	return config.BaseDir + string(os.PathSeparator) + "data" + string(os.PathSeparator) + "historical.db"
+}
+
+func openHistoricalDB() (*sql.DB, error) {
+	db, err := sql.Open("sqlite", historicalDBPath()+"?_journal_mode=WAL&_busy_timeout=30000")
+	if err != nil {
+		return nil, err
+	}
+	db.Exec(`CREATE TABLE IF NOT EXISTS daily_data (
+		token   INTEGER NOT NULL,
+		date    TEXT    NOT NULL,
+		open    REAL    NOT NULL,
+		high    REAL    NOT NULL,
+		low     REAL    NOT NULL,
+		close   REAL    NOT NULL,
+		volume  INTEGER NOT NULL,
+		PRIMARY KEY (token, date)
+	)`)
+	db.Exec(`CREATE INDEX IF NOT EXISTS idx_daily_token_date ON daily_data (token, date)`)
+	return db, nil
+}
+
+// latestDateInDB returns the most recent date string stored for a token, or "".
+func latestDateInDB(db *sql.DB, token uint32) string {
+	var d string
+	db.QueryRow(`SELECT MAX(date) FROM daily_data WHERE token=?`, token).Scan(&d)
+	return d
+}
+
+// readBarsFromDB reads up to limit bars for a token, oldest-first.
+func readBarsFromDB(db *sql.DB, token uint32, limit int) ([]dailyBar, error) {
+	rows, err := db.Query(`
+		SELECT date, open, high, low, close, volume
+		FROM daily_data
+		WHERE token=?
+		ORDER BY date ASC
+		LIMIT ?`, token, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var bars []dailyBar
+	for rows.Next() {
+		var b dailyBar
+		rows.Scan(&b.Date, &b.Open, &b.High, &b.Low, &b.Close, &b.Volume)
+		bars = append(bars, b)
+	}
+	return bars, nil
+}
+
+// appendBarsToDB upserts a batch of bars into historical.db in a single transaction.
+func appendBarsToDB(db *sql.DB, token uint32, bars []dailyBar) {
+	tx, err := db.Begin()
+	if err != nil {
+		return
+	}
+	stmt, err := tx.Prepare(`INSERT OR REPLACE INTO daily_data
+		(token, date, open, high, low, close, volume) VALUES (?, ?, ?, ?, ?, ?, ?)`)
+	if err != nil {
+		tx.Rollback()
+		return
+	}
+	defer stmt.Close()
+	for _, b := range bars {
+		stmt.Exec(token, b.Date, b.Open, b.High, b.Low, b.Close, b.Volume)
+	}
+	tx.Commit()
+}
+
 func (dc *DailyCache) fetchDaily(token uint32, days int) ([]dailyBar, error) {
 	now := config.NowIST()
 	from := now.AddDate(0, 0, -days)
+	return dc.fetchDailyRange(token, from.Format("2006-01-02"), now.Format("2006-01-02"))
+}
 
+// fetchDailyRange fetches daily OHLCV bars between fromDate and toDate (inclusive).
+func (dc *DailyCache) fetchDailyRange(token uint32, fromDate, toDate string) ([]dailyBar, error) {
 	url := fmt.Sprintf(
 		"https://api.kite.trade/instruments/historical/%d/day?from=%s&to=%s",
-		token,
-		from.Format("2006-01-02"),
-		now.Format("2006-01-02"),
+		token, fromDate, toDate,
 	)
 
 	for attempt := 0; attempt < 3; attempt++ {
@@ -360,7 +474,7 @@ func toFloat(v interface{}) float64 {
 }
 
 // computeRSScores ranks universe stocks by relative strength using available bars.
-// With EODLookbackDays=150 we can compute 3-month (63d), 1-month (21d), 1-week (5d).
+// With 5-year (1825-day) history we compute multi-timeframe RS scores.
 // Regime tokens (420-day history) also get a 6-month component.
 func (dc *DailyCache) computeRSScores() {
 	dc.mu.Lock()
@@ -380,7 +494,7 @@ func (dc *DailyCache) computeRSScores() {
 		cNow := closes[len(closes)-1]
 
 		// Use whatever lookbacks are available; weight shorter periods more heavily
-		// when only 150 days of data exist.
+		// when insufficient history is available.
 		p6, p3, p1, pw := 0.0, 0.0, 0.0, 0.0
 		if len(closes) >= 126 && closes[len(closes)-126] > 0 {
 			p6 = (cNow - closes[len(closes)-126]) / closes[len(closes)-126] * 100
@@ -509,62 +623,54 @@ func max(a, b int) int {
 	return b
 }
 
-// SyncEODToHistoricalDB reaches out to Kite historical APIs to fetch the official finalized daily 
-// OHLCV for all tokens, and flushes it immediately into historical.db for the Quantum Simulator to consume.
+// SyncEODToHistoricalDB fetches today's finalized OHLCV bar for every token,
+// writes it to historical.db, and refreshes the in-memory cache entry so the
+// next Preload (and backtest) sees current data without a full restart.
 func (dc *DailyCache) SyncEODToHistoricalDB(universe map[uint32]string) {
-	dbPath := config.BaseDir + string(os.PathSeparator) + "data" + string(os.PathSeparator) + "historical.db"
-	db, err := sql.Open("sqlite", dbPath)
+	db, err := openHistoricalDB()
 	if err != nil {
 		log.Printf("[DailyCache] ❌ Failed to open historical.db for EOD sync: %v", err)
 		return
 	}
 	defer db.Close()
 
-	log.Printf("[DailyCache] 💾 Starting EOD Historical DB Sync for %d tokens...", len(universe))
-	
-	count := 0
+	log.Printf("[DailyCache] 💾 EOD DB Sync — %d tokens...", len(universe))
+
 	today := config.TodayIST().Format("2006-01-02")
+	count := 0
 
-	for token := range universe {
-		bars, err := dc.fetchDaily(token, 1) // Just pull the latest 1-2 days
+	for token, symbol := range universe {
+		bars, err := dc.fetchDailyRange(token, today, today)
 		if err != nil || len(bars) == 0 {
-			continue // Token didn't trade or auth error
-		}
-		
-		// Map Kite payload to EOD
-		var todayBar *dailyBar
-		for _, b := range bars {
-			if b.Date == today {
-				todayClone := b
-				todayBar = &todayClone
-				break
-			}
-		}
-
-		if todayBar == nil {
-			// Today's candle is not available yet (sync ran before 15:30, or stock did not trade).
-			// Do NOT write the previous day's bar under today's date — that corrupts historical.db.
+			time.Sleep(340 * time.Millisecond)
 			continue
 		}
 
-		_, err = db.Exec(`
-			INSERT INTO daily_data (token, date, open, high, low, close, volume) 
-			VALUES (?, ?, ?, ?, ?, ?, ?)
-			ON CONFLICT(token, date) DO UPDATE SET 
-				open=excluded.open, 
-				high=excluded.high, 
-				low=excluded.low, 
-				close=excluded.close, 
-				volume=excluded.volume
-		`, token, todayBar.Date, todayBar.Open, todayBar.High, todayBar.Low, todayBar.Close, todayBar.Volume)
-
-		if err == nil {
-			count++
+		// Only accept today's bar — never write a stale bar under today's date
+		var todayBar *dailyBar
+		for _, b := range bars {
+			if b.Date == today {
+				clone := b
+				todayBar = &clone
+				break
+			}
 		}
-		
-		// Kite Connect API rate limits strictly cap historical calls to 3 requests/sec
-		time.Sleep(340 * time.Millisecond) 
+		if todayBar == nil {
+			time.Sleep(340 * time.Millisecond)
+			continue
+		}
+
+		appendBarsToDB(db, token, []dailyBar{*todayBar})
+		count++
+
+		// Refresh in-memory cache entry with the updated full history
+		allBars, readErr := readBarsFromDB(db, token, 1825*2)
+		if readErr == nil && len(allBars) >= 25 {
+			dc.buildEntryFromBars(token, symbol, allBars)
+		}
+
+		time.Sleep(340 * time.Millisecond)
 	}
 
-	log.Printf("[DailyCache] ✅ EOD Sync Complete! Written %d daily candles to historical.db", count)
+	log.Printf("[DailyCache] ✅ EOD Sync complete — %d bars written to historical.db", count)
 }

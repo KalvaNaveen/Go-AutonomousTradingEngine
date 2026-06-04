@@ -16,15 +16,12 @@ type Signal struct {
 	Strategy    string
 	Symbol      string
 	Token       uint32
-	Regime      string
 	EntryPrice  float64
 	StopPrice   float64
 	TargetPrice float64 // 0 = no fixed target (trailing exit)
 	Qty         int
 	Product     string // "CNC" for swing delivery
 	IsShort     bool
-	// Book Ch.12: large base setups trail with 50 EMA (not 20 EMA)
-	// VCP (120-day lookback) = large base; EMA crossover = mini base
 	IsLargeBase bool
 }
 
@@ -82,8 +79,8 @@ type ScannerAgent struct {
 
 
 	// State
-	LastRegime          string
 	ConsecutiveSLs      int
+	consecutiveWins     int
 	CapitalMultiplier   float64
 	IsMajorEventDay     bool              // Section V.2: suppresses Bull Flag on major event days
 	MajorEventName      string            // Name of the event if active
@@ -102,146 +99,6 @@ func NewScannerAgent() *ScannerAgent {
 	return &ScannerAgent{
 		CapitalMultiplier: 1.0,
 	}
-}
-
-// ══════════════════════════════════════════════════════════════
-//  Phase 1: Market Timing — ROC-Based Regime Detection
-// ══════════════════════════════════════════════════════════════
-//  Track Nifty 50 ROC (length 18) and Smallcap 100 ROC (length 20).
-//  ROC near 0 = buy aggressively. ROC near 45/100 = reduce equity.
-//  5 consecutive SL hits = reduce capital to 30-40%.
-
-// DetectRegime classifies the current market environment using the 200-day SMA
-// of the Nifty 50 index — the primary filter from Faber (2007).
-//
-//   DEFENSIVE      : Nifty 50 below its 200-day SMA (long-term downtrend confirmed).
-//                    Reinforced when Nifty Smallcap 100 is also below its 200-SMA.
-//   NORMAL         : Nifty 50 above 200-SMA, 21-day momentum not yet strong.
-//   AGGRESSIVE     : Nifty 50 above 200-SMA AND 21-day ROC > 5% (momentum confirmed).
-//   REDUCED_CAPITAL: Nifty above 200-SMA but 5+ consecutive SL hits — trade small.
-func (s *ScannerAgent) DetectRegime() string {
-	if s.DailyCache == nil || !s.DailyCache.Loaded {
-		return "UNKNOWN"
-	}
-
-	niftyCloses, ok := s.DailyCache.Closes[config.NiftySpotToken]
-	if !ok || len(niftyCloses) < config.RegimeSMAPeriod {
-		return "NORMAL" // insufficient data → assume safe
-	}
-
-	// Current Nifty price — prefer live LTP so regime reflects intraday moves
-	niftyCurrent := niftyCloses[len(niftyCloses)-1]
-	if s.GetLTP != nil {
-		if ltp := s.GetLTP(config.NiftySpotToken); ltp > 0 {
-			niftyCurrent = ltp
-		}
-	}
-
-	niftySMA200 := computeSMA(niftyCloses, config.RegimeSMAPeriod)
-	candidate := "NORMAL"
-
-	// ── DEFENSIVE: Nifty below its 200-day SMA ───────────────────────────────
-	if niftySMA200 > 0 && niftyCurrent < niftySMA200 {
-		candidate = "DEFENSIVE"
-	}
-
-	// ── Reinforce DEFENSIVE: Smallcap also below its 200-SMA ─────────────────
-	// Both large-cap and small-cap in downtrend = broad market weakness.
-	if candidate != "DEFENSIVE" {
-		if scCloses, ok := s.DailyCache.Closes[config.SmallcapToken]; ok && len(scCloses) >= config.RegimeSMAPeriod {
-			scCurrent := scCloses[len(scCloses)-1]
-			if s.GetLTP != nil {
-				if ltp := s.GetLTP(config.SmallcapToken); ltp > 0 {
-					scCurrent = ltp
-				}
-			}
-			scSMA200 := computeSMA(scCloses, config.RegimeSMAPeriod)
-			if scSMA200 > 0 && scCurrent < scSMA200 {
-				candidate = "DEFENSIVE"
-			}
-		}
-	}
-
-	// ── AGGRESSIVE: Nifty above 200-SMA AND 21-day momentum > 5% ─────────────
-	// 21-day = one calendar month of trading days; 5% monthly gain = strong uptrend.
-	// Book Ch.10 p.253: "When BOTH Nifty 50 AND Smallcap 100 are above their EMAs
-	// and trending up together, it's a broad-based bull — deploy aggressively."
-	// Requirement: Nifty ROC > 5% AND Smallcap EMA10 > EMA20 (broad participation).
-	if candidate == "NORMAL" {
-		roc21 := s.computeROC(config.NiftySpotToken, config.RegimeMomentumPeriod)
-		if roc21 >= config.RegimeMomentumThreshold {
-			// Verify Smallcap 100 is also in bullish EMA alignment
-			smallcapBullish := false
-			if scCloses, ok := s.DailyCache.Closes[config.SmallcapToken]; ok && len(scCloses) >= config.EMA20Period+5 {
-				sc10s := computeEMASeries(scCloses, config.EMA10Period)
-				sc20s := computeEMASeries(scCloses, config.EMA20Period)
-				if len(sc10s) > 0 && len(sc20s) > 0 && sc10s[len(sc10s)-1] >= sc20s[len(sc20s)-1] {
-					smallcapBullish = true
-				}
-			} else {
-				smallcapBullish = true // No data — give benefit of the doubt
-			}
-			if smallcapBullish {
-				candidate = "AGGRESSIVE"
-			} else {
-				log.Printf("[Regime] Nifty ROC=%.1f%% qualifies AGGRESSIVE but Smallcap EMA bearish — staying NORMAL",
-					roc21)
-			}
-		}
-	}
-
-	// ── Book Ch.10: The 10 & 20 Rule (p.252-253) ─────────────────────────────
-	// "Wait for the relevant indices to trade above the 10 and 20 EMAs,
-	//  where the 10 EMA should be positioned above the 20 EMA."
-	// More responsive than SMA200 — triggers earlier on market turns.
-	// Applied AFTER SMA200 check: EMA10 < EMA20 overrides NORMAL/AGGRESSIVE → DEFENSIVE.
-	if candidate != "DEFENSIVE" && len(niftyCloses) >= config.EMA20Period+5 {
-		ema10s := computeEMASeries(niftyCloses, config.EMA10Period)
-		ema20s := computeEMASeries(niftyCloses, config.EMA20Period)
-		if len(ema10s) > 0 && len(ema20s) > 0 {
-			niftyEMA10 := ema10s[len(ema10s)-1]
-			niftyEMA20 := ema20s[len(ema20s)-1]
-			if niftyEMA10 < niftyEMA20 {
-				candidate = "DEFENSIVE"
-				log.Printf("[Regime] 10&20 Rule: Nifty EMA10(%.0f) < EMA20(%.0f) → DEFENSIVE",
-					niftyEMA10, niftyEMA20)
-			}
-		}
-	}
-
-	// ── Book Ch.10: Overheated market guard (p.258) ───────────────────────────
-	// "Go defensive when market is over-heated / euphoric."
-	// Operationalised: Nifty > 20% above SMA200 = extended/euphoric territory.
-	// Downgrade AGGRESSIVE → NORMAL to reduce new position sizing.
-	if candidate == "AGGRESSIVE" && niftySMA200 > 0 {
-		overextension := (niftyCurrent - niftySMA200) / niftySMA200 * 100
-		if overextension >= 20.0 {
-			candidate = "NORMAL"
-			log.Printf("[Regime] OVERHEATED: Nifty %.0f%% above SMA200 → downgraded AGGRESSIVE→NORMAL",
-				overextension)
-		}
-	}
-
-	// ── Contingency: risk management override (not market timing) ────────────
-	// 5 consecutive SL hits → reduce position size regardless of market regime.
-	if s.ConsecutiveSLs >= config.ConsecutiveSLCutoff {
-		s.CapitalMultiplier = config.ReducedCapitalPct
-		log.Printf("[Regime] CONTINGENCY: %d consecutive SL hits → capital reduced to %.0f%%",
-			s.ConsecutiveSLs, s.CapitalMultiplier*100)
-		if candidate != "DEFENSIVE" {
-			candidate = "REDUCED_CAPITAL"
-		}
-	}
-
-	if candidate != s.LastRegime {
-		log.Printf("[Regime]  → %s (Nifty=%.0f SMA200=%.0f ConsecSL=%d)",
-			candidate, niftyCurrent, niftySMA200, s.ConsecutiveSLs)
-		s.LastRegime = candidate
-	}
-	if s.LastRegime == "" {
-		s.LastRegime = candidate
-	}
-	return s.LastRegime
 }
 
 // computeROC calculates Rate of Change: ((current - past) / past) * 100
@@ -270,6 +127,7 @@ func (s *ScannerAgent) computeROC(token uint32, length int) float64 {
 // Progressive ladder: 3 consecutive losses → reduce to 50%; 5 → 35% (contingency).
 func (s *ScannerAgent) RecordSLHit() {
 	s.ConsecutiveSLs++
+	s.consecutiveWins = 0
 	switch {
 	case s.ConsecutiveSLs >= config.ConsecutiveSLCutoff:
 		// Hard contingency: 5+ SL hits → 35% capital
@@ -288,250 +146,28 @@ func (s *ScannerAgent) RecordSLHit() {
 	}
 }
 
-// RecordWin resets the consecutive SL counter and begins progressive recovery.
-// Book Ch.8 p.203: "If recent trades are profitable, gradually increase your risk."
+// RecordWin resets the consecutive SL counter and applies the win-recovery ladder.
+// Book Ch.8 p.202: restore capital gradually — 3 wins → 60%, 5 → 80%, 7 → 100%.
+// This mirrors the same ladder in the backtest engine so live and backtest behaviour match.
 func (s *ScannerAgent) RecordWin() {
 	s.ConsecutiveSLs = 0
-	// Progressive recovery — don't snap back to 100% immediately
-	// Let the execution agent's graduated recovery ladder handle the step-ups.
-	// Here we simply clear the SL streak so the multiplier can be stepped up.
-	if s.CapitalMultiplier >= 1.0 {
-		s.CapitalMultiplier = 1.0 // already at full — no change
+	s.consecutiveWins++
+	switch {
+	case s.consecutiveWins >= 7 && s.CapitalMultiplier < 1.0:
+		s.CapitalMultiplier = 1.0
+		log.Printf("[Scanner] Win recovery: %d consecutive wins → capital restored to 100%%", s.consecutiveWins)
+	case s.consecutiveWins >= 5 && s.CapitalMultiplier < 0.80:
+		s.CapitalMultiplier = 0.80
+		log.Printf("[Scanner] Win recovery: %d consecutive wins → capital at 80%%", s.consecutiveWins)
+	case s.consecutiveWins >= 3 && s.CapitalMultiplier < 0.60:
+		s.CapitalMultiplier = 0.60
+		log.Printf("[Scanner] Win recovery: %d consecutive wins → capital at 60%%", s.consecutiveWins)
 	}
 }
 
 func (s *ScannerAgent) NewSession() {
 	// Daily reset — regime persists across days, only reset session-specific state
 }
-
-// ══════════════════════════════════════════════════════════════
-//  Phase 2 + 3: RunAllScans — Sector Leaders + VCP Breakout
-// ══════════════════════════════════════════════════════════════
-
-func (s *ScannerAgent) RunAllScans(regime string) []*Signal {
-	if s.DailyCache == nil || !s.DailyCache.Loaded {
-		return nil
-	}
-
-	if regime == "DEFENSIVE" {
-		log.Printf("[Scanner] DEFENSIVE regime — scan suppressed")
-		return nil
-	}
-
-	// ── Book Ch.5 p.131: Market open noise filter ────────────────────────────
-	// "Avoid the first 30 minutes — fake breakouts dominate at the open."
-	{
-		now := config.NowIST()
-		openH, openM := config.ParseTime(config.MarketOpenTime)
-		noiseEnd := time.Date(now.Year(), now.Month(), now.Day(),
-			openH, openM+config.MarketOpenNoiseMins, 0, 0, now.Location())
-		if now.Before(noiseEnd) {
-			log.Printf("[Scanner] Market open noise window (first %d min) — scan suppressed", config.MarketOpenNoiseMins)
-			return nil
-		}
-	}
-
-	// Position-size multiplier (book: progressive risk via consecutive wins/losses, Ch.8 p.203).
-	effectiveCapMult := s.CapitalMultiplier
-
-	// ── Book Ch.5 p.131: F&O expiry week caution ─────────────────────────────
-	// "During F&O expiry week (week of last Thursday), volatility spikes and
-	//  stops get hit arbitrarily. Reduce new entries or tighten size."
-	if isExpiryWeek() {
-		effectiveCapMult *= 0.5
-		log.Printf("[Scanner] F&O expiry week — halving position sizes (CapMult=%.0f%%)", effectiveCapMult*100)
-	}
-
-	// Section III.2: Detect strong sectors during sideways markets
-	strongSectors := s.GetStrongSectors()
-	if len(strongSectors) > 0 {
-		log.Printf("[Scanner] Strong sectors: %v", strongSectors)
-	}
-
-	ctx := StrategyContext{
-		Cache:             s.DailyCache,
-		CapitalMultiplier: effectiveCapMult, // progressive-risk multiplier (Ch.8 p.203)
-		GetVolume:         s.GetVolume,
-		IPOSymbols:        s.IPOSymbols,
-		IsMajorEventDay:   s.IsMajorEventDay,
-	}
-	strategies := AllStrategies()
-
-	var signals []*Signal
-
-	// Diagnostic gate counters — logged every scan so you can see exactly
-	// which filter is eliminating stocks on any given day.
-	var (
-		total         int
-		skipNoLTP     int
-		skipLowPrice  int // Book Ch.11: CMP < ₹30 filter
-		skipLiquidity int
-		skipATH       int
-		skipThirdLeg  int // Book Ch.3/12: skip if stock in 3rd leg or beyond
-		skipGapUp     int // Book Ch.5: skip gap-ups > 3%
-		skipNoSignal    int
-	)
-
-	for token, symbol := range s.Universe {
-		total++
-		ltp := 0.0
-		if s.GetLTP != nil {
-			ltp = s.GetLTP(token)
-		}
-		if ltp <= 0 {
-			skipNoLTP++
-			continue
-		}
-
-		// Book Ch.11: Minimum price filter — "CMP > Number 30" (p.267)
-		// Filters out penny / micro-cap stocks with wide spreads and low float.
-		if ltp < config.MinStockPrice {
-			skipLowPrice++
-			continue
-		}
-
-		// Liquidity gate: skip stocks below ₹5Cr/day avg turnover
-		if turn, ok := s.DailyCache.TurnoverCr[token]; ok && turn < config.LiquidityFilterCr {
-			skipLiquidity++
-			continue
-		}
-
-		// Near ATH filter (52-week high — see passesPhase2Filter)
-		if !s.passesPhase2Filter(token, ltp) {
-			skipATH++
-			continue
-		}
-
-
-		// ── Book Ch.5 p.130: Gap-up filter — skip if gapped > 3% from prior close ──
-		// "A stock that gaps up more than 3% at the open is already extended —
-		//  the breakout happened overnight, not at a clean level. Wait or skip."
-		if opens, oOk := s.DailyCache.Opens[token]; oOk && len(opens) >= 1 {
-			closes2, c2Ok := s.DailyCache.Closes[token]
-			if c2Ok && len(closes2) >= 2 {
-				todayOpen := opens[len(opens)-1]
-				priorClose := closes2[len(closes2)-2]
-				if priorClose > 0 && todayOpen > 0 {
-					gapPct := (todayOpen - priorClose) / priorClose * 100
-					if gapPct > config.GapUpFilterPct {
-						skipGapUp++
-						continue
-					}
-				}
-			}
-		}
-
-		// ── Book Ch.3 p.50-55 + Ch.12 p.281,283: Leg counter — skip 3rd-leg signals ───────
-		// Ch.3: "Swing traders do best when they catch a stock in its early rally stages,
-		//  usually within the first three rally legs."
-		// Ch.12: "I usually avoid buying stocks that are above the second leg." Protect
-		// capital by staying early in the move.
-		if closes, ok := s.DailyCache.Closes[token]; ok {
-			_, isDangerous := CountLegs(closes, config.LegCounterLookback)
-			if isDangerous {
-				skipThirdLeg++
-				continue
-			}
-		}
-
-		// Run all standalone strategy agents in priority order — first signal wins
-		matched := false
-		for _, strat := range strategies {
-			if sig := strat.Detect(token, symbol, ltp, regime, ctx); sig != nil {
-				signals = append(signals, sig)
-				matched = true
-				break
-			}
-		}
-		if !matched {
-			skipNoSignal++
-		}
-	}
-
-	log.Printf("[Scanner] universe=%d noLTP=%d lowPrice=%d liquidity=%d ATH=%d gapUp=%d thirdLeg=%d noSignal=%d signals=%d",
-		total, skipNoLTP, skipLowPrice, skipLiquidity, skipATH, skipGapUp, skipThirdLeg, skipNoSignal, len(signals))
-
-	// ── Rank signals by conviction before returning ───────────────────────
-	// Book Ch.2-3: volume expansion confirms a breakout. Rank by volume spike
-	// (today's live volume / 20-day average) — strongest breakout first.
-	if len(signals) > 1 {
-		type scored struct {
-			sig   *Signal
-			score float64
-		}
-		ranked := make([]scored, len(signals))
-		for i, sig := range signals {
-			volSpike := 1.0
-			if s.GetVolume != nil && s.DailyCache != nil {
-				if vols, ok := s.DailyCache.Volumes[sig.Token]; ok && len(vols) >= 21 {
-					var avg float64
-					for _, v := range vols[len(vols)-21 : len(vols)-1] {
-						avg += v
-					}
-					avg /= 20
-					if avg > 0 {
-						volSpike = float64(s.GetVolume(sig.Token)) / avg
-					}
-				}
-			}
-			ranked[i] = scored{sig: sig, score: volSpike}
-		}
-
-		// Stable insertion sort (signal count is small — typically <50)
-		for i := 1; i < len(ranked); i++ {
-			for j := i; j > 0 && ranked[j].score > ranked[j-1].score; j-- {
-				ranked[j], ranked[j-1] = ranked[j-1], ranked[j]
-			}
-		}
-		for i, r := range ranked {
-			signals[i] = r.sig
-		}
-
-		log.Printf("[Scanner] ranked %d signals by volume-spike conviction", len(signals))
-	}
-
-	return signals
-}
-
-
-// computeSMA calculates the simple moving average of the last `period` values.
-func computeSMA(closes []float64, period int) float64 {
-	if len(closes) < period {
-		return 0
-	}
-	sum := 0.0
-	for _, c := range closes[len(closes)-period:] {
-		sum += c
-	}
-	return sum / float64(period)
-}
-
-// computeEMASeries returns the full EMA series for the given period using standard
-// exponential smoothing: seed from first-N SMA, then apply multiplier forward.
-func computeEMASeries(closes []float64, period int) []float64 {
-	if len(closes) < period {
-		return nil
-	}
-	result := make([]float64, len(closes))
-	k := 2.0 / float64(period+1)
-	// Seed: SMA of first `period` closes
-	seed := 0.0
-	for i := 0; i < period; i++ {
-		seed += closes[i]
-	}
-	result[period-1] = seed / float64(period)
-	for i := period; i < len(closes); i++ {
-		result[i] = closes[i]*k + result[i-1]*(1-k)
-	}
-	// Return only the non-zero tail
-	return result[period-1:]
-}
-
-// ══════════════════════════════════════════════════════════════
-//  Phase 2: Stock Identification — Near ATH + High RS
-// ══════════════════════════════════════════════════════════════
-//  Blueprint: "Always buy at or near All-Time Highs."
-//  Uses full available history (500 days) as ATH proxy.
 
 func (s *ScannerAgent) passesPhase2Filter(token uint32, ltp float64) bool {
 	// Blueprint says "Always buy at or near All-Time Highs."
@@ -602,16 +238,6 @@ func (s *ScannerAgent) passesPhase2Filter(token uint32, ltp float64) bool {
 			if ema50 > 0 && ltp > ema50*(1+config.Extension50EMAPct/100) {
 				return false // Too extended above 50 EMA — parabolic, skip
 			}
-		}
-	}
-
-	// ── Book Ch.3 p.38: Per-stock SMA200 — only buy stocks above long-term trend ──
-	// "If a stock is below its 200-day SMA it is in a long-term downtrend —
-	//  avoid regardless of short-term pattern."
-	if len(closes) >= config.RegimeSMAPeriod {
-		sma200 := computeSMA(closes, config.RegimeSMAPeriod)
-		if sma200 > 0 && ltp < sma200 {
-			return false
 		}
 	}
 
@@ -735,12 +361,9 @@ func (s *ScannerAgent) passesPhase2Filter(token uint32, ltp float64) bool {
 		return false
 	}
 
-	// ── Book Ch.11 p.271 (Fig 11.4): Tight Range scan ─────────────────────────
-	// "Stocks in strong momentum currently forming a tight range or Range Contraction."
-	// Today's % change ≤ 2.5%, previous day's ≤ 3.5% (both absolute).
-	if !passesTightRangeScan(closes) {
-		return false
-	}
+	// Tight Range scan removed — it was a VCP/consolidation breakout filter.
+	// The EMA pullback bounce is explicitly a strong-move day (3-6% green candle),
+	// which tight range would reject. Wrong filter for this strategy.
 
 	// ── Book Ch.4 p.127 + p.137: Base-quality enhancers ───────────────────────
 	// (a) Higher Low in the Base (p.127): "stock's price keeps forming higher lows
@@ -817,28 +440,6 @@ func passesMonthlyGainersScan(closes []float64) bool {
 	return true
 }
 
-// passesTightRangeScan implements Book Ch.11 p.271 (Fig 11.4).
-// Requires today's % change in [-2.5%, +2.5%] AND previous day's in [-3.5%, +3.5%].
-func passesTightRangeScan(closes []float64) bool {
-	if len(closes) < 3 {
-		return true // skip-safe
-	}
-	n := len(closes)
-	today, todayPrev := closes[n-1], closes[n-2]
-	yesterday, yPrev := closes[n-2], closes[n-3]
-	if todayPrev <= 0 || yPrev <= 0 {
-		return true
-	}
-	todayPct := (today - todayPrev) / todayPrev * 100
-	yPct := (yesterday - yPrev) / yPrev * 100
-	if todayPct > config.TightRangeTodayMaxPct || todayPct < -config.TightRangeTodayMaxPct {
-		return false
-	}
-	if yPct > config.TightRangeYesterdayMaxPct || yPct < -config.TightRangeYesterdayMaxPct {
-		return false
-	}
-	return true
-}
 
 // hasRecentPocketPivot implements Book Ch.4 p.121.
 // Pocket pivot = up day with volume > highest down-day volume in past 10 days.
@@ -1127,69 +728,7 @@ func (s *ScannerAgent) GetStrongSectors() []string {
 
 
 // ══════════════════════════════════════════════════════════════
-//  Phase 3: Top-Up / Pyramiding
-// ══════════════════════════════════════════════════════════════
-//  Doc: "Add more quantity when the stock breaks out past its initial
-//  listing/issue price and successfully retests that level."
-//  In practice: if an existing position's stock successfully retests
-//  and holds above its breakout (entry) level, add to the position.
-
-func (s *ScannerAgent) CheckTopUp(token uint32, symbol string, entryPrice float64, ltp float64, regime string) *Signal {
-	if ltp <= 0 || entryPrice <= 0 {
-		return nil
-	}
-
-	// Top-up condition: LTP pulled back to within 2% of entry, then bounced back above entry
-	// This is the "retest of breakout level" from the document
-	closes, ok := s.DailyCache.Closes[token]
-	if !ok || len(closes) < 5 {
-		return nil
-	}
-
-	// Check if recent daily close was near entry (within 2%) and now recovering
-	recentPullback := false
-	for i := len(closes) - 5; i < len(closes)-1; i++ {
-		if i >= 0 && closes[i] <= entryPrice*1.02 && closes[i] >= entryPrice*0.98 {
-			recentPullback = true
-			break
-		}
-	}
-
-	if !recentPullback || ltp < entryPrice*1.01 {
-		return nil // Not retested, or still below entry
-	}
-
-	stopPrice := ltp * (1 - config.SLCeilingPct/100)
-	// Book Ch.8: risk-based sizing for top-ups (smaller by design — entry+10% SL)
-	qty := computeRiskBasedQty(config.TotalCapital, s.CapitalMultiplier, ltp, stopPrice)
-	if qty <= 0 {
-		log.Printf("[TopUp] %s: top-up qty=0 — skipping", symbol)
-		return nil
-	}
-
-	log.Printf("[TopUp] %s retest confirmed: Entry=%.2f LTP=%.2f", symbol, entryPrice, ltp)
-
-	return &Signal{
-		Strategy:    "VCP_TOPUP",
-		Symbol:      symbol,
-		Token:       token,
-		Regime:      regime,
-		EntryPrice:  ltp,
-		StopPrice:   stopPrice,
-		TargetPrice: 0,
-		Qty:         qty,
-		Product:     "CNC",
-		IsShort:     false,
-	}
-}
-
-// ══════════════════════════════════════════════════════════════
-//  Phase 5: Re-Entry Signal Generation
-// ══════════════════════════════════════════════════════════════
-//  "If stopped out by 21 EMA rule, but stock reclaims and closes
-//   back above 21 EMA with a green candle → re-enter the trade."
-
-func (s *ScannerAgent) CheckReEntry(token uint32, symbol string, regime string) *Signal {
+func (s *ScannerAgent) CheckReEntry(token uint32, symbol string) *Signal {
 	if s.DailyCache == nil || !s.DailyCache.Loaded {
 		return nil
 	}
@@ -1225,10 +764,9 @@ func (s *ScannerAgent) CheckReEntry(token uint32, symbol string, regime string) 
 	log.Printf("[ReEntry] %s reclaimed EMA20: Close=%.2f EMA20=%.2f", symbol, lastClose, ema20Val)
 
 	return &Signal{
-		Strategy:    "VCP_REENTRY",
+		Strategy:    "EMA_REENTRY",
 		Symbol:      symbol,
 		Token:       token,
-		Regime:      regime,
 		EntryPrice:  entryPrice,
 		StopPrice:   stopPrice,
 		TargetPrice: 0,
@@ -1307,7 +845,7 @@ func isExpiryWeek() bool {
 	return !nowDate.Before(monday) && !nowDate.After(lastThursday)
 }
 
-// ComputeEMA21 is defined in execution_agent.go (same package)
+// ComputeEMA21 is defined in telegram.go (same package)
 
 // ComputeADRatio calculates the Advance/Decline ratio from the live universe.
 // Compares each stock's live LTP to the prior-day close in DailyCache.

@@ -17,8 +17,6 @@ import (
 // MarketHealthReport is the full Bird's Eye View snapshot.
 // Generated daily by RunBirdsEyeView() and sent via Telegram.
 type MarketHealthReport struct {
-	// Regime
-	Regime      string // DEFENSIVE / NORMAL / AGGRESSIVE / REDUCED_CAPITAL
 	NiftyCurrent float64
 	NiftySMA200  float64
 	NiftyEMA10   float64
@@ -28,8 +26,9 @@ type MarketHealthReport struct {
 
 	// Market Breadth (Book Ch.10 p.255-260)
 	TotalStocks       int     // Universe size
-	PctAboveEMA20     float64 // % of stocks above their 20 EMA
-	PctAboveEMA50     float64 // % of stocks above their 50 EMA
+	PctAboveEMA10     float64 // % of stocks above their 10 EMA  (short-term momentum)
+	PctAboveEMA20     float64 // % of stocks above their 20 EMA  (trend confirmation)
+	PctAboveEMA50     float64 // % of stocks above their 50 EMA  (long-term health)
 	New52WHigh        int     // stocks making new 52-week highs today
 	New52WLow         int     // stocks making new 52-week lows today
 	NetNew52WHigh     int     // New52WHigh - New52WLow (breadth signal)
@@ -64,9 +63,6 @@ func (s *ScannerAgent) RunBirdsEyeView() *MarketHealthReport {
 	}
 
 	r := &MarketHealthReport{}
-
-	// ── 1. Regime & Nifty indicators ─────────────────────────────────────────
-	r.Regime = s.DetectRegime()
 
 	niftyCloses, ok := s.DailyCache.Closes[config.NiftySpotToken]
 	if ok && len(niftyCloses) > 0 {
@@ -103,19 +99,26 @@ func (s *ScannerAgent) RunBirdsEyeView() *MarketHealthReport {
 	// ── 2. Market Breadth ─────────────────────────────────────────────────────
 	// Book Ch.10 p.255: "Look at what percentage of stocks are above their 20 and 50 EMAs.
 	// If the majority are, it confirms strength. If most are below, it's a weak market."
+	aboveEMA10Count := 0
 	aboveEMA20Count := 0
 	aboveEMA50Count := 0
 	new52WHigh := 0
 	new52WLow := 0
 	total := 0
 
-	for token, _ := range s.Universe {
+	for token := range s.Universe {
 		closes, ok := s.DailyCache.Closes[token]
 		if !ok || len(closes) < config.EMA20Period+1 {
 			continue
 		}
 		total++
 		lastClose := closes[len(closes)-1]
+
+		// % above EMA10 (short-term momentum)
+		ema10s := computeEMASeries(closes, config.EMA10Period)
+		if len(ema10s) > 0 && lastClose > ema10s[len(ema10s)-1] {
+			aboveEMA10Count++
+		}
 
 		// % above EMA20
 		ema20s := computeEMASeries(closes, config.EMA20Period)
@@ -162,6 +165,7 @@ func (s *ScannerAgent) RunBirdsEyeView() *MarketHealthReport {
 
 	r.TotalStocks = total
 	if total > 0 {
+		r.PctAboveEMA10 = float64(aboveEMA10Count) / float64(total) * 100
 		r.PctAboveEMA20 = float64(aboveEMA20Count) / float64(total) * 100
 		r.PctAboveEMA50 = float64(aboveEMA50Count) / float64(total) * 100
 	}
@@ -301,13 +305,10 @@ func computeMarketVerdict(r *MarketHealthReport) (verdict, msg string) {
 	}
 
 	switch {
-	case r.Regime == "DEFENSIVE":
-		verdict = "STAY_OUT"
-		msg = "🛑 Market in DEFENSIVE regime — no new buys. Protect capital."
 	case negatives >= 3:
 		verdict = "STAY_OUT"
 		msg = fmt.Sprintf("🛑 STAY OUT: %d/5 breadth signals negative. Cash is a position.", negatives)
-	case r.Regime == "AGGRESSIVE" && positives >= 4:
+	case positives >= 4:
 		verdict = "BUY_AGGRESSIVELY"
 		msg = fmt.Sprintf("🚀 BUY AGGRESSIVELY: %d/5 signals positive. Deploy full capital.", positives)
 	case positives >= 3:
@@ -331,6 +332,12 @@ func formatBirdsEyeReport(r *MarketHealthReport) string {
 		sma200Str = "🟢"
 	}
 
+	breadth10Str := "🔴"
+	if r.PctAboveEMA10 >= 60 {
+		breadth10Str = "🟢"
+	} else if r.PctAboveEMA10 >= 40 {
+		breadth10Str = "🟡"
+	}
 	breadth20Str := "🔴"
 	if r.PctAboveEMA20 >= 60 {
 		breadth20Str = "🟢"
@@ -351,22 +358,22 @@ func formatBirdsEyeReport(r *MarketHealthReport) string {
 		newHighStr = "🟡"
 	}
 
-	strongStr := "none"
+	strongStr := "—"
 	if len(r.StrongSectors) > 0 {
 		strongStr = strings.Join(r.StrongSectors, ", ")
 	}
-	weakStr := "none"
+	weakStr := "—"
 	if len(r.WeakSectors) > 0 {
 		weakStr = strings.Join(r.WeakSectors, ", ")
 	}
 
 	return fmt.Sprintf(`🦅 *BIRD'S EYE VIEW — Market Health Report*
 
-*Regime:* `+"`"+`%s`+"`"+`
 *Nifty:* `+"`"+`%.0f`+"`"+` | SMA200: `+"`"+`%.0f`+"`"+` %s | EMA10>EMA20: %s
 *Overheat:* `+"`"+`%.1f%%`+"`"+` above SMA200 | 21d ROC: `+"`"+`%.1f%%`+"`"+`
 
 📊 *Market Breadth:*
+• Above EMA10: `+"`"+`%.1f%%`+"`"+` %s
 • Above EMA20: `+"`"+`%.1f%%`+"`"+` %s
 • Above EMA50: `+"`"+`%.1f%%`+"`"+` %s
 • Net New 52W Highs: `+"`"+`%+d`+"`"+` %s (High:%d / Low:%d)
@@ -376,9 +383,9 @@ func formatBirdsEyeReport(r *MarketHealthReport) string {
 ⚠️ *Weak Sectors:* %s
 
 %s`,
-		r.Regime,
 		r.NiftyCurrent, r.NiftySMA200, sma200Str, ema10Str,
 		r.OverheatPct, r.NiftyROC21,
+		r.PctAboveEMA10, breadth10Str,
 		r.PctAboveEMA20, breadth20Str,
 		r.PctAboveEMA50, breadth50Str,
 		r.NetNew52WHigh, newHighStr, r.New52WHigh, r.New52WLow,

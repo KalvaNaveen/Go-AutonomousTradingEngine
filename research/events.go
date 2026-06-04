@@ -6,7 +6,6 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"strings"
 	"time"
 
 	"bnf_go_engine/config"
@@ -115,28 +114,3 @@ func IsMajorEventDay() (bool, string) {
 	return false, ""
 }
 
-// IsMajorEventDayWithHolidays checks both hardcoded events and NSE holidays
-func IsMajorEventDayWithHolidays(nseHolidays map[string]string) (bool, string) {
-	// First check hardcoded major events
-	if is, event := IsMajorEventDay(); is {
-		return true, event
-	}
-
-	// Check NSE holidays (market closed = possible big announcement day)
-	now := config.NowIST()
-	for _, offset := range []int{-1, 0, 1} {
-		day := now.AddDate(0, 0, offset)
-		key := fmt.Sprintf("%02d-%02d", day.Month(), day.Day())
-		if desc, ok := nseHolidays[key]; ok {
-			// Only flag politically significant holidays, not routine ones
-			lower := strings.ToLower(desc)
-			if strings.Contains(lower, "election") ||
-				strings.Contains(lower, "republic") ||
-				strings.Contains(lower, "independence") {
-				return true, desc
-			}
-		}
-	}
-
-	return false, ""
-}

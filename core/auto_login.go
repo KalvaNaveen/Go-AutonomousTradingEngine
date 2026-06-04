@@ -161,6 +161,15 @@ func (a *AutoLogin) Login() (string, error) {
 	}
 	resp.Body.Close()
 
+	// Capture enctoken from session cookies — used for Kite web OMS API (watchlists etc.)
+	for _, c := range jar.Cookies(&url.URL{Scheme: "https", Host: "kite.zerodha.com"}) {
+		if c.Name == "enctoken" {
+			config.KiteEncToken = c.Value
+			log.Printf("[AutoLogin] enctoken captured (%d chars)", len(c.Value))
+			break
+		}
+	}
+
 	// Step 3: Navigate to OAuth URL to get request_token redirect
 	oauthURL := fmt.Sprintf("https://kite.zerodha.com/connect/login?v=3&api_key=%s", a.APIKey)
 	resp, err = client.Get(oauthURL)

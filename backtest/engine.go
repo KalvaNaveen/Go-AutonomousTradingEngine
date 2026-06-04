@@ -23,7 +23,7 @@ import (
 
 // Config holds all tunable parameters for one backtest run.
 type Config struct {
-	Strategy         string  `json:"strategy"`            // "ALL","VCP_BREAKOUT","IPO_BASE"
+	Strategy         string  `json:"strategy"` // "ALL" or "EMA_PULLBACK"
 	StartBarOffset   int     `json:"start_bar_offset"`    // bars from end to simulate (e.g. 250 = ~1 year)
 	Capital          float64 `json:"capital"`
 	SLFloorPct       float64 `json:"sl_floor_pct"`        // default 1.5
@@ -80,11 +80,12 @@ type Result struct {
 	EquityCurve     []float64 `json:"equity_curve"`
 	Trades          []Trade   `json:"trades"`
 
-	// Diagnostics — explain WHY trades were (or weren't) taken.
-	NormalDays      int `json:"normal_days"`       // bars where regime allowed entries
-	DefensiveDays   int `json:"defensive_days"`    // bars blocked by DEFENSIVE regime
-	RawSignals      int `json:"raw_signals"`       // pattern breakouts detected (pre-regime)
-	BlockedByRegime int `json:"blocked_by_regime"` // signals skipped because regime was DEFENSIVE
+	// Diagnostics — same guards as live engine
+	RawSignals        int `json:"raw_signals"`         // pattern detections before guards
+	DrawdownHalts     int `json:"drawdown_halts"`      // entries blocked by drawdown halt
+	OpenRiskBlocks    int `json:"open_risk_blocks"`    // entries blocked by open risk cap
+	UnderwaterBlocks  int `json:"underwater_blocks"`   // entries blocked by ≥2 underwater positions
+	SLHits            int `json:"sl_hits"`             // hard SL exits
 }
 
 // simPosition tracks one open simulated position.
@@ -96,7 +97,6 @@ type simPosition struct {
 	entryPrice float64
 	sl         float64
 	qty        int
-	redBelow   int // consecutive red candles below EMA20
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -154,41 +154,109 @@ func Run(cache *agents.DailyCache, universe map[uint32]string, cfg Config) *Resu
 	equityCurve := []float64{cfg.Capital}
 	capital := cfg.Capital
 
+	// ── Live-engine risk state (mirrors ExecutionAgent + ScannerAgent) ──
+	capitalMultiplier := 1.0
+	consecSLs := 0
+	consecutiveWins := 0
+	peakCapital := cfg.Capital
+	drawdownHalted := false
+
 	for day := startBar; day < totalBars-1; day++ {
-		// ── Regime filter ─────────────────────────────────────
-		regime := detectRegimeAt(cache, day)
-		if regime == "DEFENSIVE" {
-			result.DefensiveDays++
+		// ── Recompute maxPos based on current capital (dynamic, same as live) ──
+		if cfg.MaxPositions > 0 {
+			maxPos = cfg.MaxPositions
 		} else {
-			result.NormalDays++
+			maxPos = config.ComputeMaxPositions(capital)
 		}
 
-		// ── Manage open positions (always, regardless of regime) ──
-		for token, pos := range openPositions {
+		// ── Manage open positions — process in deterministic token order ──
+		// Go map iteration is random; sorting ensures same params → same result.
+		openTokens := make([]uint32, 0, len(openPositions))
+		for token := range openPositions {
+			openTokens = append(openTokens, token)
+		}
+		sort.Slice(openTokens, func(i, j int) bool { return openTokens[i] < openTokens[j] })
+
+		for _, token := range openTokens {
+			pos := openPositions[token]
 			exit, reason := checkExit(cache, token, pos, day, cfg)
 			if exit > 0 {
 				t := buildTrade(pos, day, exit, reason, cache.Closes[token], cache.TradingDates)
-				capital += t.NetPnl // capital grows/shrinks by net P&L after charges
+				capital += t.NetPnl
 				closedTrades = append(closedTrades, t)
 				delete(openPositions, token)
+
+				// ── Mirror live RecordSLHit / RecordWin + recovery ladder ──
+				if reason == "HARD_SL" {
+					result.SLHits++
+					consecSLs++
+					consecutiveWins = 0
+					switch {
+					case consecSLs >= config.ConsecutiveSLCutoff:
+						if capitalMultiplier > config.ReducedCapitalPct {
+							capitalMultiplier = config.ReducedCapitalPct
+						}
+					case consecSLs >= 3:
+						if capitalMultiplier > 0.50 {
+							capitalMultiplier = 0.50
+						}
+					}
+				} else {
+					consecSLs = 0
+					consecutiveWins++
+					switch {
+					case consecutiveWins >= 7 && capitalMultiplier < 1.0:
+						capitalMultiplier = 1.0
+					case consecutiveWins >= 5 && capitalMultiplier < 0.80:
+						capitalMultiplier = 0.80
+					case consecutiveWins >= 3 && capitalMultiplier < 0.60:
+						capitalMultiplier = 0.60
+					}
+				}
+
+				// ── Mirror drawdown halt ──
+				if capital > peakCapital {
+					peakCapital = capital
+				}
+				if peakCapital > 0 {
+					dd := (peakCapital - capital) / peakCapital * 100
+					drawdownHalted = dd >= config.MaxDrawdownHaltPct
+				}
 			}
 		}
 
-		// ── Scan for new entries. Candidates are collected regardless of regime
-		// (so RawSignals reflects true detector activity); positions are only
-		// OPENED when the regime is not DEFENSIVE (book: sit out weak markets). ──
-	    if len(openPositions) < maxPos {
-			// ── Pass 1: collect ALL candidates for this day ──────────────────
-			// Then rank by volume spike ratio so the highest-conviction breakout
-			// fills the slot — not just whichever token happens to come first.
+		// ── Drawdown halt — no new entries (mirrors ExecutionAgent) ──
+		if drawdownHalted {
+			result.DrawdownHalts++
+			equityCurve = append(equityCurve, capital+unrealizedAt(cache, openPositions, day))
+			continue
+		}
+
+		// ── Underwater gate — ≥2 positions below entry = no new entries ──
+		underwaterCount := 0
+		for _, pos := range openPositions {
+			if closes, ok := cache.Closes[pos.token]; ok && day < len(closes) {
+				if closes[day] < pos.entryPrice {
+					underwaterCount++
+				}
+			}
+		}
+		if underwaterCount >= 2 {
+			result.UnderwaterBlocks++
+			equityCurve = append(equityCurve, capital+unrealizedAt(cache, openPositions, day))
+			continue
+		}
+
+		// ── Scan for new entries ──
+		if len(openPositions) < maxPos {
 			type candidate struct {
-				token       uint32
-				symbol      string
-				strat       string
-				nextOpen    float64
-				sl          float64
-				qty         int
-				volSpike    float64 // today's vol / 20-day avg — conviction score
+				token    uint32
+				symbol   string
+				strat    string
+				nextOpen float64
+				sl       float64
+				qty      int
+				volSpike float64
 			}
 			var candidates []candidate
 
@@ -209,13 +277,16 @@ func Run(cache *agents.DailyCache, universe map[uint32]string, cfg Config) *Resu
 					continue
 				}
 
-				// No look-ahead: slice to simulated today
+				oSlice := ([]float64)(nil)
+				if opens := cache.Opens[token]; opens != nil && day+1 <= len(opens) {
+					oSlice = opens[:day+1]
+				}
 				cSlice := closes[:day+1]
 				hSlice := highs[:day+1]
 				lSlice := lows[:day+1]
 				vSlice := volumes[:day+1]
 
-				// ATH filter: within ATHProximityPct of 52-week (252-bar) high
+				// ATH filter
 				const lookback52W = 252
 				athWindow := cSlice
 				if len(athWindow) > lookback52W {
@@ -232,7 +303,7 @@ func Run(cache *agents.DailyCache, universe map[uint32]string, cfg Config) *Resu
 					continue
 				}
 
-				strat := detectSignalAt(cSlice, hSlice, lSlice, vSlice, cfg)
+				strat := detectSignalAt(oSlice, cSlice, hSlice, lSlice, vSlice, cfg)
 				if strat == "" {
 					continue
 				}
@@ -258,14 +329,33 @@ func Run(cache *agents.DailyCache, universe map[uint32]string, cfg Config) *Resu
 					continue
 				}
 
-				alloc := cfg.Capital * cfg.MaxTradeAllocPct / 100
-				qty := int(alloc / entryPrice)
+				// ── Risk-based sizing (mirrors computeRiskBasedQty in live engine) ──
+				riskPerShare := entryPrice - sl
+				riskAmount := capital * capitalMultiplier * config.RiskPerTradePct / 100
+				qty := 0
+				if riskPerShare > 0 {
+					qty = int(riskAmount / riskPerShare)
+				}
+				// Floor: minimum lot
+				minQty := int(config.MinAbsPositionSize / entryPrice)
+				if minQty < 1 {
+					minQty = 1
+				}
+				if qty < minQty {
+					qty = minQty
+				}
+				// Ceiling: MaxTradeAllocPct of current capital
+				maxQty := int(capital * capitalMultiplier * cfg.MaxTradeAllocPct / 100 / entryPrice)
+				if maxQty < 1 {
+					maxQty = 1
+				}
+				if qty > maxQty {
+					qty = maxQty
+				}
 				if qty < 1 {
 					continue
 				}
 
-				// Volume spike: today's volume vs 20-day average.
-				// Higher ratio = more institutional interest = higher conviction.
 				volSpike := 1.0
 				if day >= 20 {
 					var avg float64
@@ -280,20 +370,19 @@ func Run(cache *agents.DailyCache, universe map[uint32]string, cfg Config) *Resu
 
 				candidates = append(candidates, candidate{
 					token: token, symbol: symbol, strat: strat,
-					nextOpen: nextOpen, sl: sl, qty: qty, volSpike: volSpike,
+					nextOpen: entryPrice, sl: sl, qty: qty, volSpike: volSpike,
 				})
 			}
 
-			// Diagnostics: every candidate is a real pattern breakout detected.
 			result.RawSignals += len(candidates)
-			if regime == "DEFENSIVE" {
-				// Book rule: sit out weak markets. Count what we skipped, open nothing.
-				result.BlockedByRegime += len(candidates)
-				equityCurve = append(equityCurve, capital+unrealizedAt(cache, openPositions, day))
-				continue
+
+			// ── Open risk cap check before entering (mirrors live engine) ──
+			openRisk := 0.0
+			for _, pos := range openPositions {
+				openRisk += (pos.entryPrice - pos.sl) * float64(pos.qty)
 			}
 
-			// ── Pass 2: rank by volume spike descending, enter top N ─────────
+			// ── Rank by volume spike, enter top N respecting all caps ──
 			sort.Slice(candidates, func(i, j int) bool {
 				return candidates[i].volSpike > candidates[j].volSpike
 			})
@@ -302,23 +391,32 @@ func Run(cache *agents.DailyCache, universe map[uint32]string, cfg Config) *Resu
 				if len(openPositions) >= maxPos {
 					break
 				}
-				entryPrice := c.nextOpen
+				// Open risk cap (mirrors live engine Ch.8 p.194)
+				tradeRisk := (c.nextOpen - c.sl) * float64(c.qty)
+				if capital > 0 && (openRisk+tradeRisk)/capital*100 >= config.MaxOpenRiskPct {
+					result.OpenRiskBlocks++
+					continue
+				}
 				openPositions[c.token] = &simPosition{
 					token: c.token, symbol: c.symbol, strategy: c.strat,
-					entryBar: day + 1, entryPrice: entryPrice, sl: c.sl, qty: c.qty,
+					entryBar: day + 1, entryPrice: c.nextOpen, sl: c.sl, qty: c.qty,
 				}
-				if len(openPositions) >= maxPos {
-					break
-				}
+				openRisk += tradeRisk
 			}
 		}
 
 		equityCurve = append(equityCurve, capital+unrealizedAt(cache, openPositions, day))
 	}
 
-	// Force-close remaining positions at end of simulation
+	// Force-close remaining positions at end of simulation — deterministic order
 	lastBar := totalBars - 2
-	for token, pos := range openPositions {
+	endTokens := make([]uint32, 0, len(openPositions))
+	for token := range openPositions {
+		endTokens = append(endTokens, token)
+	}
+	sort.Slice(endTokens, func(i, j int) bool { return endTokens[i] < endTokens[j] })
+	for _, token := range endTokens {
+		pos := openPositions[token]
 		closes := cache.Closes[token]
 		if lastBar < len(closes) {
 			t := buildTrade(pos, lastBar, closes[lastBar], "BACKTEST_END", closes, cache.TradingDates)
@@ -413,10 +511,10 @@ func Run(cache *agents.DailyCache, universe map[uint32]string, cfg Config) *Resu
 // detectSignalAt checks the engine's sole entry setup on pre-sliced OHLCV arrays.
 // Returns the strategy name if the EMA pullback/bounce fired, or "".
 // Uses the same detection math as the live scanner (agents.DetectEMAPullbackFromSlice).
-func detectSignalAt(closes, highs, lows, volumes []float64, cfg Config) string {
+func detectSignalAt(opens, closes, highs, lows, volumes []float64, cfg Config) string {
 	strat := cfg.Strategy
 	if strat == "ALL" || strat == "EMA_PULLBACK" {
-		if _, formed := agents.DetectEMAPullbackFromSlice(closes, highs, lows, volumes); formed {
+		if _, formed := agents.DetectEMAPullbackFromSlice(opens, closes, highs, lows, volumes); formed {
 			return "EMA_PULLBACK"
 		}
 	}
@@ -441,39 +539,16 @@ func checkExit(cache *agents.DailyCache, token uint32, pos *simPosition, day int
 		return pos.sl, "HARD_SL"
 	}
 
-	// EMA20 exit: single EOD close below EMA20 (Book Ch.6 p.167)
-	if day > 0 {
+	// EMA20 exit — Book Ch.6 p.167-168: "Closed below EMA — Sell on this day."
+	// Single EOD close below 20 EMA = exit immediately. No red-candle filter.
+	if day >= config.EMA20Period {
 		ema20 := computeLastEMA(closes[:day+1], config.EMA20Period)
-		if ema20 > 0 {
-			isRed := ltp < closes[day-1]
-			if isRed && ltp < ema20 {
-				pos.redBelow++
-				if pos.redBelow >= config.RedCandlesBelowEMA {
-					return ltp, "EMA20_2RED"
-				}
-			} else {
-				pos.redBelow = 0
-			}
+		if ema20 > 0 && ltp < ema20 {
+			return ltp, "EMA20_EXIT"
 		}
 	}
 
 	return 0, ""
-}
-
-// ── Regime ───────────────────────────────────────────────────────
-
-func detectRegimeAt(cache *agents.DailyCache, day int) string {
-	niftyCloses, ok := cache.Closes[config.NiftySpotToken]
-	if !ok || day < config.RegimeSMAPeriod || day >= len(niftyCloses) {
-		return "NORMAL"
-	}
-	slice := niftyCloses[:day+1]
-	current := slice[len(slice)-1]
-	sma200 := computeSMA(slice, config.RegimeSMAPeriod)
-	if sma200 > 0 && current < sma200 {
-		return "DEFENSIVE"
-	}
-	return "NORMAL"
 }
 
 // ── Math helpers ─────────────────────────────────────────────────
@@ -565,7 +640,6 @@ func buildTrade(pos *simPosition, exitBar int, exitPrice float64, reason string,
 	if pos.entryPrice > 0 {
 		pnlPct = netPnl / (pos.entryPrice * float64(pos.qty)) * 100
 	}
-	pnl := grossPnl // keep for internal use below
 
 	entryDate, exitDate := "", ""
 	if pos.entryBar < len(dates) {
@@ -589,7 +663,6 @@ func buildTrade(pos *simPosition, exitBar int, exitPrice float64, reason string,
 		copy(priceSlice, closes[sliceStart:sliceEnd+1])
 	}
 
-	_ = pnl // gross pnl stored separately
 	return Trade{
 		Symbol: pos.symbol, Strategy: pos.strategy,
 		EntryBar: pos.entryBar, ExitBar: exitBar,

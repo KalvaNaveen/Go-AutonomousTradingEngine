@@ -57,32 +57,6 @@ func TestMonthlyGainersScan_SkipSafeWithShortHistory(t *testing.T) {
 
 // ─── Ch.11 p.271: Tight Range Scan ────────────────────────────────────────────
 
-func TestTightRangeScan_AcceptsTightDays(t *testing.T) {
-	// Closes: ..., 100.0, 101.0 (1% day), 100.5 (-0.5% day)
-	closes := []float64{99.0, 100.0, 101.0, 100.5}
-	if !passesTightRangeScan(closes) {
-		t.Error("Tight range stock should pass Tight Range scan (Ch.11 p.271)")
-	}
-}
-
-func TestTightRangeScan_BlocksVolatileDay(t *testing.T) {
-	// Today's bar moved +5% — exceeds ±2.5% limit
-	closes := []float64{99.0, 100.0, 100.5, 105.5}
-	if passesTightRangeScan(closes) {
-		t.Error("Stock with >2.5%% daily move should fail Tight Range (Ch.11 p.271)")
-	}
-}
-
-func TestTightRangeScan_BlocksVolatileYesterday(t *testing.T) {
-	// Yesterday's bar moved +5% — exceeds ±3.5% limit
-	closes := []float64{99.0, 100.0, 105.0, 105.5}
-	if passesTightRangeScan(closes) {
-		t.Error("Stock with >3.5%% prev-day move should fail Tight Range (Ch.11 p.271)")
-	}
-}
-
-// ─── Ch.4 p.121: Pocket Pivot ─────────────────────────────────────────────────
-
 func TestPocketPivot_DetectsHighVolumeUpDay(t *testing.T) {
 	// 20 bars: closes alternate small ups/downs with consistent volume,
 	// then today is an up day with huge volume.
@@ -234,37 +208,6 @@ func TestBreadthConfirmation_SessionsConstant(t *testing.T) {
 
 // ─── Ch.6 p.163: Extended-Move Sell ───────────────────────────────────────────
 
-func TestExtendedMove_Thresholds(t *testing.T) {
-	if config.ExtendedMoveMinPct != 25.0 {
-		t.Errorf("ExtendedMoveMinPct should be 25 (Ch.6 p.163), got %.1f",
-			config.ExtendedMoveMinPct)
-	}
-	if config.ExtendedMoveSessionsWindow < 3 || config.ExtendedMoveSessionsWindow > 10 {
-		t.Errorf("ExtendedMoveSessionsWindow should be a small window 'few sessions', got %d",
-			config.ExtendedMoveSessionsWindow)
-	}
-}
-
-// ─── Ch.6 p.173: Hybrid Selling 25-35% ───────────────────────────────────────
-
-func TestHybridPartialSell_Range(t *testing.T) {
-	if config.HybridPartialSellPct < 25.0 || config.HybridPartialSellPct > 35.0 {
-		t.Errorf("HybridPartialSellPct must be in 25-35%% range (Ch.6 p.173), got %.1f",
-			config.HybridPartialSellPct)
-	}
-}
-
-// ─── Ch.6 p.171-172: Downside Pivot Exit ──────────────────────────────────────
-
-func TestDownsidePivot_LookbackConstant(t *testing.T) {
-	if config.DownsidePivotLookback < 5 || config.DownsidePivotLookback > 20 {
-		t.Errorf("DownsidePivotLookback should be in 5-20 bars range (Ch.6 p.171-172), got %d",
-			config.DownsidePivotLookback)
-	}
-}
-
-// ─── Ch.11 p.269: Monthly Gainers exact thresholds ────────────────────────────
-
 func TestMonthlyGainers_BookThresholds(t *testing.T) {
 	// Verify the 4 percentages match the book EXACTLY (Fig 11.2)
 	if config.MonthlyGainers10DayMinPct != 20.0 {
@@ -286,19 +229,6 @@ func TestMonthlyGainers_BookThresholds(t *testing.T) {
 }
 
 // ─── Ch.11 p.271: Tight Range exact thresholds ────────────────────────────────
-
-func TestTightRange_BookThresholds(t *testing.T) {
-	if config.TightRangeTodayMaxPct != 2.5 {
-		t.Errorf("TightRangeTodayMaxPct must be 2.5%% (book p.271), got %.1f",
-			config.TightRangeTodayMaxPct)
-	}
-	if config.TightRangeYesterdayMaxPct != 3.5 {
-		t.Errorf("TightRangeYesterdayMaxPct must be 3.5%% (book p.271), got %.1f",
-			config.TightRangeYesterdayMaxPct)
-	}
-}
-
-// ─── Ch.4 p.121: Pocket Pivot lookback constant ───────────────────────────────
 
 func TestPocketPivot_LookbackConstant(t *testing.T) {
 	if config.PocketPivotLookback != 10 {
