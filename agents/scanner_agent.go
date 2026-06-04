@@ -77,6 +77,10 @@ type ScannerAgent struct {
 	// Precomputed daily data
 	DailyCache *DailyCache
 
+	// RefreshCache — wired by main.go so the bot can refresh before scanning.
+	// Calling this reloads today's candles from Kite/DB before a manual scan.
+	RefreshCache func()
+
 
 	// State
 	ConsecutiveSLs      int

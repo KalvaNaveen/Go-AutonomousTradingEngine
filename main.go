@@ -203,6 +203,14 @@ func main() {
 	dailyCache.Preload(preloadUniverse)
 	scanner.DailyCache = dailyCache.ToScannerCache()
 
+	// Wire RefreshCache so bot manual scans always use latest data
+	scanner.RefreshCache = func() {
+		log.Println("[Bot] Refreshing cache before manual scan...")
+		dailyCache.Preload(preloadUniverse)
+		scanner.DailyCache = dailyCache.ToScannerCache()
+		log.Println("[Bot] Cache refreshed ✅")
+	}
+
 	// ══════════════════════════════════════════════════════════════
 	//  Research Automation (Sections II-IV of Blueprint)
 	// ══════════════════════════════════════════════════════════════

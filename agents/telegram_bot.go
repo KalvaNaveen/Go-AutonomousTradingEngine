@@ -246,16 +246,25 @@ func handleFullScan(chatID, msgText string, scanner *ScannerAgent, signalAgent *
 	// Parse RS threshold from message — supports: "scan 85", "scan 90+", "rs=85", "rs85"
 	rsMin := parseRSThreshold(msgText)
 
-	dateStr := config.NowIST().Format("02 Jan 2006 15:04 IST")
 	now := config.NowIST()
 	hhmm := now.Hour()*100 + now.Minute()
-	dataTag := "📂 last EOD data"
-	if hhmm >= 915 && hhmm <= 1530 {
+	marketOpen := hhmm >= 915 && hhmm <= 1530
+
+	dataTag := "📂 refreshing data..."
+	if marketOpen {
 		dataTag = "📡 live Kite data"
 	}
+
 	replyToChat(chatID, fmt.Sprintf(
 		"🔍 *Scanning* — %s\n%s | RS≥%d | %d stocks",
-		dateStr, dataTag, rsMin, len(scanner.Universe)))
+		config.NowIST().Format("02 Jan 2006 15:04 IST"),
+		dataTag, rsMin, len(scanner.Universe)))
+
+	// Outside market hours: refresh cache so we always have the latest EOD candles
+	// (same as what the auto EOD scan does before running)
+	if !marketOpen && scanner.RefreshCache != nil {
+		scanner.RefreshCache()
+	}
 
 	start := time.Now()
 	cache := scanner.DailyCache
