@@ -304,10 +304,10 @@ func handleFullScan(chatID, msgText string, scanner *ScannerAgent, signalAgent *
 		}
 	}
 
-	// Keep only BUY results with RS >= rsMin, sort by RS desc
+	// Best of best: EMA pullback confirmed (Pattern != "") + RS >= rsMin
 	var buyResults []EODScanResult
 	for _, r := range results {
-		if r.Signal == "BUY" && r.RSScore >= rsMin {
+		if r.Signal == "BUY" && r.Pattern != "" && r.RSScore >= rsMin {
 			buyResults = append(buyResults, r)
 		}
 	}

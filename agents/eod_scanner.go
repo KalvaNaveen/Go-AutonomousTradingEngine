@@ -644,46 +644,43 @@ func buildEODSummary(results []EODScanResult, scanned, buyCount, sellCount int, 
 	_ = elapsed
 	_ = buyCount
 
-	// Filter: BUY signal + RS >= MinRSScore, already sorted by RS desc from caller
+	// Best of best: EMA pullback confirmed + RS >= MinRSScore
+	// r.Pattern != "" means EMAStrategy.Detect fired — all 3 rules + MACD + 9 filters passed
 	var buys []EODScanResult
 	for _, r := range results {
-		if r.Signal == "BUY" && r.RSScore >= config.MinRSScore {
+		if r.Signal == "BUY" && r.Pattern != "" && r.RSScore >= config.MinRSScore {
 			buys = append(buys, r)
 		}
 	}
 
 	msg := fmt.Sprintf("📊 *SWING WATCHLIST — %s*\n", dateStr)
 	msg += "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-	msg += fmt.Sprintf("🔎 `%d` stocks scanned | 🟢 `%d` setups (RS≥%d)\n", scanned, len(buys), config.MinRSScore)
+	msg += fmt.Sprintf("🔎 `%d` stocks | 🎯 `%d` confirmed setups (RS≥%d)\n", scanned, len(buys), config.MinRSScore)
 	msg += "━━━━━━━━━━━━━━━━━━━━━━━━\n"
 
 	if len(buys) == 0 {
-		msg += fmt.Sprintf("\n❌ No setups with RS≥%d today. Market momentum is weak.\n", config.MinRSScore)
+		msg += fmt.Sprintf("\n❌ No confirmed EMA pullback setups with RS≥%d today.\n", config.MinRSScore)
 	} else {
 		limit := 15
 		if len(buys) < limit {
 			limit = len(buys)
 		}
-		msg += fmt.Sprintf("\n🟢 *TOP %d — EMA Pullback + High Momentum*\n", limit)
-		msg += "_Ranked by Relative Strength (RS)_\n\n"
+		msg += fmt.Sprintf("\n🎯 *TOP %d CONFIRMED SETUPS*\n", limit)
+		msg += "_EMA Pullback ✅ + MACD ✅ + RS≥80 ✅_\n\n"
 		for i := 0; i < limit; i++ {
 			r := buys[i]
 			rsTag := eodRSEmoji(r.RSScore)
-			patTag := ""
-			if r.Pattern != "" {
-				patTag = " ✅"
-			}
 			// Volume vs average
 			volTag := ""
 			if r.AvgVolume > 0 {
 				vr := r.Volume / r.AvgVolume
 				switch {
 				case vr >= 2.0:
-					volTag = fmt.Sprintf(" | Vol: 🔥`%.1fx` avg", vr)
+					volTag = fmt.Sprintf(" | Vol: 🔥`%.1fx`", vr)
 				case vr >= 1.3:
-					volTag = fmt.Sprintf(" | Vol: ⚡`%.1fx` avg", vr)
+					volTag = fmt.Sprintf(" | Vol: ⚡`%.1fx`", vr)
 				default:
-					volTag = fmt.Sprintf(" | Vol: `%.1fx` avg", vr)
+					volTag = fmt.Sprintf(" | Vol: `%.1fx`", vr)
 				}
 			}
 			// Distance from 52W high
@@ -691,13 +688,13 @@ func buildEODSummary(results []EODScanResult, scanned, buyCount, sellCount int, 
 			if r.High52W > 0 && r.LTP > 0 {
 				dist := (r.High52W - r.LTP) / r.High52W * 100
 				if dist <= 2.0 {
-					nearHighTag = " | 🏔 Near ATH"
+					nearHighTag = " | 🏔 ATH"
 				} else if dist <= 8.0 {
-					nearHighTag = fmt.Sprintf(" | `%.1f%%` from 52W High", dist)
+					nearHighTag = fmt.Sprintf(" | `%.1f%%` from High", dist)
 				}
 			}
-			msg += fmt.Sprintf("*%d. %s* %s%s | RS `%d`\n   ₹`%.0f`%s%s\n\n",
-				i+1, r.Symbol, rsTag, patTag, r.RSScore,
+			msg += fmt.Sprintf("*%d. %s* %s | RS `%d`\n   ₹`%.0f`%s%s\n\n",
+				i+1, r.Symbol, rsTag, r.RSScore,
 				r.LTP, volTag, nearHighTag)
 		}
 		if len(buys) > 15 {
