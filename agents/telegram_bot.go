@@ -14,6 +14,7 @@ package agents
 //
 //  Command matching is intent-based — "scan", "full scan",
 //  "get latest signals", "check market" etc. all trigger the scan.
+//  All BUY output is the consolidated EOD summary — no per-stock spam.
 //
 //  Security: only responds to chat IDs in TELEGRAM_CHAT_IDS.
 // ══════════════════════════════════════════════════════════════
@@ -26,6 +27,7 @@ import (
 	"net/http"
 	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -140,11 +142,11 @@ func handleBotMessage(chatID, text string, scanner *ScannerAgent, signalAgent *S
 	lower := strings.ToLower(strings.TrimSpace(text))
 
 	switch {
-	// ── Scan intent: any message with these keywords triggers a full EOD-style scan
+	// ── Scan intent
 	case containsAnyWord(lower,
 		"scan", "signal", "signals", "latest", "setup", "setups",
 		"buy", "market", "check", "run", "full", "eod"):
-		handleFullScan(chatID, scanner, signalAgent)
+		handleFullScan(chatID, lower, scanner, signalAgent)
 
 	// ── Status
 	case containsAnyWord(lower, "status", "health", "engine"):
@@ -154,19 +156,69 @@ func handleBotMessage(chatID, text string, scanner *ScannerAgent, signalAgent *S
 	case containsAnyWord(lower, "help", "start", "hi", "hello", "/help", "/start"):
 		replyToChat(chatID,
 			"👋 *Zenith Trading Engine*\n\n"+
-				"Just say what you want — I understand natural language:\n\n"+
-				"📡 *scan* / *full scan* / *get signals* — Full EOD-style scan\n"+
-				"⚙️ *status* / *engine health* — Engine status\n"+
+				"Just say what you want:\n\n"+
+				"📡 *scan* — Full market scan\n"+
+				"⚙️ *status* — Engine health\n"+
 				"❓ *help* — This message\n\n"+
-				"_Tip: EOD scan also runs automatically at 16:00 IST_")
+				"_EOD scan auto-runs at 16:00 IST_")
 
 	default:
 		replyToChat(chatID,
 			"❓ I didn't understand that. Try:\n"+
-				"• *scan* — to scan the market\n"+
+				"• *scan* — scan the market\n"+
 				"• *status* — engine health\n"+
 				"• *help* — all commands")
 	}
+}
+
+// parseRSThreshold extracts an RS threshold from a message.
+// Supports: "scan 85", "scan 90+", "rs=85", "rs85", "rs 90"
+// Falls back to config.MinRSScore (default 80) if nothing found.
+func parseRSThreshold(text string) int {
+	text = strings.ToLower(text)
+
+	// Try "rs=85" or "rs=90"
+	if idx := strings.Index(text, "rs="); idx >= 0 {
+		rest := strings.TrimLeft(text[idx+3:], " ")
+		num := extractLeadingInt(rest)
+		if num >= 50 && num <= 99 {
+			return num
+		}
+	}
+
+	// Try "rs 85" or "rs85"
+	if idx := strings.Index(text, "rs"); idx >= 0 {
+		rest := strings.TrimLeft(text[idx+2:], " ")
+		num := extractLeadingInt(rest)
+		if num >= 50 && num <= 99 {
+			return num
+		}
+	}
+
+	// Try bare number: "scan 85" or "scan 90+"
+	// Look for any 2-digit number in range 50–99 in the message
+	words := strings.Fields(text)
+	for _, w := range words {
+		w = strings.TrimRight(w, "+%")
+		if n, err := strconv.Atoi(w); err == nil && n >= 50 && n <= 99 {
+			return n
+		}
+	}
+
+	return config.MinRSScore // default
+}
+
+// extractLeadingInt reads a leading integer from a string (stops at non-digit).
+func extractLeadingInt(s string) int {
+	end := 0
+	for end < len(s) && s[end] >= '0' && s[end] <= '9' {
+		end++
+	}
+	if end == 0 {
+		return 0
+	}
+	n, _ := strconv.Atoi(s[:end])
+	return n
 }
 
 // containsAnyWord returns true if `text` contains any of the given words.
@@ -179,31 +231,31 @@ func containsAnyWord(text string, words ...string) bool {
 	return false
 }
 
-// ── Full EOD-style scan (mirrors RunEODMarketScan + RunEODBuyAlerts + RunEODSellAlerts)
-// ─────────────────────────────────────────────────────────────────────────────
+// ── Full EOD-style scan ───────────────────────────────────────────────────────
 
 // handleFullScan runs the complete scan pipeline on demand:
-//  1. 🟢 EMA Pullback BUY signals (individual messages, same as RunEODBuyAlerts)
-//  2. 📊 EOD Summary: top BUY picks from score-based classifier
-//  3. 🚀 MOMO Leaders + 🔥 Trigger Candles (EODBookScans)
-//  4. 🦅 Bird's Eye View market health report
-func handleFullScan(chatID string, scanner *ScannerAgent, signalAgent *SignalAlertAgent) {
+//  1. 📊 EOD Summary: top BUY picks (score-based + EMA pullback pattern)
+//  2. 🚀 MOMO Leaders + 🔥 Trigger Candles (EODBookScans)
+//  3. 🦅 Bird's Eye View market health report
+func handleFullScan(chatID, msgText string, scanner *ScannerAgent, signalAgent *SignalAlertAgent) {
 	if scanner == nil || scanner.DailyCache == nil || !scanner.DailyCache.Loaded {
 		replyToChat(chatID, "⚠️ Cache not loaded yet — try again in a moment.")
 		return
 	}
 
+	// Parse RS threshold from message — supports: "scan 85", "scan 90+", "rs=85", "rs85"
+	rsMin := parseRSThreshold(msgText)
+
 	dateStr := config.NowIST().Format("02 Jan 2006 15:04 IST")
 	now := config.NowIST()
 	hhmm := now.Hour()*100 + now.Minute()
-	dataTag := "📂 using last EOD data"
+	dataTag := "📂 last EOD data"
 	if hhmm >= 915 && hhmm <= 1530 {
-		dataTag = "📡 using live Kite data"
+		dataTag = "📡 live Kite data"
 	}
 	replyToChat(chatID, fmt.Sprintf(
-		"🔍 *Full Scan Started* — %s\n"+
-			"%s | %d stocks",
-		dateStr, dataTag, len(scanner.Universe)))
+		"🔍 *Scanning* — %s\n%s | RS≥%d | %d stocks",
+		dateStr, dataTag, rsMin, len(scanner.Universe)))
 
 	start := time.Now()
 	cache := scanner.DailyCache
@@ -243,10 +295,10 @@ func handleFullScan(chatID string, scanner *ScannerAgent, signalAgent *SignalAle
 		}
 	}
 
-	// Keep only BUY results, sort by RS desc
+	// Keep only BUY results with RS >= rsMin, sort by RS desc
 	var buyResults []EODScanResult
 	for _, r := range results {
-		if r.Signal == "BUY" {
+		if r.Signal == "BUY" && r.RSScore >= rsMin {
 			buyResults = append(buyResults, r)
 		}
 	}

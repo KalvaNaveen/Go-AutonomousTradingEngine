@@ -353,6 +353,12 @@ const (
 // EMA scan criterion: "CMP > Number 30" (p.267). Filters out penny/micro stocks.
 var MinStockPrice = envFloat("MIN_STOCK_PRICE", 30.0)
 
+// ── Relative Strength minimum threshold ──────────────────────────────────────
+// Only stocks with RS Score >= this value appear in BUY signals and EOD summary.
+// William O'Neil: "Only buy RS 80+". Minervini: "RS 90+".
+// Set MIN_RS_SCORE in .env to override. Default: 80.
+var MinRSScore = int(envFloat("MIN_RS_SCORE", 80))
+
 // (RS-percentile rank, India VIX guards, and per-sector cap removed — none appear
 //  in the book. RS is expressed via the Monthly Gainers scan; VIX is never mentioned;
 //  sector concentration is not capped by the book.)

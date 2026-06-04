@@ -347,8 +347,8 @@ func classifyStock(
 	if sma200 > 0 && ltp > sma200 {
 		buyScore++
 	}
-	// 3. Strong RS Score (top 30% of market)
-	if rsScore >= 70 {
+	// 3. Strong RS Score (≥ MinRSScore, default 80 = top 20%)
+	if rsScore >= config.MinRSScore {
 		buyScore++
 	}
 	// 4. Near all-time/52-week high (within 5%)
@@ -642,10 +642,10 @@ func EODBookScans(cache *DailyCache, universe map[uint32]string, getLTP func(uin
 func buildEODSummary(results []EODScanResult, scanned, buyCount, sellCount int, elapsed time.Duration) string {
 	dateStr := config.NowIST().Format("02 Jan 2006")
 
-	// ── Section 1: Top 15 BUY setups ──────────────────────────────────────────
+	// ── Section 1: Top 15 BUY setups (RS >= MinRSScore) ─────────────────────
 	var buys []EODScanResult
 	for _, r := range results {
-		if r.Signal == "BUY" {
+		if r.Signal == "BUY" && r.RSScore >= config.MinRSScore {
 			buys = append(buys, r)
 		}
 	}
@@ -653,13 +653,14 @@ func buildEODSummary(results []EODScanResult, scanned, buyCount, sellCount int, 
 
 	msg := fmt.Sprintf("📊 *EOD SWING SCAN — %s*\n", dateStr)
 	msg += "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-	msg += fmt.Sprintf("🔎 `%d` stocks scanned | 🟢 `%d` BUY setups found\n", scanned, buyCount)
+	msg += fmt.Sprintf("🔎 `%d` stocks | 🟢 `%d` quality setups (RS≥%d)\n", scanned, len(buys), config.MinRSScore)
 	msg += "━━━━━━━━━━━━━━━━━━━━━━━━\n"
 	_ = sellCount
 	_ = elapsed
+	_ = buyCount
 
 	if len(buys) == 0 {
-		msg += "\n❌ No convincing BUY setups today. Market may be consolidating.\n"
+		msg += fmt.Sprintf("\n❌ No setups with RS ≥ %d today. Market momentum is weak.\n", config.MinRSScore)
 	} else {
 		limit := 15
 		if len(buys) < limit {

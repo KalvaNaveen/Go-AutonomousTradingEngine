@@ -354,10 +354,8 @@ func main() {
 				freshCache := dailyCache.ToScannerCache()
 				scanner.DailyCache = freshCache
 
-				// SELL first — stocks that crossed below EMA10
+				// SELL — stocks that crossed below EMA10 (open positions only)
 				signalAgent.RunEODSellAlerts(scanner.Universe)
-				// BUY — new 2-green-candle-above-EMA10 setups
-				signalAgent.RunEODBuyAlerts(scanner.Universe)
 
 				// Full EOD market scan (BUY breadth, Trigger Candles, MOMO leaders, CSV)
 				go agents.RunEODMarketScan(agents.EODScanDeps{
@@ -450,3 +448,4 @@ func isNSEHoliday(t time.Time) bool {
 	dateStr := t.Format("2006-01-02")
 	return nseHolidays2026Fallback[dateStr]
 }
+
