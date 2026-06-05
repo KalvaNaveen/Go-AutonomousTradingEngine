@@ -17,10 +17,10 @@ TOKENIZER_REPO = "NeoQuasar/Kronos-Tokenizer-base"
 PREDICTOR_REPO = "NeoQuasar/Kronos-base"
 
 def download(repo_id, local_dir):
-    print(f"Downloading {repo_id} → {local_dir}")
+    print(f"Downloading {repo_id} -> {local_dir}")
     from huggingface_hub import snapshot_download
     snapshot_download(repo_id=repo_id, local_dir=str(local_dir))
-    print(f"  ✅ Done")
+    print("  Done")
 
 def main():
     try:
@@ -37,9 +37,9 @@ def main():
     if not kronos_dir.exists():
         print("Cloning Kronos source...")
         subprocess.check_call(["git", "clone", "https://github.com/shiyu-coder/Kronos.git", str(kronos_dir)])
-        print("  ✅ Cloned")
+        print("  Cloned")
 
-    print("\n✅ Setup complete.")
+    print("\nSetup complete.")
     print("Next steps:")
     print("  1. python data_export.py --api-key XXXX --access-token YYYY")
     print("  2. python finetune/train.py --stage tokenizer")

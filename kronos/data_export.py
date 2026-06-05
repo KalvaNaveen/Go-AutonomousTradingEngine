@@ -49,36 +49,56 @@ def fetch_instruments(api_key, access_token):
     reader = csv.DictReader(lines)
     return list(reader)
 
-def fetch_ohlcv(token, from_date, to_date, api_key, access_token, retries=3):
+MAX_DAYS = 1800  # Kite historical API limit is 2000 days; use 1800 for safety
+
+def _fetch_chunk(token, from_date, to_date, headers, retries=3):
     url = f"{BASE_URL}/instruments/historical/{token}/day?from={from_date}&to={to_date}"
     for attempt in range(retries):
         try:
-            resp = requests.get(url, headers=kite_headers(api_key, access_token), timeout=15)
+            resp = requests.get(url, headers=headers, timeout=15)
             data = resp.json()
             if data.get("status") != "success":
-                return None
-            candles = data["data"]["candles"]
-            if not candles:
-                return None
-            rows = []
-            for c in candles:
-                if len(c) < 6:
-                    continue
-                rows.append({
-                    "date":   pd.Timestamp(c[0][:10]),
-                    "open":   float(c[1]),
-                    "high":   float(c[2]),
-                    "low":    float(c[3]),
-                    "close":  float(c[4]),
-                    "vol":    float(c[5]),
-                })
-            df = pd.DataFrame(rows).set_index("date")
-            df["amt"] = (df["open"] + df["high"] + df["low"] + df["close"]) / 4 * df["vol"]
-            return df
-        except Exception as e:
+                return []
+            return data["data"]["candles"] or []
+        except Exception:
             if attempt < retries - 1:
                 time.sleep(1)
-    return None
+    return []
+
+def fetch_ohlcv(token, from_date, to_date, api_key, access_token, retries=3):
+    headers = kite_headers(api_key, access_token)
+    start = datetime.strptime(from_date, "%Y-%m-%d").date()
+    end   = datetime.strptime(to_date,   "%Y-%m-%d").date()
+    delta = timedelta(days=MAX_DAYS)
+
+    all_candles = []
+    chunk_start = start
+    while chunk_start <= end:
+        chunk_end = min(chunk_start + delta, end)
+        candles = _fetch_chunk(token, chunk_start.isoformat(), chunk_end.isoformat(), headers, retries)
+        all_candles.extend(candles)
+        chunk_start = chunk_end + timedelta(days=1)
+        if chunk_start <= end:
+            time.sleep(0.35)
+
+    if not all_candles:
+        return None
+    rows = []
+    for c in all_candles:
+        if len(c) < 6:
+            continue
+        rows.append({
+            "date":  pd.Timestamp(c[0][:10]),
+            "open":  float(c[1]),
+            "high":  float(c[2]),
+            "low":   float(c[3]),
+            "close": float(c[4]),
+            "vol":   float(c[5]),
+        })
+    df = pd.DataFrame(rows).set_index("date")
+    df = df[~df.index.duplicated(keep="last")]
+    df["amt"] = (df["open"] + df["high"] + df["low"] + df["close"]) / 4 * df["vol"]
+    return df
 
 # ── NSE universe loader ────────────────────────────────────────────────────
 
