@@ -43,7 +43,7 @@ app = FastAPI(title="Kronos Signal Ranker", version="1.0")
 # ── Model config ───────────────────────────────────────────────────────────
 MODELS_DIR       = Path(__file__).parent / "models"
 TOKENIZER_PATH   = os.environ.get("KRONOS_TOKENIZER", str(MODELS_DIR / "nse_tokenizer"))
-PREDICTOR_PATH   = os.environ.get("KRONOS_PREDICTOR", str(MODELS_DIR / "nse_predictor"))
+PREDICTOR_PATH   = os.environ.get("KRONOS_PREDICTOR", str(MODELS_DIR / "nse_predictor_base"))
 PRED_LEN         = 5      # forecast 5 trading days forward
 LOOKBACK         = 90     # use last 90 days as context
 SAMPLE_COUNT     = 5      # average 5 sample paths for stability
@@ -58,7 +58,7 @@ def load_model():
         return
 
     tok_path  = TOKENIZER_PATH if Path(TOKENIZER_PATH).exists() else "NeoQuasar/Kronos-Tokenizer-base"
-    pred_path = PREDICTOR_PATH if Path(PREDICTOR_PATH).exists() else "NeoQuasar/Kronos-small"
+    pred_path = PREDICTOR_PATH if Path(PREDICTOR_PATH).exists() else "NeoQuasar/Kronos-base"
 
     log.info(f"Loading tokenizer from {tok_path}")
     log.info(f"Loading predictor from {pred_path}")

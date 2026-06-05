@@ -22,12 +22,12 @@ class Config:
 
     # ── Pretrained model paths ─────────────────────────────────────────────
     pretrained_tokenizer_path = str(BASE / "models" / "Kronos-Tokenizer-base")
-    pretrained_predictor_path = str(BASE / "models" / "Kronos-small")
+    pretrained_predictor_path = str(BASE / "models" / "Kronos-base")
 
     # ── Output ────────────────────────────────────────────────────────────
     save_path                    = str(BASE / "models")
     tokenizer_save_folder_name   = "nse_tokenizer"
-    predictor_save_folder_name   = "nse_predictor"
+    predictor_save_folder_name   = "nse_predictor_base"
 
     # ── Training hyperparams ──────────────────────────────────────────────
     seed                  = 42

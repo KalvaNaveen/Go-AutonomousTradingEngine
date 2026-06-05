@@ -14,7 +14,7 @@ MODELS_DIR = Path(__file__).parent / "models"
 MODELS_DIR.mkdir(exist_ok=True)
 
 TOKENIZER_REPO = "NeoQuasar/Kronos-Tokenizer-base"
-PREDICTOR_REPO = "NeoQuasar/Kronos-small"
+PREDICTOR_REPO = "NeoQuasar/Kronos-base"
 
 def download(repo_id, local_dir):
     print(f"Downloading {repo_id} → {local_dir}")
@@ -30,7 +30,7 @@ def main():
         from huggingface_hub import snapshot_download
 
     download(TOKENIZER_REPO, MODELS_DIR / "Kronos-Tokenizer-base")
-    download(PREDICTOR_REPO, MODELS_DIR / "Kronos-small")
+    download(PREDICTOR_REPO, MODELS_DIR / "Kronos-base")
 
     # Clone Kronos source if not present
     kronos_dir = Path(__file__).parent / "Kronos"
