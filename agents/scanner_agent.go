@@ -81,6 +81,10 @@ type ScannerAgent struct {
 	// Calling this reloads today's candles from Kite/DB before a manual scan.
 	RefreshCache func()
 
+	// Kronos — optional AI ranker. When non-nil and online, re-ranks BUY signals
+	// by predicted 5-day upside after the rule-based scan completes.
+	Kronos *KronosClient
+
 
 	// State
 	ConsecutiveSLs      int

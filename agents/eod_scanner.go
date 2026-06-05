@@ -25,22 +25,24 @@ import (
 
 // EODScanResult holds the analysis output for a single stock.
 type EODScanResult struct {
-	Symbol    string
-	Company   string
-	Signal    string  // "BUY" or "SELL"
-	Score     int     // raw signal score — higher = more criteria met
-	LTP       float64
-	MarketCap float64 // from Screener.in cache (Cr), 0 if unavailable
-	EMA21     float64
-	EMA63     float64
-	SMA200    float64
-	Volume    float64 // today's volume (from tick store or daily cache)
-	AvgVolume float64 // 20-day average
-	RSScore   int     // Relative Strength percentile (1-99)
-	Pattern   string  // detected pattern name, or ""
-	ATR       float64
-	High52W   float64
-	Low52W    float64
+	Symbol       string
+	Company      string
+	Token        uint32
+	Signal       string  // "BUY" or "SELL"
+	Score        int     // raw signal score — higher = more criteria met
+	KronosUpside float64 // Kronos predicted 5-day upside % (0 if service offline)
+	LTP          float64
+	MarketCap    float64 // from Screener.in cache (Cr), 0 if unavailable
+	EMA21        float64
+	EMA63        float64
+	SMA200       float64
+	Volume       float64 // today's volume (from tick store or daily cache)
+	AvgVolume    float64 // 20-day average
+	RSScore      int     // Relative Strength percentile (1-99)
+	Pattern      string  // detected pattern name, or ""
+	ATR          float64
+	High52W      float64
+	Low52W       float64
 }
 
 // EODScanDeps bundles the dependencies the EOD scanner needs.
@@ -56,6 +58,8 @@ type EODScanDeps struct {
 	GetLiveLTP func(token uint32) float64
 	// GetLiveVolume returns the live cumulative day volume for a token.
 	GetLiveVolume func(token uint32) int64
+	// Kronos is optional — when non-nil, BUY signals are re-ranked by predicted upside.
+	Kronos *KronosClient
 }
 
 // RunEODMarketScan is the top-level function called from main.go at 16:00.
@@ -107,13 +111,28 @@ func RunEODMarketScan(deps EODScanDeps, scanner *ScannerAgent) {
 	sort.Slice(results, func(i, j int) bool {
 		ri, rj := results[i], results[j]
 		if ri.Signal != rj.Signal {
-			return ri.Signal == "BUY" // BUY section before SELL
+			return ri.Signal == "BUY"
 		}
 		if ri.Score != rj.Score {
-			return ri.Score > rj.Score // higher conviction first
+			return ri.Score > rj.Score
 		}
-		return ri.RSScore > rj.RSScore // tie-break by relative strength
+		return ri.RSScore > rj.RSScore
 	})
+
+	// Step 4b: Kronos re-ranking — re-order BUY signals by predicted 5d upside
+	if deps.Kronos != nil && deps.Kronos.IsAlive() {
+		var buys, sells []EODScanResult
+		for _, r := range results {
+			if r.Signal == "BUY" {
+				buys = append(buys, r)
+			} else {
+				sells = append(sells, r)
+			}
+		}
+		log.Printf("[EODScan] Kronos re-ranking %d BUY signals...", len(buys))
+		buys = deps.Kronos.RankSignals(buys, scanCache)
+		results = append(buys, sells...)
+	}
 
 	buyCount := 0
 	sellCount := 0
@@ -313,6 +332,7 @@ func analyzeStock(
 	return &EODScanResult{
 		Symbol:    symbol,
 		Company:   company,
+		Token:     token,
 		Signal:    signal,
 		Score:     score,
 		LTP:       ltp,
@@ -697,9 +717,10 @@ func buildEODSummary(results []EODScanResult, scanned, buyCount, sellCount int, 
 					nearHighTag = fmt.Sprintf(" | `%.1f%%` from High", dist)
 				}
 			}
-			msg += fmt.Sprintf("*%d. %s* %s | RS `%d`\n   ₹`%.0f`%s%s\n\n",
+			kronosTag := KronosUpsideTag(r.KronosUpside)
+			msg += fmt.Sprintf("*%d. %s* %s | RS `%d`\n   ₹`%.0f`%s%s%s\n\n",
 				i+1, r.Symbol, rsTag, r.RSScore,
-				r.LTP, volTag, nearHighTag)
+				r.LTP, volTag, nearHighTag, kronosTag)
 		}
 		if len(buys) > 15 {
 			msg += fmt.Sprintf("_... +%d more in CSV_\n", len(buys)-15)

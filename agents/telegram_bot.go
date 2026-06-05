@@ -312,8 +312,18 @@ func handleFullScan(chatID, msgText string, scanner *ScannerAgent, signalAgent *
 		}
 	}
 	sort.Slice(buyResults, func(i, j int) bool {
+		if buyResults[i].Score != buyResults[j].Score {
+			return buyResults[i].Score > buyResults[j].Score
+		}
 		return buyResults[i].RSScore > buyResults[j].RSScore
 	})
+
+	// Kronos re-ranking — re-order by predicted 5d upside if service online
+	if scanner.Kronos != nil && scanner.Kronos.IsAlive() {
+		log.Printf("[Bot] Kronos re-ranking %d BUY signals...", len(buyResults))
+		buyResults = scanner.Kronos.RankSignals(buyResults, cache)
+	}
+
 	results = buyResults
 	buyCount := len(results)
 	sellCount := 0

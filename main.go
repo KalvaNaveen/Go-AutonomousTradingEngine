@@ -236,6 +236,20 @@ func main() {
 	}
 	scanner.GetLTP = getKiteLTP
 
+	// Kronos AI ranker — optional, gracefully skipped when service is offline
+	kronosURL := os.Getenv("KRONOS_SERVICE_URL")
+	if kronosURL == "" {
+		kronosURL = "http://localhost:8765"
+	}
+	kronosClient := agents.NewKronosClient(kronosURL)
+	if kronosClient.IsAlive() {
+		log.Println("[Engine] Kronos service online ✅ — AI ranking enabled")
+		agents.SendTelegram("🤖 *Kronos AI ranker online* — signals will include predicted 5-day upside")
+	} else {
+		log.Println("[Engine] Kronos service offline — AI ranking disabled (rule-based order used)")
+	}
+	scanner.Kronos = kronosClient
+
 	// ══════════════════════════════════════════════════════════════
 	//  Research Automation (Sections II-IV of Blueprint)
 	// ══════════════════════════════════════════════════════════════
@@ -398,6 +412,7 @@ func main() {
 					GetScannerCache: func() *agents.DailyCache { return dailyCache.ToScannerCache() },
 					GetLiveLTP:      getKiteLTP,
 					GetLiveVolume:   func(token uint32) int64 { return tickStore.GetVolume(token) },
+					Kronos:          kronosClient,
 				}, scanner)
 
 				alertsDone = true
