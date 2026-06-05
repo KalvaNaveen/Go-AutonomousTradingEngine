@@ -1,19 +1,15 @@
 package storage
 
 import (
-	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"math"
 	"net/http"
-	"os"
 	"sort"
 	"sync"
 	"time"
-
-	_ "modernc.org/sqlite"
 
 	"bnf_go_engine/agents"
 	"bnf_go_engine/config"
@@ -59,27 +55,13 @@ func NewDailyCache() *DailyCache {
 	}
 }
 
-// isRegimeToken returns true for the two index tokens that need the full
-// RegimeLookbackDays history for ROC calculation.
-func isRegimeToken(token uint32) bool {
-	return token == config.NiftySpotToken || token == config.SmallcapToken
-}
 
-// Preload loads 5 years of OHLCV for every universe token.
-// Strategy: DB-first. On startup it reads historical.db (fast, no API calls).
-// Only the gap between the latest DB row and today is fetched from Kite API,
-// then written back to DB. First-ever run seeds the full 5-year history.
+// Preload loads 5 years of OHLCV for every universe token directly from Kite API.
+// DB cache is bypassed so that every scan always reflects the latest Kite data.
 func (dc *DailyCache) Preload(universe map[uint32]string) bool {
 	const fiveYearsCalendar = 1825
 
-	histDB, dbErr := openHistoricalDB()
-	if dbErr != nil {
-		log.Printf("[DailyCache] ⚠️  historical.db unavailable (%v) — falling back to live API only", dbErr)
-	} else {
-		defer histDB.Close()
-	}
-
-	log.Printf("[DailyCache] Preloading %d tokens (DB-first, 5yr history)...", len(universe))
+	log.Printf("[DailyCache] Preloading %d tokens (live Kite API, no DB cache)...", len(universe))
 
 	type tokenJob struct {
 		token  uint32
@@ -101,57 +83,16 @@ func (dc *DailyCache) Preload(universe map[uint32]string) bool {
 		go func() {
 			defer wg.Done()
 			for job := range jobs {
-				var bars []dailyBar
-				hitAPI := false
-
-				if histDB != nil {
-					latest := latestDateInDB(histDB, job.token)
-					today := config.NowIST().Format("2006-01-02")
-					yesterday := config.NowIST().AddDate(0, 0, -1).Format("2006-01-02")
-
-					if latest == "" {
-						// First-ever load: seed full 5-year history from Kite API
-						fromDate := config.NowIST().AddDate(0, 0, -fiveYearsCalendar).Format("2006-01-02")
-						newBars, err := dc.fetchDailyRange(job.token, fromDate, today)
-						if err == nil && len(newBars) > 0 {
-							appendBarsToDB(histDB, job.token, newBars)
-						}
-						hitAPI = true
-					} else if latest < yesterday {
-						// Incremental update: fetch only the missing gap
-						newBars, err := dc.fetchDailyRange(job.token, latest, today)
-						if err == nil && len(newBars) > 0 {
-							appendBarsToDB(histDB, job.token, newBars)
-						}
-						hitAPI = true
+				bars, err := dc.fetchDaily(job.token, fiveYearsCalendar)
+				if err != nil || len(bars) < 25 {
+					mu.Lock()
+					failed++
+					mu.Unlock()
+					if err != nil {
+						log.Printf("[DailyCache] %s failed: %v", job.symbol, err)
 					}
-					// else: DB is current (today or yesterday) — no API call needed
-
-					// Read full history from DB (up to 5 years of trading bars)
-					dbBars, err := readBarsFromDB(histDB, job.token, fiveYearsCalendar*2)
-					if err == nil && len(dbBars) >= 25 {
-						bars = dbBars
-					}
-				}
-
-				// Fallback: DB unavailable or returned < 25 bars → call Kite API directly
-				if len(bars) < 25 {
-					apiBars, err := dc.fetchDaily(job.token, fiveYearsCalendar)
-					if err != nil || len(apiBars) < 25 {
-						mu.Lock()
-						failed++
-						mu.Unlock()
-						if err != nil {
-							log.Printf("[DailyCache] %s failed: %v", job.symbol, err)
-						}
-						time.Sleep(350 * time.Millisecond)
-						continue
-					}
-					bars = apiBars
-					if histDB != nil {
-						appendBarsToDB(histDB, job.token, bars)
-					}
-					hitAPI = true
+					time.Sleep(350 * time.Millisecond)
+					continue
 				}
 
 				dc.buildEntryFromBars(job.token, job.symbol, bars)
@@ -163,10 +104,7 @@ func (dc *DailyCache) Preload(universe map[uint32]string) bool {
 				}
 				mu.Unlock()
 
-				// Rate limit only when we actually called the Kite API
-				if hitAPI {
-					time.Sleep(350 * time.Millisecond)
-				}
+				time.Sleep(350 * time.Millisecond)
 			}
 		}()
 	}
@@ -299,10 +237,6 @@ func (dc *DailyCache) ToScannerCache() *agents.DailyCache {
 	return sc
 }
 
-// ExportAgentsCache is an alias for ToScannerCache — used by the backtest API handler.
-func (dc *DailyCache) ExportAgentsCache() *agents.DailyCache {
-	return dc.ToScannerCache()
-}
 
 func (dc *DailyCache) IsLoaded() bool {
 	dc.mu.RLock()
@@ -322,79 +256,6 @@ type dailyBar struct {
 	Volume int64
 }
 
-// ══════════════════════════════════════════════════════════════
-//  Historical DB helpers — persistent 5-year price store
-// ══════════════════════════════════════════════════════════════
-
-func historicalDBPath() string {
-	return config.BaseDir + string(os.PathSeparator) + "data" + string(os.PathSeparator) + "historical.db"
-}
-
-func openHistoricalDB() (*sql.DB, error) {
-	db, err := sql.Open("sqlite", historicalDBPath()+"?_journal_mode=WAL&_busy_timeout=30000")
-	if err != nil {
-		return nil, err
-	}
-	db.Exec(`CREATE TABLE IF NOT EXISTS daily_data (
-		token   INTEGER NOT NULL,
-		date    TEXT    NOT NULL,
-		open    REAL    NOT NULL,
-		high    REAL    NOT NULL,
-		low     REAL    NOT NULL,
-		close   REAL    NOT NULL,
-		volume  INTEGER NOT NULL,
-		PRIMARY KEY (token, date)
-	)`)
-	db.Exec(`CREATE INDEX IF NOT EXISTS idx_daily_token_date ON daily_data (token, date)`)
-	return db, nil
-}
-
-// latestDateInDB returns the most recent date string stored for a token, or "".
-func latestDateInDB(db *sql.DB, token uint32) string {
-	var d string
-	db.QueryRow(`SELECT MAX(date) FROM daily_data WHERE token=?`, token).Scan(&d)
-	return d
-}
-
-// readBarsFromDB reads up to limit bars for a token, oldest-first.
-func readBarsFromDB(db *sql.DB, token uint32, limit int) ([]dailyBar, error) {
-	rows, err := db.Query(`
-		SELECT date, open, high, low, close, volume
-		FROM daily_data
-		WHERE token=?
-		ORDER BY date ASC
-		LIMIT ?`, token, limit)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var bars []dailyBar
-	for rows.Next() {
-		var b dailyBar
-		rows.Scan(&b.Date, &b.Open, &b.High, &b.Low, &b.Close, &b.Volume)
-		bars = append(bars, b)
-	}
-	return bars, nil
-}
-
-// appendBarsToDB upserts a batch of bars into historical.db in a single transaction.
-func appendBarsToDB(db *sql.DB, token uint32, bars []dailyBar) {
-	tx, err := db.Begin()
-	if err != nil {
-		return
-	}
-	stmt, err := tx.Prepare(`INSERT OR REPLACE INTO daily_data
-		(token, date, open, high, low, close, volume) VALUES (?, ?, ?, ?, ?, ?, ?)`)
-	if err != nil {
-		tx.Rollback()
-		return
-	}
-	defer stmt.Close()
-	for _, b := range bars {
-		stmt.Exec(token, b.Date, b.Open, b.High, b.Low, b.Close, b.Volume)
-	}
-	tx.Commit()
-}
 
 func (dc *DailyCache) fetchDaily(token uint32, days int) ([]dailyBar, error) {
 	now := config.NowIST()
@@ -623,54 +484,3 @@ func max(a, b int) int {
 	return b
 }
 
-// SyncEODToHistoricalDB fetches today's finalized OHLCV bar for every token,
-// writes it to historical.db, and refreshes the in-memory cache entry so the
-// next Preload (and backtest) sees current data without a full restart.
-func (dc *DailyCache) SyncEODToHistoricalDB(universe map[uint32]string) {
-	db, err := openHistoricalDB()
-	if err != nil {
-		log.Printf("[DailyCache] ❌ Failed to open historical.db for EOD sync: %v", err)
-		return
-	}
-	defer db.Close()
-
-	log.Printf("[DailyCache] 💾 EOD DB Sync — %d tokens...", len(universe))
-
-	today := config.TodayIST().Format("2006-01-02")
-	count := 0
-
-	for token, symbol := range universe {
-		bars, err := dc.fetchDailyRange(token, today, today)
-		if err != nil || len(bars) == 0 {
-			time.Sleep(340 * time.Millisecond)
-			continue
-		}
-
-		// Only accept today's bar — never write a stale bar under today's date
-		var todayBar *dailyBar
-		for _, b := range bars {
-			if b.Date == today {
-				clone := b
-				todayBar = &clone
-				break
-			}
-		}
-		if todayBar == nil {
-			time.Sleep(340 * time.Millisecond)
-			continue
-		}
-
-		appendBarsToDB(db, token, []dailyBar{*todayBar})
-		count++
-
-		// Refresh in-memory cache entry with the updated full history
-		allBars, readErr := readBarsFromDB(db, token, 1825*2)
-		if readErr == nil && len(allBars) >= 25 {
-			dc.buildEntryFromBars(token, symbol, allBars)
-		}
-
-		time.Sleep(340 * time.Millisecond)
-	}
-
-	log.Printf("[DailyCache] ✅ EOD Sync complete — %d bars written to historical.db", count)
-}

@@ -203,13 +203,38 @@ func main() {
 	dailyCache.Preload(preloadUniverse)
 	scanner.DailyCache = dailyCache.ToScannerCache()
 
-	// Wire RefreshCache so bot manual scans always use latest data
+	// getKiteLTP fetches fresh LTP from Kite Quote API — used by both the bot and EOD scan.
+	// Falls back to tick store when WS is live (market hours), Kite Quote API otherwise.
+	var kiteQuoteCache map[uint32]float64
+	var kiteQuoteMu sync.Mutex
+	getKiteLTP := func(token uint32) float64 {
+		// During market hours prefer the live WebSocket tick (zero-latency)
+		if ltp := tickStore.GetLTPIfFresh(token); ltp > 0 {
+			return ltp
+		}
+		// Otherwise use the most recently fetched Kite Quote batch
+		kiteQuoteMu.Lock()
+		ltp := kiteQuoteCache[token]
+		kiteQuoteMu.Unlock()
+		return ltp
+	}
+	refreshKiteQuotes := func() {
+		tokens := dataAgent.GetAllTokens()
+		quotes := dataAgent.FetchKiteQuotes(tokens)
+		kiteQuoteMu.Lock()
+		kiteQuoteCache = quotes
+		kiteQuoteMu.Unlock()
+	}
+
+	// Wire RefreshCache: reload historical bars + fetch fresh LTP from Kite Quote API
 	scanner.RefreshCache = func() {
-		log.Println("[Bot] Refreshing cache before manual scan...")
+		log.Println("[Bot] Refreshing cache + Kite quotes before scan...")
 		dailyCache.Preload(preloadUniverse)
 		scanner.DailyCache = dailyCache.ToScannerCache()
-		log.Println("[Bot] Cache refreshed ✅")
+		refreshKiteQuotes()
+		log.Println("[Bot] Cache + quotes refreshed ✅")
 	}
+	scanner.GetLTP = getKiteLTP
 
 	// ══════════════════════════════════════════════════════════════
 	//  Research Automation (Sections II-IV of Blueprint)
@@ -361,6 +386,7 @@ func main() {
 				dailyCache.Preload(dataAgent.Universe)
 				freshCache := dailyCache.ToScannerCache()
 				scanner.DailyCache = freshCache
+				refreshKiteQuotes()
 
 				// SELL — stocks that crossed below EMA10 (open positions only)
 				signalAgent.RunEODSellAlerts(scanner.Universe)
@@ -370,7 +396,7 @@ func main() {
 					LoadUniverse:    dataAgent.LoadEODScanUniverse,
 					PreloadCache:    dailyCache.Preload,
 					GetScannerCache: func() *agents.DailyCache { return dailyCache.ToScannerCache() },
-					GetLiveLTP:      func(token uint32) float64 { return tickStore.GetLTPIfFresh(token) },
+					GetLiveLTP:      getKiteLTP,
 					GetLiveVolume:   func(token uint32) int64 { return tickStore.GetVolume(token) },
 				}, scanner)
 
@@ -384,7 +410,6 @@ func main() {
 			}
 		}
 
-		dailyCache.SyncEODToHistoricalDB(dataAgent.Universe)
 		agents.SendTelegram("🌙 *ENGINE SLEEPING* — Next alerts tomorrow at 16:00.")
 		sleepUntilMorning()
 		log.Printf("[Engine] ═══ WAKING UP — %s ═══", config.NowIST().Format("2006-01-02 15:04"))

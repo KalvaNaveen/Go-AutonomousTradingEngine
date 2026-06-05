@@ -1,7 +1,6 @@
 package agents
 
 import (
-	"database/sql"
 	"encoding/csv"
 	"encoding/json"
 	"fmt"
@@ -14,8 +13,6 @@ import (
 	"time"
 
 	"bnf_go_engine/config"
-
-	_ "modernc.org/sqlite"
 )
 
 // DataAgent manages the universe of tradeable symbols.
@@ -362,6 +359,72 @@ func (d *DataAgent) fetchInstruments() ([]map[string]interface{}, error) {
 	return results, nil
 }
 
+// FetchKiteQuotes fetches live LTP for all tokens from the Kite Quote API.
+// Batches 500 tokens per request (Kite limit). Returns token → LTP.
+// When passing integer tokens, Kite keys the response by token string (e.g. "738561").
+func (d *DataAgent) FetchKiteQuotes(tokens []uint32) map[uint32]float64 {
+	result := make(map[uint32]float64, len(tokens))
+	const batchSize = 500
+
+	for i := 0; i < len(tokens); i += batchSize {
+		end := i + batchSize
+		if end > len(tokens) {
+			end = len(tokens)
+		}
+		batch := tokens[i:end]
+
+		// Build query string: ?i=TOKEN1&i=TOKEN2...
+		queryStr := ""
+		for _, tok := range batch {
+			queryStr += fmt.Sprintf("&i=%d", tok)
+		}
+		queryStr = "?" + queryStr[1:]
+
+		req, err := http.NewRequest("GET", "https://api.kite.trade/quote"+queryStr, nil)
+		if err != nil {
+			continue
+		}
+		req.Header.Set("X-Kite-Version", "3")
+		req.Header.Set("Authorization", fmt.Sprintf("token %s:%s", d.apiKey, d.accessToken))
+
+		client := &http.Client{Timeout: 10 * time.Second}
+		resp, err := client.Do(req)
+		if err != nil {
+			log.Printf("[DataAgent] Quote batch %d failed: %v", i/batchSize+1, err)
+			continue
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+
+		// Kite returns data keyed by token string when queried by integer token
+		var payload struct {
+			Status string                     `json:"status"`
+			Data   map[string]json.RawMessage `json:"data"`
+		}
+		if err := json.Unmarshal(body, &payload); err != nil || payload.Status != "success" {
+			log.Printf("[DataAgent] Quote parse failed (status=%s): %v", payload.Status, err)
+			continue
+		}
+
+		for keyStr, raw := range payload.Data {
+			var q struct {
+				LastPrice float64 `json:"last_price"`
+			}
+			if err := json.Unmarshal(raw, &q); err != nil || q.LastPrice <= 0 {
+				continue
+			}
+			var tok uint32
+			fmt.Sscanf(keyStr, "%d", &tok)
+			if tok > 0 {
+				result[tok] = q.LastPrice
+			}
+		}
+	}
+
+	log.Printf("[DataAgent] FetchKiteQuotes: %d/%d tokens quoted", len(result), len(tokens))
+	return result
+}
+
 // GetAllTokens returns all universe tokens plus benchmark index tokens for WebSocket subscription.
 func (d *DataAgent) GetAllTokens() []uint32 {
 	var tokens []uint32
@@ -380,138 +443,3 @@ func (d *DataAgent) GetAllTokens() []uint32 {
 	return tokens
 }
 
-// ── Historical EOD Synchronization ────────────────────────────────
-
-type KiteCandle struct {
-	Timestamp string
-	Open      float64
-	High      float64
-	Low       float64
-	Close     float64
-	Volume    int64
-}
-
-// fetchKiteHistorical fetches daily or minute bars from the Kite API
-func (d *DataAgent) fetchKiteHistorical(token uint32, interval, from, to string) ([]KiteCandle, error) {
-	url := fmt.Sprintf("https://api.kite.trade/instruments/historical/%d/%s?from=%s+09:15:00&to=%s+15:30:00", token, interval, from, to)
-	req, _ := http.NewRequest("GET", url, nil)
-	req.Header.Set("X-Kite-Version", "3")
-	req.Header.Set("Authorization", fmt.Sprintf("token %s:%s", d.apiKey, d.accessToken))
-
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("Kite API returned HTTP %d", resp.StatusCode)
-	}
-
-	body, _ := io.ReadAll(resp.Body)
-
-	var r struct {
-		Status string `json:"status"`
-		Data   struct {
-			Candles [][]interface{} `json:"candles"`
-		} `json:"data"`
-	}
-	if err := json.Unmarshal(body, &r); err != nil {
-		return nil, err
-	}
-	if r.Status != "success" {
-		return nil, fmt.Errorf("Kite API error payload")
-	}
-
-	var res []KiteCandle
-	for _, raw := range r.Data.Candles {
-		if len(raw) >= 6 {
-			ts, _ := raw[0].(string)
-			o, _ := raw[1].(float64)
-			h, _ := raw[2].(float64)
-			l, _ := raw[3].(float64)
-			c, _ := raw[4].(float64)
-			v, _ := raw[5].(float64)
-			res = append(res, KiteCandle{Timestamp: ts, Open: o, High: h, Low: l, Close: c, Volume: int64(v)})
-		}
-	}
-	return res, nil
-}
-
-// SyncHistoricalEODData fetches daily and minute bars for all tracked tokens for the last 3 days
-// and inserts/appends them into historical.db. 
-func (d *DataAgent) SyncHistoricalEODData(dbPath string) error {
-	return d.SyncHistoricalCustom(dbPath, 3)
-}
-
-// SyncHistoricalCustom allows fetching a custom number of lookback days to backfill historical missing data
-func (d *DataAgent) SyncHistoricalCustom(dbPath string, lookbackDays int) error {
-	log.Printf("[DataAgent] ═══ STARTING EOD DATA SYNC (%d days) ═══", lookbackDays)
-	SendTelegram(fmt.Sprintf("⏳ *EOD SYNC STARTED*: Downloading intraday data (%d days) to `historical.db`.", lookbackDays))
-
-	db, err := sql.Open("sqlite", dbPath+"?_journal_mode=WAL&_busy_timeout=30000")
-	if err != nil {
-		return err
-	}
-	defer db.Close()
-
-	now := config.NowIST()
-	fromDate := now.AddDate(0, 0, -lookbackDays).Format("2006-01-02")
-	toDate := now.Format("2006-01-02")
-
-	tokens := d.GetAllTokens()
-	log.Printf("[DataAgent] Syncing historical data for %d tokens (%s to %s)", len(tokens), fromDate, toDate)
-
-	countDay := 0
-	countMin := 0
-
-	for i, token := range tokens {
-		// 1. Fetch Day Candles
-		dayCandles, err := d.fetchKiteHistorical(token, "day", fromDate, toDate)
-		if err == nil {
-			for _, c := range dayCandles {
-				// Convert 2026-04-18T00:00:00+0530 -> "2026-04-18"
-				dateStr := ""
-				if len(c.Timestamp) >= 10 {
-					dateStr = c.Timestamp[:10]
-				}
-				if dateStr != "" {
-					_, _ = db.Exec(`INSERT OR REPLACE INTO daily_data (token, date, open, high, low, close, volume) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-						token, dateStr, c.Open, c.High, c.Low, c.Close, c.Volume)
-					countDay++
-				}
-			}
-		}
-
-		// 2. Fetch Minute Candles
-		minCandles, err := d.fetchKiteHistorical(token, "minute", fromDate, toDate)
-		if err == nil {
-			for _, c := range minCandles {
-				// Convert 2026-04-17T15:20:00+0530 -> "2026-04-17 15:20:00"
-				ts := ""
-				if len(c.Timestamp) >= 19 {
-					ts = strings.Replace(c.Timestamp[:19], "T", " ", 1)
-				}
-				if ts != "" {
-					// Use INSERT OR IGNORE rather than REPLACE because volume might have been accumulated differently live vs historical API
-					_, _ = db.Exec(`INSERT OR IGNORE INTO minute_data (token, date_time, open, high, low, close, volume) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-						token, ts, c.Open, c.High, c.Low, c.Close, c.Volume)
-					countMin++
-				}
-			}
-		}
-
-		// Kite Rate Limit: 3 requests per second. We do 2 per token.
-		// Sleep 800ms to stay extremely safe under the 3 req/sec limit.
-		time.Sleep(800 * time.Millisecond)
-
-		if (i+1)%50 == 0 {
-			log.Printf("[DataAgent] Synced %d/%d tokens...", i+1, len(tokens))
-		}
-	}
-
-	log.Printf("[DataAgent] ═══ EOD SYNC COMPLETE: %d Daily, %d Minute candles ═══", countDay, countMin)
-	SendTelegram(fmt.Sprintf("✅ *EOD SYNC COMPLETE*: Inserted %d Min bounds and %d Daily bounds.", countMin, countDay))
-	return nil
-}
