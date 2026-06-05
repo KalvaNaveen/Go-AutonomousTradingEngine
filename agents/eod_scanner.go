@@ -28,6 +28,7 @@ type EODScanResult struct {
 	Symbol    string
 	Company   string
 	Signal    string  // "BUY" or "SELL"
+	Score     int     // raw signal score — higher = more criteria met
 	LTP       float64
 	MarketCap float64 // from Screener.in cache (Cr), 0 if unavailable
 	EMA21     float64
@@ -102,15 +103,16 @@ func RunEODMarketScan(deps EODScanDeps, scanner *ScannerAgent) {
 		}
 	}
 
-	// Step 4: Sort results — BUY first (by RS desc), then SELL (by RS asc)
+	// Step 4: Sort — BUY first, then by score desc, then RS desc
 	sort.Slice(results, func(i, j int) bool {
-		if results[i].Signal != results[j].Signal {
-			return results[i].Signal == "BUY" // BUY comes first
+		ri, rj := results[i], results[j]
+		if ri.Signal != rj.Signal {
+			return ri.Signal == "BUY" // BUY section before SELL
 		}
-		if results[i].Signal == "BUY" {
-			return results[i].RSScore > results[j].RSScore // Higher RS first for BUY
+		if ri.Score != rj.Score {
+			return ri.Score > rj.Score // higher conviction first
 		}
-		return results[i].RSScore < results[j].RSScore // Lower RS first for SELL
+		return ri.RSScore > rj.RSScore // tie-break by relative strength
 	})
 
 	buyCount := 0
@@ -301,7 +303,7 @@ func analyzeStock(
 	}
 
 	// ── Classification ──
-	signal := classifyStock(ltp, ema21Val, ema63Val, sma200Val, volume, avgVolume,
+	signal, score := classifyStock(ltp, ema21Val, ema63Val, sma200Val, volume, avgVolume,
 		rsScore, high52w, low52w, closes, pattern)
 
 	if signal == "" {
@@ -312,7 +314,8 @@ func analyzeStock(
 		Symbol:    symbol,
 		Company:   company,
 		Signal:    signal,
-		LTP:       math.Round(ltp*100) / 100,
+		Score:     score,
+		LTP:       ltp,
 		MarketCap: marketCap,
 		EMA21:     math.Round(ema21Val*100) / 100,
 		EMA63:     math.Round(ema63Val*100) / 100,
@@ -327,14 +330,14 @@ func analyzeStock(
 	}
 }
 
-// classifyStock determines BUY, SELL, or "" (neutral) based on technical indicators.
+// classifyStock determines BUY, SELL, or "" (neutral) and returns the raw score.
 func classifyStock(
 	ltp, ema21, ema63, sma200, volume, avgVolume float64,
 	rsScore int,
 	high52w, low52w float64,
 	closes []float64,
 	pattern string,
-) string {
+) (string, int) {
 	buyScore := 0
 	sellScore := 0
 
@@ -421,12 +424,12 @@ func classifyStock(
 	// ── Decision ──
 	// Require a minimum score to classify (avoid noise)
 	if buyScore >= 4 && buyScore > sellScore {
-		return "BUY"
+		return "BUY", buyScore
 	}
 	if sellScore >= 4 && sellScore > buyScore {
-		return "SELL"
+		return "SELL", sellScore
 	}
-	return "" // NEUTRAL — not a strong signal
+	return "", 0 // NEUTRAL — not a strong signal
 }
 
 // detectPatternForEOD checks for known patterns without generating trade signals.
@@ -495,7 +498,7 @@ func generateEODCSV(results []EODScanResult) (string, error) {
 
 	// Header
 	header := []string{
-		"Signal", "Symbol", "Company", "LTP", "MarketCap(Cr)",
+		"Signal", "Score", "Symbol", "Company", "LTP", "MarketCap(Cr)",
 		"EMA21", "EMA63", "SMA200", "Volume", "AvgVolume",
 		"RS Score", "Pattern", "ATR", "52W High", "52W Low",
 	}
@@ -505,9 +508,10 @@ func generateEODCSV(results []EODScanResult) (string, error) {
 	for _, r := range results {
 		row := []string{
 			r.Signal,
+			fmt.Sprintf("%d", r.Score),
 			r.Symbol,
 			r.Company,
-			fmt.Sprintf("%.2f", r.LTP),
+			fmt.Sprintf("%g", r.LTP),
 			fmt.Sprintf("%.0f", r.MarketCap),
 			fmt.Sprintf("%.2f", r.EMA21),
 			fmt.Sprintf("%.2f", r.EMA63),
