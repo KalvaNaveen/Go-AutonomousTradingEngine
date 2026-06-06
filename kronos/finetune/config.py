@@ -30,11 +30,11 @@ class Config:
     predictor_save_folder_name   = "nse_predictor_base"
 
     # ── Training hyperparams ──────────────────────────────────────────────
+    # CPU-tuned: small batch, capped steps per epoch, fewer epochs
     seed                  = 42
-    epochs                = 20
-    batch_size            = 32
-    n_train_iter          = 50_000
-    n_val_iter            = 10_000
+    epochs                = 3
+    batch_size            = 4
+    max_steps_per_epoch   = 500   # cap so each epoch runs in ~20-30 min on CPU
     tokenizer_learning_rate = 2e-4
     predictor_learning_rate = 4e-5
     accumulation_steps    = 1
@@ -42,7 +42,7 @@ class Config:
     adam_beta1            = 0.9
     adam_beta2            = 0.95
     adam_weight_decay     = 0.1
-    log_interval          = 100
+    log_interval          = 50
 
     # ── Inference ────────────────────────────────────────────────────────
     inference_T            = 0.6

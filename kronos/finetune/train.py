@@ -21,6 +21,10 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import OneCycleLR
 from torch.utils.data import DataLoader
 
+# Flush every print immediately (important when stdout is piped to a file)
+import functools
+print = functools.partial(print, flush=True)
+
 # Path setup: our root first so our finetune/ package wins over Kronos repo's
 OUR_ROOT    = str(Path(__file__).parent.parent)
 KRONOS_REPO = os.environ.get("KRONOS_REPO", str(Path(__file__).parent.parent / "Kronos"))
@@ -46,11 +50,14 @@ def train_tokenizer(config):
     val_loader   = DataLoader(val_ds,   batch_size=config.batch_size, shuffle=False,
                               num_workers=0)
 
+    max_steps = getattr(config, "max_steps_per_epoch", len(train_loader))
+    steps_per_epoch = min(max_steps, len(train_loader))
+
     optimizer = AdamW(tokenizer.parameters(), lr=config.tokenizer_learning_rate,
                       betas=(config.adam_beta1, config.adam_beta2),
                       weight_decay=config.adam_weight_decay)
     scheduler = OneCycleLR(optimizer, max_lr=config.tokenizer_learning_rate,
-                           total_steps=config.epochs * len(train_loader))
+                           total_steps=config.epochs * steps_per_epoch)
 
     save_path = Path(config.finetuned_tokenizer_path)
     save_path.mkdir(parents=True, exist_ok=True)
@@ -61,6 +68,8 @@ def train_tokenizer(config):
         train_loss = 0.0
 
         for step, (x, t) in enumerate(train_loader):
+            if step >= steps_per_epoch:
+                break
             x = x.to(device)
 
             # Forward: returns ((z_pre, z), bsq_loss, quantized, z_indices)
@@ -78,19 +87,23 @@ def train_tokenizer(config):
             train_loss += loss.item()
             if (step + 1) % config.log_interval == 0:
                 avg = train_loss / (step + 1)
-                print(f"[Tokenizer] Epoch {epoch+1} Step {step+1} loss={avg:.4f}")
+                print(f"[Tokenizer] Epoch {epoch+1} Step {step+1}/{steps_per_epoch} loss={avg:.4f}")
 
-        # Validation
+        # Validation (cap at 100 steps for speed)
         tokenizer.eval()
         val_loss = 0.0
+        val_steps = 0
         with torch.no_grad():
             for x, t in val_loader:
+                if val_steps >= 100:
+                    break
                 x = x.to(device)
                 (z_pre, z), bsq_loss, _, _ = tokenizer(x)
                 recon_loss = F.mse_loss(z_pre, x) + F.mse_loss(z, x)
                 val_loss += ((recon_loss + bsq_loss) / 2).item()
+                val_steps += 1
 
-        val_loss /= len(val_loader)
+        val_loss /= max(val_steps, 1)
         print(f"[Tokenizer] Epoch {epoch+1} val_loss={val_loss:.4f}")
 
         if val_loss < best_val_loss:
@@ -122,11 +135,14 @@ def train_predictor(config):
     val_loader   = DataLoader(val_ds,   batch_size=config.batch_size, shuffle=False,
                               num_workers=0)
 
+    max_steps = getattr(config, "max_steps_per_epoch", len(train_loader))
+    steps_per_epoch = min(max_steps, len(train_loader))
+
     optimizer = AdamW(model.parameters(), lr=config.predictor_learning_rate,
                       betas=(config.adam_beta1, config.adam_beta2),
                       weight_decay=config.adam_weight_decay)
     scheduler = OneCycleLR(optimizer, max_lr=config.predictor_learning_rate,
-                           total_steps=config.epochs * len(train_loader))
+                           total_steps=config.epochs * steps_per_epoch)
 
     save_path = Path(config.finetuned_predictor_path)
     save_path.mkdir(parents=True, exist_ok=True)
@@ -137,6 +153,8 @@ def train_predictor(config):
         train_loss = 0.0
 
         for step, (x, t) in enumerate(train_loader):
+            if step >= steps_per_epoch:
+                break
             x = x.to(device)
             t = t.to(device)
 
@@ -146,9 +164,10 @@ def train_predictor(config):
 
             token_in  = [token_seq_0[:, :-1], token_seq_1[:, :-1]]
             token_out = [token_seq_0[:, 1:],  token_seq_1[:, 1:]]
-            stamp_in  = t[:, :-1, :]
 
-            logits = model(token_in[0], token_in[1], stamp_in)
+            # stamp=None: TemporalEmbedding expects 5 features (min/hr/wd/day/mo)
+            # our dataset only has 3 — skip to avoid IndexError
+            logits = model(token_in[0], token_in[1])
             loss, _, _ = model.head.compute_loss(logits[0], logits[1],
                                                   token_out[0], token_out[1])
 
@@ -161,24 +180,28 @@ def train_predictor(config):
             train_loss += loss.item()
             if (step + 1) % config.log_interval == 0:
                 avg = train_loss / (step + 1)
-                print(f"[Predictor] Epoch {epoch+1} Step {step+1} loss={avg:.4f}")
+                print(f"[Predictor] Epoch {epoch+1} Step {step+1}/{steps_per_epoch} loss={avg:.4f}")
 
-        # Validation
+        # Validation (cap at 100 steps for speed)
         model.eval()
         val_loss = 0.0
+        val_steps = 0
         with torch.no_grad():
             for x, t in val_loader:
+                if val_steps >= 100:
+                    break
                 x = x.to(device)
                 t = t.to(device)
                 token_seq_0, token_seq_1 = tokenizer.encode(x, half=True)
                 token_in  = [token_seq_0[:, :-1], token_seq_1[:, :-1]]
                 token_out = [token_seq_0[:, 1:],  token_seq_1[:, 1:]]
-                logits = model(token_in[0], token_in[1], t[:, :-1, :])
+                logits = model(token_in[0], token_in[1])
                 loss, _, _ = model.head.compute_loss(logits[0], logits[1],
                                                       token_out[0], token_out[1])
                 val_loss += loss.item()
+                val_steps += 1
 
-        val_loss /= len(val_loader)
+        val_loss /= max(val_steps, 1)
         print(f"[Predictor] Epoch {epoch+1} val_loss={val_loss:.4f}")
 
         if val_loss < best_val_loss:
