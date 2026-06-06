@@ -249,6 +249,10 @@ func main() {
 		kronosURL = "http://localhost:8765"
 	}
 	kronosClient := agents.NewKronosClient(kronosURL)
+	// EnsureKronosRunning: if the service is offline, locate start_kronos.ps1
+	// relative to the exe, launch it as a detached background process, and
+	// optionally register it in Windows Task Scheduler (needs Admin once).
+	kronosClient.EnsureKronosRunning()
 	if kronosClient.IsAlive() {
 		log.Println("[Engine] Kronos service online ✅ — AI ranking enabled")
 		agents.SendTelegram("🤖 *Kronos AI ranker online* — signals will include predicted 5-day upside")
