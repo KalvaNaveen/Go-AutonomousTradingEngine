@@ -218,6 +218,13 @@ func main() {
 		kiteQuoteMu.Unlock()
 		return ltp
 	}
+	// getLTPSource returns "live" when a fresh WebSocket tick exists, "quote" otherwise.
+	getLTPSource := func(token uint32) string {
+		if ltp := tickStore.GetLTPIfFresh(token); ltp > 0 {
+			return "live"
+		}
+		return "quote"
+	}
 	refreshKiteQuotes := func() {
 		tokens := dataAgent.GetAllTokens()
 		quotes := dataAgent.FetchKiteQuotes(tokens)
@@ -411,8 +418,10 @@ func main() {
 					PreloadCache:    dailyCache.Preload,
 					GetScannerCache: func() *agents.DailyCache { return dailyCache.ToScannerCache() },
 					GetLiveLTP:      getKiteLTP,
+					GetLTPSource:    getLTPSource,
 					GetLiveVolume:   func(token uint32) int64 { return tickStore.GetVolume(token) },
 					Kronos:          kronosClient,
+					SignalAgent:     signalAgent,
 				}, scanner)
 
 				alertsDone = true
@@ -427,7 +436,66 @@ func main() {
 
 		agents.SendTelegram("🌙 *ENGINE SLEEPING* — Next alerts tomorrow at 16:00.")
 		sleepUntilMorning()
-		log.Printf("[Engine] ═══ WAKING UP — %s ═══", config.NowIST().Format("2006-01-02 15:04"))
+		now := config.NowIST()
+		log.Printf("[Engine] ═══ WAKING UP — %s ═══", now.Format("2006-01-02 15:04"))
+
+		// ── Daily Kite token refresh ──────────────────────────────────────
+		// Kite access tokens expire every day at midnight IST.
+		// Re-validate and auto-login before the trading day starts.
+		tokenOK := false
+		if config.KiteAccessToken != "" {
+			client := &http.Client{Timeout: 10 * time.Second}
+			req, _ := http.NewRequest("GET", "https://api.kite.trade/user/profile", nil)
+			req.Header.Set("X-Kite-Version", "3")
+			req.Header.Set("Authorization", fmt.Sprintf("token %s:%s", config.KiteAPIKey, config.KiteAccessToken))
+			if resp, err := client.Do(req); err == nil {
+				tokenOK = resp.StatusCode == 200
+				resp.Body.Close()
+			}
+		}
+		if !tokenOK {
+			log.Println("[Engine] Kite token expired — running AutoLogin...")
+			agents.SendTelegram("🔑 *Kite token expired* — auto-refreshing...")
+			if config.ZerodhaUserID != "" && config.ZerodhaTOTPSecret != "" {
+				login := core.NewAutoLogin()
+				if login.Run() {
+					log.Println("[Engine] AutoLogin SUCCESS — token refreshed")
+					agents.SendTelegram("✅ *Kite token refreshed* — engine ready for trading day")
+					if ws != nil {
+						ws.UpdateToken(config.KiteAccessToken)
+					}
+				} else {
+					log.Println("[Engine] AutoLogin FAILED — manual token entry required")
+					agents.SendTelegram("🚨 *Kite AutoLogin FAILED*\nPlease update `KITE_ACCESS_TOKEN` in `.env` and restart the engine.")
+				}
+			} else {
+				agents.SendTelegram("🚨 *Kite token expired* — TOTP not configured. Please update `KITE_ACCESS_TOKEN` in `.env` and restart.")
+			}
+		} else {
+			log.Println("[Engine] Kite token valid ✅")
+		}
+
+		// Heartbeat — confirms engine is alive every morning
+		kronosStatus := "offline"
+		if kronosClient != nil && kronosClient.IsAlive() {
+			kronosStatus = "online"
+		}
+		tokenStatus := "✅ valid"
+		if !tokenOK {
+			tokenStatus = "⚠️ refreshed"
+		}
+		agents.SendTelegram(fmt.Sprintf(
+			"☀️ *ZENITH ENGINE — Good Morning*\n"+
+				"Date: `%s`\n"+
+				"Universe: `%d stocks`\n"+
+				"Kite token: `%s`\n"+
+				"Kronos AI: `%s`\n"+
+				"EOD scan scheduled at *16:00 IST*",
+			now.Format("Mon, 02 Jan 2006"),
+			len(scanner.Universe),
+			tokenStatus,
+			kronosStatus,
+		))
 	}
 }
 
@@ -457,43 +525,52 @@ func waitForNetwork() {
 	}
 }
 
-// NSE holidays loaded at startup from research.FetchNSEHolidays(), refreshed daily at 06:00.
+// NSE holidays — YYYY-MM-DD keys, loaded from NSE API and refreshed daily at 06:00.
 var (
-	nseHolidaysMu   sync.RWMutex
-	nseHolidaysMMDD = map[string]string{}
+	nseHolidaysMu  sync.RWMutex
+	nseHolidaysMap = map[string]string{} // YYYY-MM-DD → description
 )
 
-var nseHolidays2026Fallback = map[string]bool{
+// Static fallback covering 2026 + 2027 (used when NSE API is unreachable).
+var nseHolidaysFallback = map[string]bool{
+	// 2026
 	"2026-01-26": true, "2026-02-17": true, "2026-03-10": true,
 	"2026-03-30": true, "2026-04-02": true, "2026-04-03": true,
-	"2026-04-14": true, "2026-05-01": true, "2026-06-06": true,
-	"2026-07-06": true, "2026-08-15": true, "2026-08-18": true,
-	"2026-09-04": true, "2026-10-02": true, "2026-10-20": true,
-	"2026-10-21": true, "2026-11-09": true, "2026-11-10": true,
-	"2026-11-24": true, "2026-12-25": true,
+	"2026-04-14": true, "2026-05-01": true, "2026-07-06": true,
+	"2026-08-15": true, "2026-08-18": true, "2026-09-04": true,
+	"2026-10-02": true, "2026-10-20": true, "2026-10-21": true,
+	"2026-11-09": true, "2026-11-10": true, "2026-11-24": true,
+	"2026-12-25": true,
+	// 2027 — approximate; API fetch will override these
+	"2027-01-26": true, "2027-03-29": true, "2027-04-02": true,
+	"2027-04-14": true, "2027-05-01": true, "2027-08-15": true,
+	"2027-10-02": true, "2027-10-19": true, "2027-11-12": true,
+	"2027-12-25": true,
 }
 
 func refreshNSEHolidays() {
-	fetched := research.FetchNSEHolidays()
+	fetched := research.FetchNSEHolidays() // now returns YYYY-MM-DD keys
 	if len(fetched) == 0 {
 		log.Printf("[Engine] NSE holiday fetch returned empty — keeping existing/fallback list")
 		return
 	}
 	nseHolidaysMu.Lock()
-	nseHolidaysMMDD = fetched
+	// Merge into map (keeps prior-year data across year-end)
+	for k, v := range fetched {
+		nseHolidaysMap[k] = v
+	}
 	nseHolidaysMu.Unlock()
+	log.Printf("[Engine] NSE holidays refreshed: %d entries", len(fetched))
 }
 
 func isNSEHoliday(t time.Time) bool {
-	mmdd := fmt.Sprintf("%02d-%02d", t.Month(), t.Day())
+	dateStr := t.Format("2006-01-02")
 	nseHolidaysMu.RLock()
-	_, fromAPI := nseHolidaysMMDD[mmdd]
+	_, fromAPI := nseHolidaysMap[dateStr]
 	nseHolidaysMu.RUnlock()
 	if fromAPI {
 		return true
 	}
-	// Fallback to hardcoded list if live fetch hasn't populated yet.
-	dateStr := t.Format("2006-01-02")
-	return nseHolidays2026Fallback[dateStr]
+	return nseHolidaysFallback[dateStr]
 }
 

@@ -83,10 +83,10 @@ func FetchNSEHolidays() map[string]string {
 	}
 
 	for _, h := range data.CM {
-		// Parse "02-Jan-2026" format
+		// Parse "02-Jan-2026" format → store as YYYY-MM-DD for unambiguous lookup
 		t, err := time.Parse("02-Jan-2006", h.TradingDate)
 		if err == nil {
-			key := fmt.Sprintf("%02d-%02d", t.Month(), t.Day())
+			key := t.Format("2006-01-02")
 			holidays[key] = h.Description
 		}
 	}

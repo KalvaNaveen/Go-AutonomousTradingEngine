@@ -32,6 +32,7 @@ type EODScanResult struct {
 	Score        int     // raw signal score — higher = more criteria met
 	KronosUpside float64 // Kronos predicted 5-day upside % (0 if service offline)
 	LTP          float64
+	LTPSource    string  // "live" (WebSocket tick) | "quote" (Kite Quote API) | "close" (prev daily close)
 	MarketCap    float64 // from Screener.in cache (Cr), 0 if unavailable
 	EMA21        float64
 	EMA63        float64
@@ -43,6 +44,10 @@ type EODScanResult struct {
 	ATR          float64
 	High52W      float64
 	Low52W       float64
+	// ATR-based risk management (populated for BUY signals)
+	SLPrice  float64 // stop-loss = LTP - 1.5 × ATR
+	SLPct    float64 // stop-loss as % of LTP
+	QtyRisk  int     // suggested qty: risk ₹5000 / (1.5 × ATR), minimum 1
 }
 
 // EODScanDeps bundles the dependencies the EOD scanner needs.
@@ -56,10 +61,15 @@ type EODScanDeps struct {
 	GetScannerCache func() *DailyCache
 	// GetLiveLTP returns the latest tick-store LTP for a token (0 if stale).
 	GetLiveLTP func(token uint32) float64
+	// GetLTPSource returns "live" (WebSocket tick) or "quote" (Kite Quote API batch).
+	GetLTPSource func(token uint32) string
 	// GetLiveVolume returns the live cumulative day volume for a token.
 	GetLiveVolume func(token uint32) int64
 	// Kronos is optional — when non-nil, BUY signals are re-ranked by predicted upside.
 	Kronos *KronosClient
+	// SignalAgent is optional — when non-nil, BUY signals are de-duplicated (3-day
+	// cooldown) and persisted to the signals DB so SELL alerts can reference them.
+	SignalAgent *SignalAlertAgent
 }
 
 // RunEODMarketScan is the top-level function called from main.go at 16:00.
@@ -134,6 +144,32 @@ func RunEODMarketScan(deps EODScanDeps, scanner *ScannerAgent) {
 		results = append(buys, sells...)
 	}
 
+	// Step 4c: Signal deduplication — 3-day cooldown.
+	// Suppress BUY alerts for stocks that already have an open position or were
+	// exited within the last 3 calendar days. The full result list (including
+	// suppressed stocks) still goes into the CSV so nothing is hidden from the analyst.
+	// Suppressed stocks are tagged Signal="BUY_SKIP" in memory only (not in CSV).
+	if deps.SignalAgent != nil {
+		var newBuys, others []EODScanResult
+		skipped := 0
+		for _, r := range results {
+			if r.Signal == "BUY" && deps.SignalAgent.IsOnCooldown(r.Symbol) {
+				skipped++
+				log.Printf("[EODScan] Cooldown skip: %s (open/recent position)", r.Symbol)
+				// Keep in results with original signal for CSV — just don't persist/alert
+				others = append(others, r)
+			} else if r.Signal == "BUY" {
+				newBuys = append(newBuys, r)
+			} else {
+				others = append(others, r)
+			}
+		}
+		results = append(newBuys, others...)
+		if skipped > 0 {
+			log.Printf("[EODScan] Dedup: %d BUY signals suppressed (cooldown)", skipped)
+		}
+	}
+
 	buyCount := 0
 	sellCount := 0
 	for _, r := range results {
@@ -183,6 +219,20 @@ func RunEODMarketScan(deps EODScanDeps, scanner *ScannerAgent) {
 	}
 	SendTelegram(summary)
 
+	// Step 7b: Persist new BUY signals to DB for dedup / SELL tracking
+	if deps.SignalAgent != nil {
+		saved := 0
+		for _, r := range results {
+			if r.Signal == "BUY" && r.Pattern != "" {
+				deps.SignalAgent.RecordBuySignal(r)
+				saved++
+			}
+		}
+		if saved > 0 {
+			log.Printf("[EODScan] Persisted %d new BUY signals to DB", saved)
+		}
+	}
+
 	// Step 8: Send CSV via Telegram
 	caption := fmt.Sprintf("📊 EOD Scan — %s | %d BUY | %d SELL",
 		config.NowIST().Format("02 Jan 2006"), buyCount, sellCount)
@@ -223,10 +273,16 @@ func analyzeStock(
 
 	// LTP: prefer live tick data, fall back to last daily close
 	ltp := lastClose
+	ltpSource := "close"
 	if deps.GetLiveLTP != nil {
 		liveLTP := deps.GetLiveLTP(token)
 		if liveLTP > 0 {
 			ltp = liveLTP
+			if deps.GetLTPSource != nil {
+				ltpSource = deps.GetLTPSource(token)
+			} else {
+				ltpSource = "quote"
+			}
 		}
 	}
 
@@ -329,6 +385,25 @@ func analyzeStock(
 		return nil // NEUTRAL — not interesting enough
 	}
 
+	// ATR-based risk management for BUY signals
+	slPrice := 0.0
+	slPct := 0.0
+	qtyRisk := 0
+	if signal == "BUY" && atr > 0 {
+		slPrice = math.Round((ltp-1.5*atr)*100) / 100
+		if ltp > 0 {
+			slPct = math.Round((ltp-slPrice)/ltp*10000) / 100 // 2dp %
+		}
+		riskPerShare := ltp - slPrice
+		if riskPerShare > 0 {
+			qty := int(5000 / riskPerShare)
+			if qty < 1 {
+				qty = 1
+			}
+			qtyRisk = qty
+		}
+	}
+
 	return &EODScanResult{
 		Symbol:    symbol,
 		Company:   company,
@@ -336,6 +411,7 @@ func analyzeStock(
 		Signal:    signal,
 		Score:     score,
 		LTP:       ltp,
+		LTPSource: ltpSource,
 		MarketCap: marketCap,
 		EMA21:     math.Round(ema21Val*100) / 100,
 		EMA63:     math.Round(ema63Val*100) / 100,
@@ -347,6 +423,9 @@ func analyzeStock(
 		ATR:       atr,
 		High52W:   high52w,
 		Low52W:    math.Round(low52w*100) / 100,
+		SLPrice:   slPrice,
+		SLPct:     slPct,
+		QtyRisk:   qtyRisk,
 	}
 }
 
@@ -502,7 +581,8 @@ func loadMarketCapFromCache(symbol string) float64 {
 // ══════════════════════════════════════════════════════════════
 
 func generateEODCSV(results []EODScanResult) (string, error) {
-	dateStr := config.NowIST().Format("2006-01-02")
+	now := config.NowIST()
+	dateStr := now.Format("2006-01-02_1504") // e.g. 2026-06-06_1600 — unique per scan
 	csvDir := filepath.Join(config.BaseDir, "data")
 	os.MkdirAll(csvDir, 0755)
 	csvPath := filepath.Join(csvDir, fmt.Sprintf("eod_scan_%s.csv", dateStr))
@@ -518,20 +598,30 @@ func generateEODCSV(results []EODScanResult) (string, error) {
 
 	// Header
 	header := []string{
-		"Signal", "Score", "Symbol", "Company", "LTP", "MarketCap(Cr)",
+		"Signal", "Score", "Symbol", "Company", "LTP", "LTP Source", "MarketCap(Cr)",
 		"EMA21", "EMA63", "SMA200", "Volume", "AvgVolume",
-		"RS Score", "Pattern", "ATR", "52W High", "52W Low",
+		"RS Score", "Pattern", "ATR", "SL Price", "SL%", "Qty(₹5k risk)",
+		"52W High", "52W Low",
 	}
 	writer.Write(header)
 
 	// Data rows
 	for _, r := range results {
+		slStr := ""
+		slPctStr := ""
+		qtyStr := ""
+		if r.SLPrice > 0 {
+			slStr = fmt.Sprintf("%.2f", r.SLPrice)
+			slPctStr = fmt.Sprintf("%.2f%%", r.SLPct)
+			qtyStr = fmt.Sprintf("%d", r.QtyRisk)
+		}
 		row := []string{
 			r.Signal,
 			fmt.Sprintf("%d", r.Score),
 			r.Symbol,
 			r.Company,
 			fmt.Sprintf("%g", r.LTP),
+			r.LTPSource,
 			fmt.Sprintf("%.0f", r.MarketCap),
 			fmt.Sprintf("%.2f", r.EMA21),
 			fmt.Sprintf("%.2f", r.EMA63),
@@ -541,6 +631,9 @@ func generateEODCSV(results []EODScanResult) (string, error) {
 			fmt.Sprintf("%d", r.RSScore),
 			r.Pattern,
 			fmt.Sprintf("%.2f", r.ATR),
+			slStr,
+			slPctStr,
+			qtyStr,
 			fmt.Sprintf("%.2f", r.High52W),
 			fmt.Sprintf("%.2f", r.Low52W),
 		}
@@ -718,9 +811,17 @@ func buildEODSummary(results []EODScanResult, scanned, buyCount, sellCount int, 
 				}
 			}
 			kronosTag := KronosUpsideTag(r.KronosUpside)
-			msg += fmt.Sprintf("*%d. %s* %s | RS `%d`\n   ₹`%.0f`%s%s%s\n\n",
+			slTag := ""
+			if r.SLPrice > 0 {
+				slTag = fmt.Sprintf(" | SL ₹`%.0f` (`%.1f%%`)", r.SLPrice, r.SLPct)
+			}
+			qtyTag := ""
+			if r.QtyRisk > 0 {
+				qtyTag = fmt.Sprintf(" | Qty `%d`", r.QtyRisk)
+			}
+			msg += fmt.Sprintf("*%d. %s* %s | RS `%d`\n   ₹`%.0f`%s%s%s%s%s\n\n",
 				i+1, r.Symbol, rsTag, r.RSScore,
-				r.LTP, volTag, nearHighTag, kronosTag)
+				r.LTP, volTag, nearHighTag, kronosTag, slTag, qtyTag)
 		}
 		if len(buys) > 15 {
 			msg += fmt.Sprintf("_... +%d more in CSV_\n", len(buys)-15)
