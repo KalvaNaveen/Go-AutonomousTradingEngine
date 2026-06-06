@@ -24,9 +24,15 @@ import pandas as pd
 import requests
 from tqdm import tqdm
 
-BASE_URL    = "https://api.kite.trade"
-NSE_CSV_URL = "https://archives.nseindia.com/content/indices/ind_nifty500list.csv"
-DATA_DIR    = Path(__file__).parent / "data"
+BASE_URL = "https://api.kite.trade"
+# Nifty Total Market = Nifty 500 + Nifty MicroCap 250 (~750 stocks).
+# Same URL used by the Go scanner (config.NiftyTotalMarketCSVURL).
+# Fallback: Nifty 500 only if Total Market fetch fails.
+NSE_INDEX_URLS = [
+    "https://nsearchives.nseindia.com/content/indices/ind_niftytotalmarket_list.csv",
+    "https://archives.nseindia.com/content/indices/ind_nifty500list.csv",  # fallback
+]
+DATA_DIR = Path(__file__).parent / "data"
 DATA_DIR.mkdir(exist_ok=True)
 
 TRAIN_END = "2023-12-31"
@@ -103,18 +109,28 @@ def fetch_ohlcv(token, from_date, to_date, api_key, access_token, retries=3):
 # ── NSE universe loader ────────────────────────────────────────────────────
 
 def load_nse_universe():
-    try:
-        resp = requests.get(NSE_CSV_URL, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
-        lines = resp.text.strip().splitlines()
-        reader = csv.DictReader(lines)
-        return {row["Symbol"].strip() for row in reader if row.get("Symbol")}
-    except Exception as e:
-        print(f"Warning: NSE CSV fetch failed ({e}), falling back to instruments.csv")
-        csv_path = DATA_DIR / "instruments.csv"
-        if csv_path.exists():
-            df = pd.read_csv(csv_path)
-            return set(df["symbol"].tolist())
-        return set()
+    """Load Nifty Total Market (~750 stocks). Falls back to Nifty 500 if needed."""
+    for url in NSE_INDEX_URLS:
+        try:
+            resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
+            resp.raise_for_status()
+            lines = resp.text.strip().splitlines()
+            reader = csv.DictReader(lines)
+            # Total Market CSV uses "Symbol"; Nifty 500 CSV also uses "Symbol"
+            symbols = {row["Symbol"].strip() for row in reader if row.get("Symbol")}
+            if symbols:
+                print(f"  {len(symbols)} symbols from {url.split('/')[-1]}")
+                return symbols
+        except Exception as e:
+            print(f"  Warning: {url.split('/')[-1]} failed ({e}), trying next...")
+
+    # Last resort: use existing instruments.csv
+    print("Warning: all NSE CSV fetches failed — falling back to instruments.csv")
+    csv_path = DATA_DIR / "instruments.csv"
+    if csv_path.exists():
+        df = pd.read_csv(csv_path)
+        return set(df["symbol"].tolist())
+    return set()
 
 # ── Main ───────────────────────────────────────────────────────────────────
 

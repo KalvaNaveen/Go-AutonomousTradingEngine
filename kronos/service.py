@@ -115,12 +115,12 @@ def _predict_one(df: pd.DataFrame) -> float:
     if len(df) < LOOKBACK:
         return float(df["close"].iloc[-1])  # not enough history — return current
 
-    x_df = df[["open", "high", "low", "close", "vol", "amt"]].iloc[-LOOKBACK:]
-    x_ts = df["date"].iloc[-LOOKBACK:]
+    x_df = df[["open", "high", "low", "close", "vol", "amt"]].iloc[-LOOKBACK:].reset_index(drop=True)
 
-    # Generate future timestamps (approximate trading day offsets)
+    # KronosPredictor.predict() requires pd.Series for timestamps (not DatetimeIndex).
     last_date = df["date"].iloc[-1]
-    y_ts = pd.date_range(start=last_date, periods=PRED_LEN + 1, freq="B")[1:]
+    x_ts = pd.Series(pd.date_range(end=last_date, periods=LOOKBACK, freq="B"))
+    y_ts = pd.Series(pd.date_range(start=last_date, periods=PRED_LEN + 1, freq="B")[1:])
 
     pred_df = predictor.predict(
         df=x_df,
