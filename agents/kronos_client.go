@@ -24,7 +24,10 @@ type KronosClient struct {
 func NewKronosClient(baseURL string) *KronosClient {
 	k := &KronosClient{
 		BaseURL:     baseURL,
-		HTTPClient:  &http.Client{Timeout: 60 * time.Second},
+		// 60s was too short — CPU inference takes ~12s/stock with 5 sample
+		// paths, and a capped batch of 30 can take ~6 minutes worst case.
+		// 12 minutes gives headroom without hanging forever if the service wedges.
+		HTTPClient:  &http.Client{Timeout: 12 * time.Minute},
 		trainedSyms: loadKronosTrainedSymbols(),
 	}
 	if len(k.trainedSyms) > 0 {
@@ -137,6 +140,16 @@ func (k *KronosClient) IsAlive() bool {
 	return resp.StatusCode == 200
 }
 
+// kronosMaxBatchSize caps how many signals get sent to Kronos for ranking
+// per scan. On CPU, each prediction (5 sample paths) takes ~12s — ranking
+// the full BUY list (often 100-190 stocks) would take 20-40 minutes and blow
+// past the HTTP client timeout, silently falling back to "no AI ranking"
+// (which is what was happening — see the "no Kronos identity" report).
+// Only the top ~15 setups are ever shown in the summary anyway, so ranking
+// more than this is wasted compute. The overflow is appended after the
+// ranked subset, in original (Score/RS) order — nothing is hidden.
+const kronosMaxBatchSize = 30
+
 // ── RankSignals ────────────────────────────────────────────────────────────
 // Takes EOD BUY results with their DailyCache closes and returns them
 // re-ranked by Kronos predicted 5-day upside. Returns original order
@@ -160,6 +173,19 @@ func (k *KronosClient) RankSignals(results []EODScanResult, cache *DailyCache) [
 		log.Printf("[Kronos] Gating: %d trained symbols sent to Kronos, %d untrained appended after",
 			len(trained), len(untrained))
 	}
+
+	// Cap the batch — incoming `trained` is already sorted by Score/RS desc
+	// (callers sort BUY results before invoking RankSignals), so truncating
+	// keeps the highest-quality candidates and pushes the rest after,
+	// unranked but still visible.
+	if len(trained) > kronosMaxBatchSize {
+		overflow := trained[kronosMaxBatchSize:]
+		trained = trained[:kronosMaxBatchSize]
+		untrained = append(overflow, untrained...)
+		log.Printf("[Kronos] Batch cap: ranking top %d of %d trained signals (CPU latency guard); %d appended after",
+			kronosMaxBatchSize, kronosMaxBatchSize+len(overflow), len(overflow))
+	}
+
 	if len(trained) == 0 {
 		return results // nothing to rank
 	}
