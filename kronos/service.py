@@ -135,6 +135,19 @@ def _predict_one(df: pd.DataFrame) -> float:
 
 # ── Endpoints ──────────────────────────────────────────────────────────────
 
+@app.get("/")
+def root():
+    """Friendly landing page — avoids a confusing bare 404 at the service root."""
+    return {
+        "service": "Kronos Signal Ranker",
+        "status": "ok" if predictor is not None else "model not loaded",
+        "endpoints": {
+            "GET /health": "liveness + model status check",
+            "POST /predict_batch": "rank BUY signals by predicted 5-day upside",
+        },
+        "docs": "/docs",
+    }
+
 @app.get("/health")
 def health():
     return {
