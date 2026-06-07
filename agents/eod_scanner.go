@@ -9,11 +9,20 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"bnf_go_engine/config"
 	"bnf_go_engine/data"
 )
+
+// eodScanInFlight guards against overlapping runs of RunEODMarketScan —
+// whether triggered by the 16:00 scheduler or an on-demand "scan" from
+// Telegram. Both paths now call the SAME function and mutate shared state
+// (scanner.DailyCache is swapped mid-run for Bird's Eye View), so two
+// concurrent runs would race and could double-send CSVs/alerts and hammer
+// the Kite API. 0 = idle, 1 = running.
+var eodScanInFlight int32
 
 // ══════════════════════════════════════════════════════════════
 //  EOD Market Scanner — Daily Nifty 750 Technical Scan
@@ -76,6 +85,17 @@ type EODScanDeps struct {
 // It loads the Nifty 750 universe, fetches/uses daily cache, runs analysis,
 // generates a CSV, and sends the report via Telegram.
 func RunEODMarketScan(deps EODScanDeps, scanner *ScannerAgent) {
+	// Re-entrancy guard: refuse to start a second run while one is already
+	// in flight (e.g. someone texts "scan" twice, or a manual scan overlaps
+	// with the 16:00 scheduled run). Both paths share scanner.DailyCache and
+	// would otherwise race.
+	if !atomic.CompareAndSwapInt32(&eodScanInFlight, 0, 1) {
+		log.Println("[EODScan] Scan already in progress — ignoring duplicate trigger")
+		SendTelegram("⏳ *Scan already running* — please wait for it to finish before requesting another.")
+		return
+	}
+	defer atomic.StoreInt32(&eodScanInFlight, 0)
+
 	startTime := time.Now()
 	log.Println("[EODScan] ═══ STARTING EOD MARKET SCAN ═══")
 	SendTelegram("🔍 *EOD MARKET SCAN STARTED*\nScanning Nifty Total Market (~750 stocks)...")
