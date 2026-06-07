@@ -85,6 +85,12 @@ type ScannerAgent struct {
 	// by predicted 5-day upside after the rule-based scan completes.
 	Kronos *KronosClient
 
+	// EODDeps — fully wired dependencies for RunEODMarketScan. Set once at
+	// startup (main.go) so that BOTH the 16:00 auto EOD scan AND an on-demand
+	// "scan" command from Telegram run the EXACT SAME pipeline: full Nifty 750
+	// universe, Kronos ranking, cooldown dedup, persistence, CSV export.
+	EODDeps EODScanDeps
+
 
 	// State
 	ConsecutiveSLs      int

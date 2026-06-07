@@ -261,6 +261,20 @@ func main() {
 	}
 	scanner.Kronos = kronosClient
 
+	// Wire the SAME EODScanDeps used by the 16:00 auto scan so that an
+	// on-demand "scan" from Telegram runs the IDENTICAL pipeline (full
+	// Nifty 750 universe, Kronos ranking, cooldown dedup, persistence, CSV).
+	scanner.EODDeps = agents.EODScanDeps{
+		LoadUniverse:    dataAgent.LoadEODScanUniverse,
+		PreloadCache:    dailyCache.Preload,
+		GetScannerCache: func() *agents.DailyCache { return dailyCache.ToScannerCache() },
+		GetLiveLTP:      getKiteLTP,
+		GetLTPSource:    getLTPSource,
+		GetLiveVolume:   func(token uint32) int64 { return tickStore.GetVolume(token) },
+		Kronos:          kronosClient,
+		SignalAgent:     signalAgent,
+	}
+
 	// ══════════════════════════════════════════════════════════════
 	//  Research Automation (Sections II-IV of Blueprint)
 	// ══════════════════════════════════════════════════════════════

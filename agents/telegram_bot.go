@@ -26,8 +26,6 @@ import (
 	"log"
 	"net/http"
 	"net/url"
-	"sort"
-	"strconv"
 	"strings"
 	"time"
 
@@ -171,55 +169,6 @@ func handleBotMessage(chatID, text string, scanner *ScannerAgent, signalAgent *S
 	}
 }
 
-// parseRSThreshold extracts an RS threshold from a message.
-// Supports: "scan 85", "scan 90+", "rs=85", "rs85", "rs 90"
-// Falls back to config.MinRSScore (default 80) if nothing found.
-func parseRSThreshold(text string) int {
-	text = strings.ToLower(text)
-
-	// Try "rs=85" or "rs=90"
-	if idx := strings.Index(text, "rs="); idx >= 0 {
-		rest := strings.TrimLeft(text[idx+3:], " ")
-		num := extractLeadingInt(rest)
-		if num >= 50 && num <= 99 {
-			return num
-		}
-	}
-
-	// Try "rs 85" or "rs85"
-	if idx := strings.Index(text, "rs"); idx >= 0 {
-		rest := strings.TrimLeft(text[idx+2:], " ")
-		num := extractLeadingInt(rest)
-		if num >= 50 && num <= 99 {
-			return num
-		}
-	}
-
-	// Try bare number: "scan 85" or "scan 90+"
-	// Look for any 2-digit number in range 50–99 in the message
-	words := strings.Fields(text)
-	for _, w := range words {
-		w = strings.TrimRight(w, "+%")
-		if n, err := strconv.Atoi(w); err == nil && n >= 50 && n <= 99 {
-			return n
-		}
-	}
-
-	return config.MinRSScore // default
-}
-
-// extractLeadingInt reads a leading integer from a string (stops at non-digit).
-func extractLeadingInt(s string) int {
-	end := 0
-	for end < len(s) && s[end] >= '0' && s[end] <= '9' {
-		end++
-	}
-	if end == 0 {
-		return 0
-	}
-	n, _ := strconv.Atoi(s[:end])
-	return n
-}
 
 // containsAnyWord returns true if `text` contains any of the given words.
 func containsAnyWord(text string, words ...string) bool {
@@ -233,18 +182,22 @@ func containsAnyWord(text string, words ...string) bool {
 
 // ── Full EOD-style scan ───────────────────────────────────────────────────────
 
-// handleFullScan runs the complete scan pipeline on demand:
-//  1. 📊 EOD Summary: top BUY picks (score-based + EMA pullback pattern)
-//  2. 🚀 MOMO Leaders + 🔥 Trigger Candles (EODBookScans)
-//  3. 🦅 Bird's Eye View market health report
+// handleFullScan triggers the on-demand scan. It now runs the EXACT SAME
+// pipeline as the 16:00 auto EOD scan (RunEODMarketScan) — same ~750-stock
+// Nifty Total Market universe, same Kronos AI ranking, same 3-day cooldown
+// dedup + persistence, same CSV export. No parallel/lighter implementation.
+//
+// The only difference from the scheduled run: this one can be triggered any
+// time by texting "scan" (or "signals", "setups", etc.) to the bot.
 func handleFullScan(chatID, msgText string, scanner *ScannerAgent, signalAgent *SignalAlertAgent) {
 	if scanner == nil || scanner.DailyCache == nil || !scanner.DailyCache.Loaded {
 		replyToChat(chatID, "⚠️ Cache not loaded yet — try again in a moment.")
 		return
 	}
-
-	// Parse RS threshold from message — supports: "scan 85", "scan 90+", "rs=85", "rs85"
-	rsMin := parseRSThreshold(msgText)
+	if scanner.EODDeps.LoadUniverse == nil {
+		replyToChat(chatID, "⚠️ Scan pipeline not wired yet — try again in a moment.")
+		return
+	}
 
 	now := config.NowIST()
 	hhmm := now.Hour()*100 + now.Minute()
@@ -256,97 +209,16 @@ func handleFullScan(chatID, msgText string, scanner *ScannerAgent, signalAgent *
 	}
 
 	replyToChat(chatID, fmt.Sprintf(
-		"🔍 *Scanning* — %s\n%s | RS≥%d | %d stocks",
-		config.NowIST().Format("02 Jan 2006 15:04 IST"),
-		dataTag, rsMin, len(scanner.Universe)))
+		"🔍 *Manual scan triggered* — %s\n%s | Nifty Total Market (~750 stocks)\n"+
+			"_Running the full EOD pipeline: AI ranking, dedup, CSV..._",
+		config.NowIST().Format("02 Jan 2006 15:04 IST"), dataTag))
 
-	// Outside market hours: refresh cache so we always have the latest EOD candles
-	// (same as what the auto EOD scan does before running)
-	if !marketOpen && scanner.RefreshCache != nil {
-		scanner.RefreshCache()
-	}
+	log.Printf("[Bot] Manual scan requested (chat=%s) — running RunEODMarketScan (same as 16:00 auto scan)", chatID)
 
-	start := time.Now()
-	cache := scanner.DailyCache
-
-	// Wire live LTP from the WebSocket if available (market hours 9:15-15:30).
-	// Outside market hours GetLTP returns 0 and analyzeStock falls back to cache.
-	liveDeps := EODScanDeps{
-		GetLiveLTP: scanner.GetLTP, // nil-safe: returns 0 when WS disconnected
-	}
-
-	// Detect if we have live data (at least one stock has a fresh tick)
-	hasLive := false
-	if scanner.GetLTP != nil {
-		for token := range scanner.Universe {
-			if ltp := scanner.GetLTP(token); ltp > 0 {
-				hasLive = true
-				break
-			}
-		}
-	}
-	dataSource := "historical data (market closed)"
-	if hasLive {
-		dataSource = "live Kite WebSocket data ✅"
-	}
-	log.Printf("[Bot] Scan data source: %s", dataSource)
-
-	// ── 1. Score-based classifier scan ───────────────────────────────────────
-	// Uses live LTP during market hours, cached close otherwise.
-	log.Println("[Bot] Running score-based market scan...")
-	var results []EODScanResult
-	scanned := 0
-	for token, symbol := range scanner.Universe {
-		scanned++
-		r := analyzeStock(token, symbol, symbol, cache, liveDeps, scanner)
-		if r != nil {
-			results = append(results, *r)
-		}
-	}
-
-	// Best of best: EMA pullback confirmed (Pattern != "") + RS >= rsMin
-	var buyResults []EODScanResult
-	for _, r := range results {
-		if r.Signal == "BUY" && r.Pattern != "" && r.RSScore >= rsMin {
-			buyResults = append(buyResults, r)
-		}
-	}
-	sort.Slice(buyResults, func(i, j int) bool {
-		if buyResults[i].Score != buyResults[j].Score {
-			return buyResults[i].Score > buyResults[j].Score
-		}
-		return buyResults[i].RSScore > buyResults[j].RSScore
-	})
-
-	// Kronos re-ranking — re-order by predicted 5d upside if service online
-	if scanner.Kronos != nil && scanner.Kronos.IsAlive() {
-		log.Printf("[Bot] Kronos re-ranking %d BUY signals...", len(buyResults))
-		buyResults = scanner.Kronos.RankSignals(buyResults, cache)
-	}
-
-	results = buyResults
-	buyCount := len(results)
-	sellCount := 0
-
-	elapsed := time.Since(start)
-
-	// Build and send the EOD summary (top BUY + momentum) — same format as EOD
-	summary := buildEODSummary(results, scanned, buyCount, sellCount, elapsed)
-
-	// ── 2. MOMO Leaders + Trigger Candles (EODBookScans) ─────────────────────
-	bookScans := EODBookScans(cache, scanner.Universe, scanner.GetLTP, nil)
-	if bookScans != "" {
-		summary += bookScans
-	}
-
-	SendTelegram(summary)
-
-	// ── 3. Bird's Eye View ────────────────────────────────────────────────────
-	log.Println("[Bot] Running Bird's Eye View...")
-	scanner.RunBirdsEyeView()
-
-	log.Printf("[Bot] Full scan complete: %d stocks, %d BUY setups, %.1fs",
-		scanned, buyCount, elapsed.Seconds())
+	// Run the IDENTICAL pipeline used by the scheduled 16:00 EOD scan.
+	// This guarantees feature parity by construction — there's no second
+	// implementation to drift out of sync.
+	RunEODMarketScan(scanner.EODDeps, scanner)
 }
 
 // ── Status command ────────────────────────────────────────────────────────────
