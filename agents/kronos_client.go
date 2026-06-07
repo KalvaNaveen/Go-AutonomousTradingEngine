@@ -47,9 +47,17 @@ func loadKronosTrainedSymbols() map[string]bool {
 		)
 	}
 	if cwd, err := os.Getwd(); err == nil {
-		candidates = append(candidates,
-			filepath.Join(cwd, "kronos", "data", "instruments.csv"),
-		)
+		dir := cwd
+		for i := 0; i < 4; i++ {
+			candidates = append(candidates,
+				filepath.Join(dir, "kronos", "data", "instruments.csv"),
+			)
+			parent := filepath.Dir(dir)
+			if parent == dir {
+				break
+			}
+			dir = parent
+		}
 	}
 
 	for _, p := range candidates {
