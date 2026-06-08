@@ -47,7 +47,6 @@ type EODScanResult struct {
 	EMA50        float64 // extension/structure reference (book Ch.3 p.49-52)
 	Volume       float64 // today's volume (from tick store or daily cache)
 	AvgVolume    float64 // 20-day average
-	RSScore      int     // Relative Strength percentile (1-99)
 	Pattern      string  // detected pattern name, or ""
 	ATR          float64
 	High52W      float64
@@ -134,7 +133,10 @@ func RunEODMarketScan(deps EODScanDeps, scanner *ScannerAgent) {
 		}
 	}
 
-	// Step 4: Sort — BUY first, then by score desc, then RS desc
+	// Step 4: Sort — BUY first, then by score desc, then by volume strength
+	// (today's volume vs its own 20-day average — the book's own conviction
+	// signal, Ch.11 p.272 "trigger candle" idea: a bigger volume surge = a
+	// stronger, more credible move). No RS — pure EMA + Volume per the book.
 	sort.Slice(results, func(i, j int) bool {
 		ri, rj := results[i], results[j]
 		if ri.Signal != rj.Signal {
@@ -143,7 +145,14 @@ func RunEODMarketScan(deps EODScanDeps, scanner *ScannerAgent) {
 		if ri.Score != rj.Score {
 			return ri.Score > rj.Score
 		}
-		return ri.RSScore > rj.RSScore
+		viRatio, vjRatio := 0.0, 0.0
+		if ri.AvgVolume > 0 {
+			viRatio = ri.Volume / ri.AvgVolume
+		}
+		if rj.AvgVolume > 0 {
+			vjRatio = rj.Volume / rj.AvgVolume
+		}
+		return viRatio > vjRatio
 	})
 
 	// Step 4c: Signal deduplication — 3-day cooldown.
@@ -336,12 +345,6 @@ func analyzeStock(
 		atr = a
 	}
 
-	// RS Score
-	rsScore := 50
-	if rs, ok := cache.RSScore[token]; ok {
-		rsScore = rs
-	}
-
 	// 52-week High/Low
 	high52w := 0.0
 	low52w := 0.0
@@ -375,7 +378,7 @@ func analyzeStock(
 
 	// ── Classification ──
 	signal, score := classifyStock(ltp, ema10Val, ema20Val, ema50Val, volume, avgVolume,
-		rsScore, high52w, low52w, closes, pattern)
+		high52w, low52w, closes, pattern)
 
 	if signal == "" {
 		return nil // NEUTRAL — not interesting enough
@@ -414,7 +417,6 @@ func analyzeStock(
 		EMA50:     math.Round(ema50Val*100) / 100,
 		Volume:    volume,
 		AvgVolume: math.Round(avgVolume),
-		RSScore:   rsScore,
 		Pattern:   pattern,
 		ATR:       atr,
 		High52W:   high52w,
@@ -428,7 +430,6 @@ func analyzeStock(
 // classifyStock determines BUY, SELL, or "" (neutral) and returns the raw score.
 func classifyStock(
 	ltp, ema10, ema20, ema50, volume, avgVolume float64,
-	rsScore int,
 	high52w, low52w float64,
 	closes []float64,
 	pattern string,
@@ -446,8 +447,10 @@ func classifyStock(
 	if ema10 > 0 && ema20 > 0 && ema10 > ema20 {
 		buyScore++
 	}
-	// 3. Strong RS Score (≥ MinRSScore, default 80 = top 20%)
-	if rsScore >= config.MinRSScore {
+	// 3. Volume above its 50-day average — book's own scan-box rule (Ch.11 p.267:
+	// "50 Day Average Volume > 10000"); a stronger surge (≥1.5×) shows real
+	// participation behind the move, pure volume-conviction per the book.
+	if avgVolume > 0 && volume >= avgVolume*1.5 {
 		buyScore++
 	}
 	// 4. Near all-time/52-week high (within 5%)
@@ -492,8 +495,9 @@ func classifyStock(
 	if ema10 > 0 && ema20 > 0 && ema10 < ema20 {
 		sellScore++
 	}
-	// 3. Weak RS Score (bottom 30%)
-	if rsScore <= 30 {
+	// 3. Volume well below its 50-day average — fading participation, the
+	// inverse of the book's volume-conviction rule (Ch.11 p.267).
+	if avgVolume > 0 && volume <= avgVolume*0.5 {
 		sellScore++
 	}
 	// 4. Near 52-week low (within 10%)
@@ -604,7 +608,7 @@ func generateEODCSV(results []EODScanResult) (string, error) {
 	header := []string{
 		"Signal", "Score", "Symbol", "Company", "LTP", "LTP Source", "MarketCap(Cr)",
 		"EMA10", "EMA20", "EMA50", "Volume", "AvgVolume",
-		"RS Score", "Pattern", "ATR", "SL Price", "SL%", "Qty(₹5k risk)",
+		"Pattern", "ATR", "SL Price", "SL%", "Qty(₹5k risk)",
 		"52W High", "52W Low",
 	}
 	writer.Write(header)
@@ -632,7 +636,6 @@ func generateEODCSV(results []EODScanResult) (string, error) {
 			fmt.Sprintf("%.2f", r.EMA50),
 			fmt.Sprintf("%.0f", r.Volume),
 			fmt.Sprintf("%.0f", r.AvgVolume),
-			fmt.Sprintf("%d", r.RSScore),
 			r.Pattern,
 			fmt.Sprintf("%.2f", r.ATR),
 			slStr,
@@ -758,58 +761,70 @@ func EODBookScans(cache *DailyCache, universe map[uint32]string, getLTP func(uin
 }
 
 // buildEODSummary builds the Telegram EOD report — one unified section:
-// Top 15 high-momentum BUY setups ranked by RS score (EMA pullback + quality filters).
+// confirmed BUY setups ranked purely by EMA + Volume (book Ch.3 & Ch.11),
+// no Relative Strength involved anywhere — the engine follows ONLY what
+// "Swing Trading Simplified" by Ankur Patel teaches.
 func buildEODSummary(results []EODScanResult, scanned int, elapsed time.Duration) string {
 	dateStr := config.NowIST().Format("02 Jan 2006")
 
-	// Best of best: EMA pullback confirmed + RS >= MinRSScore
-	// r.Pattern != "" means EMAStrategy.Detect fired — pure-EMA rules from the
-	// book ("Swing Trading Simplified" by Ankur Patel, Ch.3): uptrend (EMA10 >
-	// EMA20, both rising), pullback to EMA support on light volume, and a green
-	// bounce candle closing back above EMA10. No MACD or other indicators.
+	// Confirmed setup = EMA pullback fired (r.Pattern != "" means
+	// EMAStrategy.Detect's pure-EMA rules matched, Ch.3): uptrend (EMA10 >
+	// EMA20, both rising), pullback to EMA support on light volume, and a
+	// green bounce candle closing back above EMA10. No RS, no MACD — pure EMA.
 	var buys []EODScanResult
 	for _, r := range results {
-		if r.Signal == "BUY" && r.Pattern != "" && r.RSScore >= config.MinRSScore {
+		if r.Signal == "BUY" && r.Pattern != "" {
 			buys = append(buys, r)
 		}
 	}
 
-	// Order: "market leaders first" — rank purely by RS percentile (who the
-	// market is rewarding most right now). Pure-EMA setups are equally valid
-	// once confirmed; RS is the single ranking signal.
+	// Order: rank by volume strength (today's volume ÷ 50-day average) — the
+	// book's own conviction signal (Ch.11 p.267 scan box; p.272 trigger candle:
+	// bigger surge = stronger, more credible move). Ties broken by raw Score.
 	sort.Slice(buys, func(i, j int) bool {
-		return buys[i].RSScore > buys[j].RSScore
+		vi, vj := 0.0, 0.0
+		if buys[i].AvgVolume > 0 {
+			vi = buys[i].Volume / buys[i].AvgVolume
+		}
+		if buys[j].AvgVolume > 0 {
+			vj = buys[j].Volume / buys[j].AvgVolume
+		}
+		if vi != vj {
+			return vi > vj
+		}
+		return buys[i].Score > buys[j].Score
 	})
 
 	msg := fmt.Sprintf("📊 *SWING WATCHLIST — %s*\n", dateStr)
 	msg += "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-	msg += fmt.Sprintf("🔎 `%d` stocks | 🎯 `%d` confirmed setups (RS≥%d) | ⏱ `%.0fs`\n", scanned, len(buys), config.MinRSScore, elapsed.Seconds())
+	msg += fmt.Sprintf("🔎 `%d` stocks | 🎯 `%d` confirmed EMA pullback setups | ⏱ `%.0fs`\n", scanned, len(buys), elapsed.Seconds())
 	msg += "━━━━━━━━━━━━━━━━━━━━━━━━\n"
 
 	if len(buys) == 0 {
-		msg += fmt.Sprintf("\n❌ No confirmed EMA pullback setups with RS≥%d today.\n", config.MinRSScore)
+		msg += "\n❌ No confirmed EMA pullback setups today.\n"
 	} else {
 		limit := 20
 		if len(buys) < limit {
 			limit = len(buys)
 		}
 		msg += fmt.Sprintf("\n🎯 *MARKET LEADERS — TOP %d*\n", limit)
-		msg += "_EMA Pullback ✅ (Ch.3 — Ankur Patel) + RS≥80 ✅, ranked by RS_\n\n"
+		msg += "_EMA Pullback ✅ (Ch.3 — Ankur Patel), ranked by Volume strength_\n\n"
 		for i := 0; i < limit; i++ {
 			r := buys[i]
-			rsTag := eodRSEmoji(r.RSScore)
-			// Volume vs average
+			// Volume vs average — the book's conviction tag
 			volTag := ""
+			volEmoji := ""
 			if r.AvgVolume > 0 {
 				vr := r.Volume / r.AvgVolume
 				switch {
-				case vr >= 2.0:
-					volTag = fmt.Sprintf(" | Vol: 🔥`%.1fx`", vr)
-				case vr >= 1.3:
-					volTag = fmt.Sprintf(" | Vol: ⚡`%.1fx`", vr)
-				default:
-					volTag = fmt.Sprintf(" | Vol: `%.1fx`", vr)
+				case vr >= 3.0:
+					volEmoji = "🔥"
+				case vr >= 1.5:
+					volEmoji = "⚡"
+				case vr >= 1.0:
+					volEmoji = "✅"
 				}
+				volTag = fmt.Sprintf(" | Vol: %s`%.1fx`", volEmoji, vr)
 			}
 			// Distance from 52W high
 			nearHighTag := ""
@@ -829,8 +844,8 @@ func buildEODSummary(results []EODScanResult, scanned int, elapsed time.Duration
 			if r.QtyRisk > 0 {
 				qtyTag = fmt.Sprintf(" | Qty `%d`", r.QtyRisk)
 			}
-			msg += fmt.Sprintf("*%d. %s* %s | RS `%d`\n   ₹`%.0f`%s%s%s%s\n\n",
-				i+1, r.Symbol, rsTag, r.RSScore,
+			msg += fmt.Sprintf("*%d. %s* | Score `%d`\n   ₹`%.0f`%s%s%s%s\n\n",
+				i+1, r.Symbol, r.Score,
 				r.LTP, volTag, nearHighTag, slTag, qtyTag)
 		}
 		if len(buys) > limit {
@@ -841,20 +856,6 @@ func buildEODSummary(results []EODScanResult, scanned int, elapsed time.Duration
 	msg += "\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
 	msg += "📎 _Full CSV attached below_"
 	return msg
-}
-
-// eodRSEmoji returns fire/star emoji based on RS tier.
-func eodRSEmoji(rs int) string {
-	switch {
-	case rs >= 95:
-		return "🔥"
-	case rs >= 80:
-		return "⭐"
-	case rs >= 60:
-		return "✅"
-	default:
-		return ""
-	}
 }
 
 // ══════════════════════════════════════════════════════════════

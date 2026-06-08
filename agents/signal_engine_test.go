@@ -774,9 +774,9 @@ func TestClassifyStock_BuyOnEMA10AboveEMA20Alignment(t *testing.T) {
 		closes[i] = 100.0 + float64(i)*0.5
 	}
 	// Strong uptrend alignment: price above EMA10, EMA10 above EMA20, near 52w high,
-	// good RS, healthy volume, pattern present, not overextended past EMA50.
+	// healthy volume surge, pattern present, not overextended past EMA50.
 	signal, score := classifyStock(130, 128, 120, 110, 2_000_000, 1_000_000,
-		90, 132, 90, closes, "VCP")
+		132, 90, closes, "VCP")
 	if signal != "BUY" {
 		t.Errorf("expected BUY for EMA10>EMA20 aligned uptrend, got %q (score=%d)", signal, score)
 	}
@@ -787,10 +787,10 @@ func TestClassifyStock_BuyOnEMA10AboveEMA20Alignment(t *testing.T) {
 
 func TestClassifyStock_SellOnEMA10BelowEMA20Breakdown(t *testing.T) {
 	closes := []float64{120, 118, 116, 114, 112, 110, 108, 106, 104, 102}
-	// Breakdown: price below EMA10, EMA10 below EMA20, weak RS, near 52w low,
+	// Breakdown: price below EMA10, EMA10 below EMA20, near 52w low,
 	// declining volume, two red candles below EMA10, overextended below EMA50.
 	signal, score := classifyStock(100, 105, 112, 130, 400_000, 1_000_000,
-		15, 140, 95, closes, "")
+		140, 95, closes, "")
 	if signal != "SELL" {
 		t.Errorf("expected SELL for EMA10<EMA20 breakdown, got %q (score=%d)", signal, score)
 	}
@@ -801,10 +801,10 @@ func TestClassifyStock_SellOnEMA10BelowEMA20Breakdown(t *testing.T) {
 
 func TestClassifyStock_NeutralWhenMixedSignals(t *testing.T) {
 	closes := []float64{100, 101, 100, 101, 100, 101, 100, 101, 100, 101}
-	// Mixed: price hovering near both EMAs, mid RS, average volume, no pattern —
+	// Mixed: price hovering near both EMAs, average volume, no pattern —
 	// should not produce a confident classification either way.
 	signal, _ := classifyStock(100, 100, 100, 100, 1_000_000, 1_000_000,
-		50, 105, 95, closes, "")
+		105, 95, closes, "")
 	if signal != "" {
 		t.Errorf("expected neutral (\"\") for mixed/weak signals, got %q", signal)
 	}

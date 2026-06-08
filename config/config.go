@@ -349,11 +349,10 @@ const (
 // EMA scan criterion: "CMP > Number 30" (p.267). Filters out penny/micro stocks.
 var MinStockPrice = envFloat("MIN_STOCK_PRICE", 30.0)
 
-// ── Relative Strength minimum threshold ──────────────────────────────────────
-// Only stocks with RS Score >= this value appear in BUY signals and EOD summary.
-// William O'Neil: "Only buy RS 80+". Minervini: "RS 90+".
-// Set MIN_RS_SCORE in .env to override. Default: 80.
-var MinRSScore = int(envFloat("MIN_RS_SCORE", 80))
+// NOTE: Relative Strength (RS) scoring was removed — it does not appear
+// anywhere in "Swing Trading Simplified" by Ankur Patel. The engine now
+// follows ONLY the book's own scan/selection criteria: EMA10/20 trend +
+// pullback + Volume (Ch.3 & Ch.11).
 
 // (RS-percentile rank, India VIX guards, and per-sector cap removed — none appear
 //  in the book. RS is expressed via the Monthly Gainers scan; VIX is never mentioned;

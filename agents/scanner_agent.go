@@ -50,7 +50,6 @@ type DailyCache struct {
 	TurnoverCr   map[uint32]float64
 	PivotSupport map[uint32]float64
 	High52W      map[uint32]float64
-	RSScore      map[uint32]int
 	TradingDates []string // NSE trading dates aligned with Closes arrays (YYYY-MM-DD)
 	Loaded       bool
 }

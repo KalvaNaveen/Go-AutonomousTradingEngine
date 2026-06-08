@@ -7,7 +7,6 @@ import (
 	"log"
 	"math"
 	"net/http"
-	"sort"
 	"sync"
 	"time"
 
@@ -44,7 +43,6 @@ type DailyCacheEntry struct {
 	ATR14        float64
 	High52W      float64
 	Low52W       float64
-	RSScore      int
 }
 
 func NewDailyCache() *DailyCache {
@@ -110,7 +108,6 @@ func (dc *DailyCache) Preload(universe map[uint32]string) bool {
 	}
 
 	wg.Wait()
-	dc.computeRSScores()
 
 	dc.mu.Lock()
 	dc.loaded = loaded >= max(1, int(float64(len(universe))*0.8))
@@ -211,7 +208,6 @@ func (dc *DailyCache) ToScannerCache() *agents.DailyCache {
 		TurnoverCr:   make(map[uint32]float64),
 		PivotSupport: make(map[uint32]float64),
 		High52W:      make(map[uint32]float64),
-		RSScore:      make(map[uint32]int),
 		Loaded:       dc.loaded,
 	}
 
@@ -228,7 +224,6 @@ func (dc *DailyCache) ToScannerCache() *agents.DailyCache {
 		sc.TurnoverCr[token] = entry.TurnoverCr
 		sc.PivotSupport[token] = entry.PivotSupport
 		sc.High52W[token] = entry.High52W
-		sc.RSScore[token] = entry.RSScore
 		if len(entry.Dates) > len(sc.TradingDates) {
 			sc.TradingDates = entry.Dates
 		}
@@ -332,61 +327,6 @@ func toFloat(v interface{}) float64 {
 		return f
 	}
 	return 0
-}
-
-// computeRSScores ranks universe stocks by relative strength using available bars.
-// With 5-year (1825-day) history we compute multi-timeframe RS scores.
-// Regime tokens (420-day history) also get a 6-month component.
-func (dc *DailyCache) computeRSScores() {
-	dc.mu.Lock()
-	defer dc.mu.Unlock()
-
-	type tokenPerf struct {
-		token     uint32
-		composite float64
-	}
-
-	var perfs []tokenPerf
-	for token, entry := range dc.store {
-		closes := entry.Closes
-		if len(closes) < 21 {
-			continue
-		}
-		cNow := closes[len(closes)-1]
-
-		// Use whatever lookbacks are available; weight shorter periods more heavily
-		// when insufficient history is available.
-		p6, p3, p1, pw := 0.0, 0.0, 0.0, 0.0
-		if len(closes) >= 126 && closes[len(closes)-126] > 0 {
-			p6 = (cNow - closes[len(closes)-126]) / closes[len(closes)-126] * 100
-		}
-		if len(closes) >= 63 && closes[len(closes)-63] > 0 {
-			p3 = (cNow - closes[len(closes)-63]) / closes[len(closes)-63] * 100
-		}
-		if len(closes) >= 21 && closes[len(closes)-21] > 0 {
-			p1 = (cNow - closes[len(closes)-21]) / closes[len(closes)-21] * 100
-		}
-		if len(closes) >= 5 && closes[len(closes)-5] > 0 {
-			pw = (cNow - closes[len(closes)-5]) / closes[len(closes)-5] * 100
-		}
-		composite := p6*0.3 + p3*0.35 + p1*0.25 + pw*0.1
-		perfs = append(perfs, tokenPerf{token, composite})
-	}
-
-	sort.Slice(perfs, func(i, j int) bool { return perfs[i].composite < perfs[j].composite })
-	n := len(perfs)
-	for rank, tp := range perfs {
-		rs := int(float64(rank+1) / float64(n) * 100)
-		if rs < 1 {
-			rs = 1
-		}
-		if rs > 99 {
-			rs = 99
-		}
-		if entry, ok := dc.store[tp.token]; ok {
-			entry.RSScore = rs
-		}
-	}
 }
 
 // ── Math helpers ─────────────────────────────────────────────

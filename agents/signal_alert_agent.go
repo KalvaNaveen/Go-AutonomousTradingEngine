@@ -31,7 +31,6 @@ type SignalAlert struct {
 	EMA10      float64
 	EMA20      float64
 	Sector     string
-	RSScore    int
 	High52W    float64
 	AvgVol     float64
 	AlertedAt  string
@@ -184,10 +183,10 @@ func (a *SignalAlertAgent) saveToDB(sig SignalAlert) {
 	}
 	_, err := a.db.Exec(`
 		INSERT INTO signal_alerts
-			(symbol, token, entry_price, sl_price, ema10, ema20, sector, rs_score, high52w, avg_vol, alerted_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			(symbol, token, entry_price, sl_price, ema10, ema20, sector, high52w, avg_vol, alerted_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		sig.Symbol, sig.Token, sig.EntryPrice, sig.SLPrice,
-		sig.EMA10, sig.EMA20, sig.Sector, sig.RSScore,
+		sig.EMA10, sig.EMA20, sig.Sector,
 		sig.High52W, sig.AvgVol, sig.AlertedAt)
 	if err != nil {
 		log.Printf("[SignalAlert] save failed for %s: %v", sig.Symbol, err)
@@ -253,7 +252,6 @@ func (a *SignalAlertAgent) RecordBuySignal(r EODScanResult) {
 		SLPrice:    slPrice,
 		EMA10:      r.EMA10,
 		EMA20:      r.EMA20,
-		RSScore:    r.RSScore,
 		High52W:    r.High52W,
 		AvgVol:     r.AvgVolume,
 		AlertedAt:  today,
@@ -266,7 +264,7 @@ func (a *SignalAlertAgent) LoadRecentAlerts(limit int) ([]map[string]interface{}
 		return nil, nil
 	}
 	rows, err := a.db.Query(`
-		SELECT symbol, entry_price, sl_price, ema10, sector, rs_score,
+		SELECT symbol, entry_price, sl_price, ema10, sector,
 		       alerted_at, sold_at, sell_price, sell_reason
 		FROM signal_alerts
 		ORDER BY alerted_at DESC, id DESC
@@ -280,8 +278,7 @@ func (a *SignalAlertAgent) LoadRecentAlerts(limit int) ([]map[string]interface{}
 	for rows.Next() {
 		var symbol, sector, alertedAt, soldAt, sellReason string
 		var entryPrice, slPrice, ema10, sellPrice float64
-		var rsScore int
-		rows.Scan(&symbol, &entryPrice, &slPrice, &ema10, &sector, &rsScore,
+		rows.Scan(&symbol, &entryPrice, &slPrice, &ema10, &sector,
 			&alertedAt, &soldAt, &sellPrice, &sellReason)
 		out = append(out, map[string]interface{}{
 			"symbol":      symbol,
@@ -289,7 +286,6 @@ func (a *SignalAlertAgent) LoadRecentAlerts(limit int) ([]map[string]interface{}
 			"sl_price":    slPrice,
 			"ema10":       ema10,
 			"sector":      sector,
-			"rs_score":    rsScore,
 			"alerted_at":  alertedAt,
 			"sold_at":     soldAt,
 			"sell_price":  sellPrice,

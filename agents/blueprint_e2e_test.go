@@ -331,7 +331,6 @@ func TestBigDownDay_BlocksEntryFor10Bars(t *testing.T) {
 	dc.Lows[tok] = lows
 	dc.Volumes[tok] = volumes
 	dc.High52W[tok] = 101.0
-	dc.RSScore[tok] = 80
 
 	s.DailyCache = dc
 	s.DailyCache.Closes[config.NiftySpotToken] = makeFlat(420, 22000.0)
@@ -398,7 +397,6 @@ func makeMockCache() *DailyCache {
 		TurnoverCr:   make(map[uint32]float64),
 		PivotSupport: make(map[uint32]float64),
 		High52W:      make(map[uint32]float64),
-		RSScore:      make(map[uint32]int),
 		Loaded:       true,
 	}
 }
