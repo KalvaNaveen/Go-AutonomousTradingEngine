@@ -213,7 +213,7 @@ func RunEODMarketScan(deps EODScanDeps, scanner *ScannerAgent) {
 	scanner.DailyCache = origCache
 
 	// Step 7: Build and send Telegram summary
-	summary := buildEODSummary(results, scanned, buyCount, sellCount, elapsed)
+	summary := buildEODSummary(results, scanned, elapsed)
 	// Append Book Ch.11 scans: trigger candles, MOMO leaders
 	bookScans := EODBookScans(scanCache, eodUniverse, deps.GetLiveLTP, deps.GetLiveVolume)
 	if bookScans != "" {
@@ -757,11 +757,8 @@ func EODBookScans(cache *DailyCache, universe map[uint32]string, getLTP func(uin
 
 // buildEODSummary builds the Telegram EOD report — one unified section:
 // Top 15 high-momentum BUY setups ranked by RS score (EMA pullback + quality filters).
-func buildEODSummary(results []EODScanResult, scanned, buyCount, sellCount int, elapsed time.Duration) string {
+func buildEODSummary(results []EODScanResult, scanned int, elapsed time.Duration) string {
 	dateStr := config.NowIST().Format("02 Jan 2006")
-	_ = sellCount
-	_ = elapsed
-	_ = buyCount
 
 	// Best of best: EMA pullback confirmed + RS >= MinRSScore
 	// r.Pattern != "" means EMAStrategy.Detect fired — all 3 rules + MACD + 9 filters passed
@@ -774,7 +771,7 @@ func buildEODSummary(results []EODScanResult, scanned, buyCount, sellCount int, 
 
 	msg := fmt.Sprintf("📊 *SWING WATCHLIST — %s*\n", dateStr)
 	msg += "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-	msg += fmt.Sprintf("🔎 `%d` stocks | 🎯 `%d` confirmed setups (RS≥%d)\n", scanned, len(buys), config.MinRSScore)
+	msg += fmt.Sprintf("🔎 `%d` stocks | 🎯 `%d` confirmed setups (RS≥%d) | ⏱ `%.0fs`\n", scanned, len(buys), config.MinRSScore, elapsed.Seconds())
 	msg += "━━━━━━━━━━━━━━━━━━━━━━━━\n"
 
 	if len(buys) == 0 {

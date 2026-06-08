@@ -109,9 +109,8 @@ func main() {
 	// FIX-12: Startup token count guard
 	// Ensure benchmark tokens are NOT in pattern scan queue (scanner.Universe)
 	benchmarkTokens := []uint32{config.IndiaVIXToken, config.BankNiftySpotToken}
-	for name, tok := range config.SectorTokens {
+	for _, tok := range config.SectorTokens {
 		benchmarkTokens = append(benchmarkTokens, tok)
-		_ = name
 	}
 	for _, bToken := range benchmarkTokens {
 		if _, inUniverse := scanner.Universe[bToken]; inUniverse {
