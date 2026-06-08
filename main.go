@@ -243,27 +243,9 @@ func main() {
 	}
 	scanner.GetLTP = getKiteLTP
 
-	// Kronos AI ranker — optional, gracefully skipped when service is offline
-	kronosURL := os.Getenv("KRONOS_SERVICE_URL")
-	if kronosURL == "" {
-		kronosURL = "http://localhost:8765"
-	}
-	kronosClient := agents.NewKronosClient(kronosURL)
-	// EnsureKronosRunning: if the service is offline, locate start_kronos.ps1
-	// relative to the exe, launch it as a detached background process, and
-	// optionally register it in Windows Task Scheduler (needs Admin once).
-	kronosClient.EnsureKronosRunning()
-	if kronosClient.IsAlive() {
-		log.Println("[Engine] Kronos service online ✅ — AI ranking enabled")
-		agents.SendTelegram("🤖 *Kronos AI ranker online* — signals will include predicted 5-day upside")
-	} else {
-		log.Println("[Engine] Kronos service offline — AI ranking disabled (rule-based order used)")
-	}
-	scanner.Kronos = kronosClient
-
 	// Wire the SAME EODScanDeps used by the 16:00 auto scan so that an
 	// on-demand "scan" from Telegram runs the IDENTICAL pipeline (full
-	// Nifty 750 universe, Kronos ranking, cooldown dedup, persistence, CSV).
+	// Nifty 750 universe, cooldown dedup, persistence, CSV).
 	scanner.EODDeps = agents.EODScanDeps{
 		LoadUniverse:    dataAgent.LoadEODScanUniverse,
 		PreloadCache:    dailyCache.Preload,
@@ -271,7 +253,6 @@ func main() {
 		GetLiveLTP:      getKiteLTP,
 		GetLTPSource:    getLTPSource,
 		GetLiveVolume:   func(token uint32) int64 { return tickStore.GetVolume(token) },
-		Kronos:          kronosClient,
 		SignalAgent:     signalAgent,
 	}
 
@@ -438,7 +419,6 @@ func main() {
 					GetLiveLTP:      getKiteLTP,
 					GetLTPSource:    getLTPSource,
 					GetLiveVolume:   func(token uint32) int64 { return tickStore.GetVolume(token) },
-					Kronos:          kronosClient,
 					SignalAgent:     signalAgent,
 				}, scanner)
 
@@ -494,10 +474,6 @@ func main() {
 		}
 
 		// Heartbeat — confirms engine is alive every morning
-		kronosStatus := "offline"
-		if kronosClient != nil && kronosClient.IsAlive() {
-			kronosStatus = "online"
-		}
 		tokenStatus := "✅ valid"
 		if !tokenOK {
 			tokenStatus = "⚠️ refreshed"
@@ -507,12 +483,10 @@ func main() {
 				"Date: `%s`\n"+
 				"Universe: `%d stocks`\n"+
 				"Kite token: `%s`\n"+
-				"Kronos AI: `%s`\n"+
 				"EOD scan scheduled at *16:00 IST*",
 			now.Format("Mon, 02 Jan 2006"),
 			len(scanner.Universe),
 			tokenStatus,
-			kronosStatus,
 		))
 	}
 }

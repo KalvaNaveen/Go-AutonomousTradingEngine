@@ -182,13 +182,15 @@ func containsAnyWord(text string, words ...string) bool {
 
 // ── Full EOD-style scan ───────────────────────────────────────────────────────
 
-// handleFullScan triggers the on-demand scan. It now runs the EXACT SAME
+// handleFullScan triggers the on-demand scan. It runs the EXACT SAME
 // pipeline as the 16:00 auto EOD scan (RunEODMarketScan) — same ~750-stock
-// Nifty Total Market universe, same Kronos AI ranking, same 3-day cooldown
-// dedup + persistence, same CSV export. No parallel/lighter implementation.
-//
-// The only difference from the scheduled run: this one can be triggered any
-// time by texting "scan" (or "signals", "setups", etc.) to the bot.
+// Nifty Total Market universe, same 3-day cooldown dedup + persistence,
+// same CSV export, and the SAME Telegram messages (RunEODMarketScan sends
+// its own "EOD MARKET SCAN STARTED" / summary / CSV messages). No separate
+// pre-message is sent here — that was the source of the format mismatch
+// the user noticed: manual scans showed an extra "Manual scan triggered"
+// banner that the scheduled run never sent. Now both paths produce
+// byte-identical Telegram output.
 func handleFullScan(chatID, msgText string, scanner *ScannerAgent, signalAgent *SignalAlertAgent) {
 	if scanner == nil || scanner.DailyCache == nil || !scanner.DailyCache.Loaded {
 		replyToChat(chatID, "⚠️ Cache not loaded yet — try again in a moment.")
@@ -199,25 +201,11 @@ func handleFullScan(chatID, msgText string, scanner *ScannerAgent, signalAgent *
 		return
 	}
 
-	now := config.NowIST()
-	hhmm := now.Hour()*100 + now.Minute()
-	marketOpen := hhmm >= 915 && hhmm <= 1530
-
-	dataTag := "📂 refreshing data..."
-	if marketOpen {
-		dataTag = "📡 live Kite data"
-	}
-
-	replyToChat(chatID, fmt.Sprintf(
-		"🔍 *Manual scan triggered* — %s\n%s | Nifty Total Market (~750 stocks)\n"+
-			"_Running the full EOD pipeline: AI ranking, dedup, CSV..._",
-		config.NowIST().Format("02 Jan 2006 15:04 IST"), dataTag))
-
-	log.Printf("[Bot] Manual scan requested (chat=%s) — running RunEODMarketScan (same as 16:00 auto scan)", chatID)
+	log.Printf("[Bot] Manual scan requested (chat=%s) — running RunEODMarketScan (identical to 16:00 auto scan)", chatID)
 
 	// Run the IDENTICAL pipeline used by the scheduled 16:00 EOD scan.
-	// This guarantees feature parity by construction — there's no second
-	// implementation to drift out of sync.
+	// This guarantees feature + message parity by construction — there's
+	// no second implementation and no second message format to drift.
 	RunEODMarketScan(scanner.EODDeps, scanner)
 }
 

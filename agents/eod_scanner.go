@@ -39,7 +39,6 @@ type EODScanResult struct {
 	Token        uint32
 	Signal       string  // "BUY" or "SELL"
 	Score        int     // raw signal score — higher = more criteria met
-	KronosUpside float64 // Kronos predicted 5-day upside % (0 if service offline)
 	LTP          float64
 	LTPSource    string  // "live" (WebSocket tick) | "quote" (Kite Quote API) | "close" (prev daily close)
 	MarketCap    float64 // from Screener.in cache (Cr), 0 if unavailable
@@ -74,8 +73,6 @@ type EODScanDeps struct {
 	GetLTPSource func(token uint32) string
 	// GetLiveVolume returns the live cumulative day volume for a token.
 	GetLiveVolume func(token uint32) int64
-	// Kronos is optional — when non-nil, BUY signals are re-ranked by predicted upside.
-	Kronos *KronosClient
 	// SignalAgent is optional — when non-nil, BUY signals are de-duplicated (3-day
 	// cooldown) and persisted to the signals DB so SELL alerts can reference them.
 	SignalAgent *SignalAlertAgent
@@ -148,21 +145,6 @@ func RunEODMarketScan(deps EODScanDeps, scanner *ScannerAgent) {
 		}
 		return ri.RSScore > rj.RSScore
 	})
-
-	// Step 4b: Kronos re-ranking — re-order BUY signals by predicted 5d upside
-	if deps.Kronos != nil && deps.Kronos.IsAlive() {
-		var buys, sells []EODScanResult
-		for _, r := range results {
-			if r.Signal == "BUY" {
-				buys = append(buys, r)
-			} else {
-				sells = append(sells, r)
-			}
-		}
-		log.Printf("[EODScan] Kronos re-ranking %d BUY signals...", len(buys))
-		buys = deps.Kronos.RankSignals(buys, scanCache)
-		results = append(buys, sells...)
-	}
 
 	// Step 4c: Signal deduplication — 3-day cooldown.
 	// Suppress BUY alerts for stocks that already have an open position or were
@@ -830,7 +812,6 @@ func buildEODSummary(results []EODScanResult, scanned, buyCount, sellCount int, 
 					nearHighTag = fmt.Sprintf(" | `%.1f%%` from High", dist)
 				}
 			}
-			kronosTag := KronosUpsideTag(r.KronosUpside)
 			slTag := ""
 			if r.SLPrice > 0 {
 				slTag = fmt.Sprintf(" | SL ₹`%.0f` (`%.1f%%`)", r.SLPrice, r.SLPct)
@@ -839,9 +820,9 @@ func buildEODSummary(results []EODScanResult, scanned, buyCount, sellCount int, 
 			if r.QtyRisk > 0 {
 				qtyTag = fmt.Sprintf(" | Qty `%d`", r.QtyRisk)
 			}
-			msg += fmt.Sprintf("*%d. %s* %s | RS `%d`\n   ₹`%.0f`%s%s%s%s%s\n\n",
+			msg += fmt.Sprintf("*%d. %s* %s | RS `%d`\n   ₹`%.0f`%s%s%s%s\n\n",
 				i+1, r.Symbol, rsTag, r.RSScore,
-				r.LTP, volTag, nearHighTag, kronosTag, slTag, qtyTag)
+				r.LTP, volTag, nearHighTag, slTag, qtyTag)
 		}
 		if len(buys) > 15 {
 			msg += fmt.Sprintf("_... +%d more in CSV_\n", len(buys)-15)
