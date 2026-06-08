@@ -48,6 +48,7 @@ type EODScanResult struct {
 	Volume       float64 // today's volume (from tick store or daily cache)
 	AvgVolume    float64 // 20-day average
 	RSScore      int     // Relative Strength percentile (1-99)
+	MACDHist     float64 // MACD histogram value (EMA10/EMA20/signal) on the latest bar — momentum strength
 	Pattern      string  // detected pattern name, or ""
 	ATR          float64
 	High52W      float64
@@ -288,6 +289,14 @@ func analyzeStock(
 		}
 	}
 
+	// MACD histogram (EMA10/EMA20/signal) — momentum strength on the latest bar.
+	// Used to rank "market leaders" (RS) vs how strongly their momentum is
+	// accelerating right now (MACD) — see buildEODSummary sort.
+	macdHistVal := 0.0
+	if hist := computeMACDHistogram(closes, config.EMA10Period, config.EMA20Period, config.MACDSignalPeriod); len(hist) > 0 {
+		macdHistVal = hist[len(hist)-1]
+	}
+
 	// EMA 21 — computed from closes (cache no longer stores EMA21)
 	ema21Val := 0.0
 	ema21Slice := data.ComputeEMA(closes, 21)
@@ -421,6 +430,7 @@ func analyzeStock(
 		Volume:    volume,
 		AvgVolume: math.Round(avgVolume),
 		RSScore:   rsScore,
+		MACDHist:  macdHistVal,
 		Pattern:   pattern,
 		ATR:       atr,
 		High52W:   high52w,
@@ -769,6 +779,17 @@ func buildEODSummary(results []EODScanResult, scanned int, elapsed time.Duration
 		}
 	}
 
+	// Order: "market leaders first, legends follow" — rank by RS percentile
+	// (who the market is rewarding most right now) and use MACD histogram
+	// strength (momentum acceleration on the bounce bar) as the tie-break /
+	// follow-on ordering among names with comparable RS.
+	sort.Slice(buys, func(i, j int) bool {
+		if buys[i].RSScore != buys[j].RSScore {
+			return buys[i].RSScore > buys[j].RSScore
+		}
+		return buys[i].MACDHist > buys[j].MACDHist
+	})
+
 	msg := fmt.Sprintf("📊 *SWING WATCHLIST — %s*\n", dateStr)
 	msg += "━━━━━━━━━━━━━━━━━━━━━━━━\n"
 	msg += fmt.Sprintf("🔎 `%d` stocks | 🎯 `%d` confirmed setups (RS≥%d) | ⏱ `%.0fs`\n", scanned, len(buys), config.MinRSScore, elapsed.Seconds())
@@ -777,12 +798,12 @@ func buildEODSummary(results []EODScanResult, scanned int, elapsed time.Duration
 	if len(buys) == 0 {
 		msg += fmt.Sprintf("\n❌ No confirmed EMA pullback setups with RS≥%d today.\n", config.MinRSScore)
 	} else {
-		limit := 15
+		limit := 20
 		if len(buys) < limit {
 			limit = len(buys)
 		}
-		msg += fmt.Sprintf("\n🎯 *TOP %d CONFIRMED SETUPS*\n", limit)
-		msg += "_EMA Pullback ✅ + MACD ✅ + RS≥80 ✅_\n\n"
+		msg += fmt.Sprintf("\n🎯 *MARKET LEADERS — TOP %d*\n", limit)
+		msg += "_Ranked by RS (market leaders first) → MACD momentum (legends follow)_\n\n"
 		for i := 0; i < limit; i++ {
 			r := buys[i]
 			rsTag := eodRSEmoji(r.RSScore)
@@ -809,6 +830,18 @@ func buildEODSummary(results []EODScanResult, scanned int, elapsed time.Duration
 					nearHighTag = fmt.Sprintf(" | `%.1f%%` from High", dist)
 				}
 			}
+			// MACD momentum strength tag — secondary ranking signal
+			macdTag := ""
+			if r.MACDHist > 0 {
+				switch {
+				case r.MACDHist >= r.LTP*0.01:
+					macdTag = " | MACD 🚀"
+				case r.MACDHist >= r.LTP*0.003:
+					macdTag = " | MACD ⚡"
+				default:
+					macdTag = " | MACD ✅"
+				}
+			}
 			slTag := ""
 			if r.SLPrice > 0 {
 				slTag = fmt.Sprintf(" | SL ₹`%.0f` (`%.1f%%`)", r.SLPrice, r.SLPct)
@@ -817,12 +850,12 @@ func buildEODSummary(results []EODScanResult, scanned int, elapsed time.Duration
 			if r.QtyRisk > 0 {
 				qtyTag = fmt.Sprintf(" | Qty `%d`", r.QtyRisk)
 			}
-			msg += fmt.Sprintf("*%d. %s* %s | RS `%d`\n   ₹`%.0f`%s%s%s%s\n\n",
-				i+1, r.Symbol, rsTag, r.RSScore,
+			msg += fmt.Sprintf("*%d. %s* %s | RS `%d`%s\n   ₹`%.0f`%s%s%s%s\n\n",
+				i+1, r.Symbol, rsTag, r.RSScore, macdTag,
 				r.LTP, volTag, nearHighTag, slTag, qtyTag)
 		}
-		if len(buys) > 15 {
-			msg += fmt.Sprintf("_... +%d more in CSV_\n", len(buys)-15)
+		if len(buys) > limit {
+			msg += fmt.Sprintf("_... +%d more in CSV_\n", len(buys)-limit)
 		}
 	}
 
