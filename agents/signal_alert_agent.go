@@ -251,8 +251,8 @@ func (a *SignalAlertAgent) RecordBuySignal(r EODScanResult) {
 		Token:      r.Token,
 		EntryPrice: r.LTP,
 		SLPrice:    slPrice,
-		EMA10:      r.EMA21, // closest available (EMA10 not stored in EODScanResult)
-		EMA20:      r.EMA21,
+		EMA10:      r.EMA10,
+		EMA20:      r.EMA20,
 		RSScore:    r.RSScore,
 		High52W:    r.High52W,
 		AvgVol:     r.AvgVolume,

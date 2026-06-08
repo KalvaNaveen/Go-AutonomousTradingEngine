@@ -42,9 +42,9 @@ type EODScanResult struct {
 	LTP          float64
 	LTPSource    string  // "live" (WebSocket tick) | "quote" (Kite Quote API) | "close" (prev daily close)
 	MarketCap    float64 // from Screener.in cache (Cr), 0 if unavailable
-	EMA21        float64
-	EMA63        float64
-	SMA200       float64
+	EMA10        float64 // fast EMA — the strategy's entry/momentum reference (book Ch.3)
+	EMA20        float64 // trend EMA — the strategy's trend/exit reference (book Ch.3)
+	EMA50        float64 // extension/structure reference (book Ch.3 p.49-52)
 	Volume       float64 // today's volume (from tick store or daily cache)
 	AvgVolume    float64 // 20-day average
 	RSScore      int     // Relative Strength percentile (1-99)
@@ -288,30 +288,24 @@ func analyzeStock(
 		}
 	}
 
-	// EMA 21 — computed from closes (cache no longer stores EMA21)
-	ema21Val := 0.0
-	ema21Slice := data.ComputeEMA(closes, 21)
-	if len(ema21Slice) > 0 {
-		ema21Val = ema21Slice[len(ema21Slice)-1]
+	// EMA10 / EMA20 / EMA50 — the EXACT EMAs the strategy is built on (book Ch.3:
+	// EMA10 = fast/entry reference, EMA20 = trend/exit reference, EMA50 = extension
+	// & structure reference). Replaces the old EMA21/EMA63/SMA200 trio, which used
+	// a mismatched moving-average system unrelated to the EMA10/20 strategy that
+	// actually drives entries — the engine now masters EMA10/20 end-to-end.
+	ema10Val := 0.0
+	if ema10Slice := data.ComputeEMA(closes, config.EMA10Period); len(ema10Slice) > 0 {
+		ema10Val = ema10Slice[len(ema10Slice)-1]
 	}
-
-	// EMA 63
-	ema63Val := 0.0
-	if len(closes) > 63 {
-		ema63Slice := data.ComputeEMA(closes, 63)
-		if len(ema63Slice) > 0 {
-			ema63Val = ema63Slice[len(ema63Slice)-1]
-		}
+	ema20Val := 0.0
+	if ema20Slice := data.ComputeEMA(closes, config.EMA20Period); len(ema20Slice) > 0 {
+		ema20Val = ema20Slice[len(ema20Slice)-1]
 	}
-
-	// SMA 200 — computed from closes (cache no longer stores SMA200)
-	sma200Val := 0.0
-	if len(closes) >= 200 {
-		sum := 0.0
-		for _, c := range closes[len(closes)-200:] {
-			sum += c
+	ema50Val := 0.0
+	if len(closes) >= config.EMA50Period {
+		if ema50Slice := data.ComputeEMA(closes, config.EMA50Period); len(ema50Slice) > 0 {
+			ema50Val = ema50Slice[len(ema50Slice)-1]
 		}
-		sma200Val = sum / 200
 	}
 
 	// Volume
@@ -380,7 +374,7 @@ func analyzeStock(
 	}
 
 	// ── Classification ──
-	signal, score := classifyStock(ltp, ema21Val, ema63Val, sma200Val, volume, avgVolume,
+	signal, score := classifyStock(ltp, ema10Val, ema20Val, ema50Val, volume, avgVolume,
 		rsScore, high52w, low52w, closes, pattern)
 
 	if signal == "" {
@@ -415,9 +409,9 @@ func analyzeStock(
 		LTP:       ltp,
 		LTPSource: ltpSource,
 		MarketCap: marketCap,
-		EMA21:     math.Round(ema21Val*100) / 100,
-		EMA63:     math.Round(ema63Val*100) / 100,
-		SMA200:    math.Round(sma200Val*100) / 100,
+		EMA10:     math.Round(ema10Val*100) / 100,
+		EMA20:     math.Round(ema20Val*100) / 100,
+		EMA50:     math.Round(ema50Val*100) / 100,
 		Volume:    volume,
 		AvgVolume: math.Round(avgVolume),
 		RSScore:   rsScore,
@@ -433,7 +427,7 @@ func analyzeStock(
 
 // classifyStock determines BUY, SELL, or "" (neutral) and returns the raw score.
 func classifyStock(
-	ltp, ema21, ema63, sma200, volume, avgVolume float64,
+	ltp, ema10, ema20, ema50, volume, avgVolume float64,
 	rsScore int,
 	high52w, low52w float64,
 	closes []float64,
@@ -442,13 +436,14 @@ func classifyStock(
 	buyScore := 0
 	sellScore := 0
 
-	// ── BUY criteria ──
-	// 1. Price above 21 EMA (trend following)
-	if ema21 > 0 && ltp > ema21 {
+	// ── BUY criteria (book Ch.3 EMA10/20/50 system) ──
+	// 1. Price above EMA10 — fast-trend confirmation (p.45-47: bounce off the 10 EMA)
+	if ema10 > 0 && ltp > ema10 {
 		buyScore++
 	}
-	// 2. Price above 200 SMA (long-term uptrend)
-	if sma200 > 0 && ltp > sma200 {
+	// 2. EMA10 above EMA20 — the strategy's own uptrend rule (p.47: "10 above the
+	// 20 EMA, both rising, is evident the stock is in a strong uptrend")
+	if ema10 > 0 && ema20 > 0 && ema10 > ema20 {
 		buyScore++
 	}
 	// 3. Strong RS Score (≥ MinRSScore, default 80 = top 20%)
@@ -479,18 +474,22 @@ func classifyStock(
 	if pattern != "" {
 		buyScore += 2 // Strong signal boost
 	}
-	// 7. EMA 21 above EMA 63 (golden cross equivalent)
-	if ema21 > 0 && ema63 > 0 && ema21 > ema63 {
-		buyScore++
+	// 7. Not overextended beyond EMA50 — book's extension/structure filter
+	// (p.49-52: chasing a stock too far above its key EMA invites a reversion).
+	if ema50 > 0 && ltp > 0 {
+		extensionPct := ((ltp - ema50) / ema50) * 100
+		if extensionPct >= 0 && extensionPct <= config.Extension50EMAPct {
+			buyScore++
+		}
 	}
 
-	// ── SELL criteria ──
-	// 1. Price below 21 EMA
-	if ema21 > 0 && ltp < ema21 {
+	// ── SELL criteria (mirror, EMA10/20/50 system) ──
+	// 1. Price below EMA10 — fast-trend breakdown
+	if ema10 > 0 && ltp < ema10 {
 		sellScore++
 	}
-	// 2. Price below 200 SMA (long-term downtrend)
-	if sma200 > 0 && ltp < sma200 {
+	// 2. EMA10 below EMA20 — death-cross equivalent / trend breakdown (p.47 inverse)
+	if ema10 > 0 && ema20 > 0 && ema10 < ema20 {
 		sellScore++
 	}
 	// 3. Weak RS Score (bottom 30%)
@@ -508,18 +507,21 @@ func classifyStock(
 	if avgVolume > 0 && volume < avgVolume*0.7 {
 		sellScore++
 	}
-	// 6. Two recent red candles below EMA
-	if len(closes) >= 3 && ema21 > 0 {
+	// 6. Two recent red candles below EMA10 (breakdown momentum)
+	if len(closes) >= 3 && ema10 > 0 {
 		c1 := closes[len(closes)-1]
 		c2 := closes[len(closes)-2]
 		c3 := closes[len(closes)-3]
-		if c1 < c2 && c2 < c3 && c1 < ema21 && c2 < ema21 {
+		if c1 < c2 && c2 < c3 && c1 < ema10 && c2 < ema10 {
 			sellScore += 2
 		}
 	}
-	// 7. EMA 21 below EMA 63 (death cross)
-	if ema21 > 0 && ema63 > 0 && ema21 < ema63 {
-		sellScore++
+	// 7. Overextended below EMA50 — structural breakdown (mirror of extension filter)
+	if ema50 > 0 && ltp > 0 {
+		extensionPct := ((ema50 - ltp) / ema50) * 100
+		if extensionPct >= config.Extension50EMAPct {
+			sellScore++
+		}
 	}
 
 	// ── Decision ──
@@ -601,7 +603,7 @@ func generateEODCSV(results []EODScanResult) (string, error) {
 	// Header
 	header := []string{
 		"Signal", "Score", "Symbol", "Company", "LTP", "LTP Source", "MarketCap(Cr)",
-		"EMA21", "EMA63", "SMA200", "Volume", "AvgVolume",
+		"EMA10", "EMA20", "EMA50", "Volume", "AvgVolume",
 		"RS Score", "Pattern", "ATR", "SL Price", "SL%", "Qty(₹5k risk)",
 		"52W High", "52W Low",
 	}
@@ -625,9 +627,9 @@ func generateEODCSV(results []EODScanResult) (string, error) {
 			fmt.Sprintf("%g", r.LTP),
 			r.LTPSource,
 			fmt.Sprintf("%.0f", r.MarketCap),
-			fmt.Sprintf("%.2f", r.EMA21),
-			fmt.Sprintf("%.2f", r.EMA63),
-			fmt.Sprintf("%.2f", r.SMA200),
+			fmt.Sprintf("%.2f", r.EMA10),
+			fmt.Sprintf("%.2f", r.EMA20),
+			fmt.Sprintf("%.2f", r.EMA50),
 			fmt.Sprintf("%.0f", r.Volume),
 			fmt.Sprintf("%.0f", r.AvgVolume),
 			fmt.Sprintf("%d", r.RSScore),
