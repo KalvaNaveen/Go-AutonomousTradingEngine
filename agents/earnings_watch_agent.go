@@ -3,6 +3,10 @@ package agents
 import (
 	"encoding/json"
 	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"net/http/cookiejar"
 	"os"
 	"path/filepath"
 	"strings"
@@ -67,6 +71,110 @@ func EarningsCaution(symbol string) string {
 	default:
 		return ""
 	}
+}
+
+// ── Auto-population: NSE board-meeting/event-calendar fetch ──────────────────
+//
+// Removes the manual data-entry step: pulls NSE's free, official board-meeting
+// calendar (the same data source the README pointed users to), filters to
+// "Financial Results" purpose entries, and writes one cache file per symbol
+// that's actually in our universe. Runs once per trading day from the EOD
+// pipeline — cheap (single HTTP call), and silently no-ops on failure (NSE
+// occasionally rate-limits/bot-blocks; a missed refresh just means yesterday's
+// cache persists, which is harmless since EarningsCaution() already treats
+// stale/past dates as "no tag").
+type nseBoardMeetingEntry struct {
+	Symbol  string `json:"symbol"`
+	Purpose string `json:"purpose"`
+	Date    string `json:"date"` // "DD-Mon-YYYY", e.g. "11-Jun-2026"
+}
+
+// RefreshEarningsCache fetches NSE's board-meeting event calendar and writes
+// data/earnings_cache/<SYMBOL>.json for every "Financial Results" entry whose
+// symbol is present in the given universe. Call once daily before the EOD scan.
+func RefreshEarningsCache(universe map[uint32]string) {
+	symbols := make(map[string]bool, len(universe))
+	for _, sym := range universe {
+		symbols[strings.ToUpper(sym)] = true
+	}
+
+	entries, err := fetchNSEBoardMeetings()
+	if err != nil {
+		log.Printf("[EarningsWatch] refresh skipped (fetch failed): %v", err)
+		return
+	}
+
+	dir := filepath.Join(".", "data", "earnings_cache")
+	os.MkdirAll(dir, 0755)
+
+	written := 0
+	for _, e := range entries {
+		if !strings.Contains(e.Purpose, "Financial Results") {
+			continue
+		}
+		sym := strings.ToUpper(strings.TrimSpace(e.Symbol))
+		if !symbols[sym] {
+			continue
+		}
+		parsed, err := time.Parse("02-Jan-2006", e.Date)
+		if err != nil {
+			continue
+		}
+		entry := earningsCacheEntry{NextResultDate: parsed.Format("2006-01-02")}
+		raw, _ := json.Marshal(entry)
+		path := filepath.Join(dir, sym+".json")
+		if err := os.WriteFile(path, raw, 0644); err == nil {
+			written++
+		}
+	}
+	log.Printf("[EarningsWatch] cache refreshed: %d symbols updated from %d board-meeting entries", written, len(entries))
+}
+
+// fetchNSEBoardMeetings hits NSE's public event-calendar API. NSE requires a
+// warm session cookie from the main site before its /api/* endpoints respond
+// (otherwise returns 403) — so we GET the homepage first to collect cookies,
+// then reuse that client for the API call. This is the same handshake every
+// NSE-scraping tool (nsepython, jugaad-data, etc.) has to perform; there is no
+// authenticated/official alternative for free access.
+func fetchNSEBoardMeetings() ([]nseBoardMeetingEntry, error) {
+	jar, _ := cookiejar.New(nil)
+	client := &http.Client{Timeout: 20 * time.Second, Jar: jar}
+
+	const ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+
+	warmup, _ := http.NewRequest("GET", "https://www.nseindia.com/companies-listing/corporate-filings-event-calendar", nil)
+	warmup.Header.Set("User-Agent", ua)
+	warmup.Header.Set("Accept-Language", "en-US,en;q=0.9")
+	if resp, err := client.Do(warmup); err == nil {
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+	}
+	time.Sleep(1 * time.Second)
+
+	req, _ := http.NewRequest("GET", "https://www.nseindia.com/api/event-calendar", nil)
+	req.Header.Set("User-Agent", ua)
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+	req.Header.Set("Referer", "https://www.nseindia.com/companies-listing/corporate-filings-event-calendar")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("NSE API returned status %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	var entries []nseBoardMeetingEntry
+	if err := json.Unmarshal(body, &entries); err != nil {
+		return nil, err
+	}
+	return entries, nil
 }
 
 func loadEarningsCacheEntry(symbol string) (earningsCacheEntry, bool) {

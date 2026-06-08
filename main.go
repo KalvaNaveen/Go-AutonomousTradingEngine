@@ -410,6 +410,7 @@ func main() {
 				log.Println("[Engine] ═══ EOD RUN (16:00) ═══")
 
 				dailyCache.Preload(dataAgent.Universe)
+				agents.RefreshEarningsCache(dataAgent.Universe)
 				freshCache := dailyCache.ToScannerCache()
 				scanner.DailyCache = freshCache
 				refreshKiteQuotes()
