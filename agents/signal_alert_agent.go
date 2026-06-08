@@ -51,7 +51,6 @@ func NewSignalAlertAgent() *SignalAlertAgent {
 		ema10       REAL    NOT NULL,
 		ema20       REAL    DEFAULT 0,
 		sector      TEXT    DEFAULT '',
-		rs_score    INTEGER DEFAULT 0,
 		high52w     REAL    DEFAULT 0,
 		avg_vol     REAL    DEFAULT 0,
 		alerted_at  TEXT    NOT NULL,
@@ -60,6 +59,13 @@ func NewSignalAlertAgent() *SignalAlertAgent {
 		sell_reason TEXT    DEFAULT ''
 	)`)
 	db.Exec(`CREATE INDEX IF NOT EXISTS idx_sa_symbol ON signal_alerts (symbol, sold_at)`)
+	// Migration: drop the now-unused rs_score column from pre-existing DBs
+	// (RS scoring was removed entirely — it isn't part of the book's strategy).
+	// SQLite ≥3.35 supports DROP COLUMN; ignore the error on older DBs/engines
+	// where the column doesn't exist or the syntax isn't supported — harmless.
+	if _, err := db.Exec(`ALTER TABLE signal_alerts DROP COLUMN rs_score`); err == nil {
+		log.Println("[SignalAlert] migrated: dropped unused rs_score column")
+	}
 	return &SignalAlertAgent{db: db}
 }
 

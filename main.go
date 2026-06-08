@@ -17,8 +17,15 @@ import (
 	"github.com/joho/godotenv"
 )
 
+// buildVersion identifies which commit produced this binary — set at build
+// time via: go build -ldflags "-X main.buildVersion=$(git rev-parse --short HEAD)"
+// Logged at startup so a running process can be matched against `git log`,
+// closing the gap where a manually-deployed binary's provenance was unclear.
+var buildVersion = "dev"
+
 func main() {
 	core.InitGlobalLogger()
+	log.Printf("[Main] ═══ Zenith Signal Engine starting — build %s ═══", buildVersion)
 	// ══════════════════════════════════════════════════════════════
 	//  PHASE 0: Environment Setup
 	// ══════════════════════════════════════════════════════════════
