@@ -48,7 +48,6 @@ type EODScanResult struct {
 	Volume       float64 // today's volume (from tick store or daily cache)
 	AvgVolume    float64 // 20-day average
 	RSScore      int     // Relative Strength percentile (1-99)
-	MACDHist     float64 // MACD histogram value (EMA10/EMA20/signal) on the latest bar — momentum strength
 	Pattern      string  // detected pattern name, or ""
 	ATR          float64
 	High52W      float64
@@ -289,14 +288,6 @@ func analyzeStock(
 		}
 	}
 
-	// MACD histogram (EMA10/EMA20/signal) — momentum strength on the latest bar.
-	// Used to rank "market leaders" (RS) vs how strongly their momentum is
-	// accelerating right now (MACD) — see buildEODSummary sort.
-	macdHistVal := 0.0
-	if hist := computeMACDHistogram(closes, config.EMA10Period, config.EMA20Period, config.MACDSignalPeriod); len(hist) > 0 {
-		macdHistVal = hist[len(hist)-1]
-	}
-
 	// EMA 21 — computed from closes (cache no longer stores EMA21)
 	ema21Val := 0.0
 	ema21Slice := data.ComputeEMA(closes, 21)
@@ -430,7 +421,6 @@ func analyzeStock(
 		Volume:    volume,
 		AvgVolume: math.Round(avgVolume),
 		RSScore:   rsScore,
-		MACDHist:  macdHistVal,
 		Pattern:   pattern,
 		ATR:       atr,
 		High52W:   high52w,
@@ -771,7 +761,10 @@ func buildEODSummary(results []EODScanResult, scanned int, elapsed time.Duration
 	dateStr := config.NowIST().Format("02 Jan 2006")
 
 	// Best of best: EMA pullback confirmed + RS >= MinRSScore
-	// r.Pattern != "" means EMAStrategy.Detect fired — all 3 rules + MACD + 9 filters passed
+	// r.Pattern != "" means EMAStrategy.Detect fired — pure-EMA rules from the
+	// book ("Swing Trading Simplified" by Ankur Patel, Ch.3): uptrend (EMA10 >
+	// EMA20, both rising), pullback to EMA support on light volume, and a green
+	// bounce candle closing back above EMA10. No MACD or other indicators.
 	var buys []EODScanResult
 	for _, r := range results {
 		if r.Signal == "BUY" && r.Pattern != "" && r.RSScore >= config.MinRSScore {
@@ -779,15 +772,11 @@ func buildEODSummary(results []EODScanResult, scanned int, elapsed time.Duration
 		}
 	}
 
-	// Order: "market leaders first, legends follow" — rank by RS percentile
-	// (who the market is rewarding most right now) and use MACD histogram
-	// strength (momentum acceleration on the bounce bar) as the tie-break /
-	// follow-on ordering among names with comparable RS.
+	// Order: "market leaders first" — rank purely by RS percentile (who the
+	// market is rewarding most right now). Pure-EMA setups are equally valid
+	// once confirmed; RS is the single ranking signal.
 	sort.Slice(buys, func(i, j int) bool {
-		if buys[i].RSScore != buys[j].RSScore {
-			return buys[i].RSScore > buys[j].RSScore
-		}
-		return buys[i].MACDHist > buys[j].MACDHist
+		return buys[i].RSScore > buys[j].RSScore
 	})
 
 	msg := fmt.Sprintf("📊 *SWING WATCHLIST — %s*\n", dateStr)
@@ -803,7 +792,7 @@ func buildEODSummary(results []EODScanResult, scanned int, elapsed time.Duration
 			limit = len(buys)
 		}
 		msg += fmt.Sprintf("\n🎯 *MARKET LEADERS — TOP %d*\n", limit)
-		msg += "_Ranked by RS (market leaders first) → MACD momentum (legends follow)_\n\n"
+		msg += "_EMA Pullback ✅ (Ch.3 — Ankur Patel) + RS≥80 ✅, ranked by RS_\n\n"
 		for i := 0; i < limit; i++ {
 			r := buys[i]
 			rsTag := eodRSEmoji(r.RSScore)
@@ -830,18 +819,6 @@ func buildEODSummary(results []EODScanResult, scanned int, elapsed time.Duration
 					nearHighTag = fmt.Sprintf(" | `%.1f%%` from High", dist)
 				}
 			}
-			// MACD momentum strength tag — secondary ranking signal
-			macdTag := ""
-			if r.MACDHist > 0 {
-				switch {
-				case r.MACDHist >= r.LTP*0.01:
-					macdTag = " | MACD 🚀"
-				case r.MACDHist >= r.LTP*0.003:
-					macdTag = " | MACD ⚡"
-				default:
-					macdTag = " | MACD ✅"
-				}
-			}
 			slTag := ""
 			if r.SLPrice > 0 {
 				slTag = fmt.Sprintf(" | SL ₹`%.0f` (`%.1f%%`)", r.SLPrice, r.SLPct)
@@ -850,8 +827,8 @@ func buildEODSummary(results []EODScanResult, scanned int, elapsed time.Duration
 			if r.QtyRisk > 0 {
 				qtyTag = fmt.Sprintf(" | Qty `%d`", r.QtyRisk)
 			}
-			msg += fmt.Sprintf("*%d. %s* %s | RS `%d`%s\n   ₹`%.0f`%s%s%s%s\n\n",
-				i+1, r.Symbol, rsTag, r.RSScore, macdTag,
+			msg += fmt.Sprintf("*%d. %s* %s | RS `%d`\n   ₹`%.0f`%s%s%s%s\n\n",
+				i+1, r.Symbol, rsTag, r.RSScore,
 				r.LTP, volTag, nearHighTag, slTag, qtyTag)
 		}
 		if len(buys) > limit {

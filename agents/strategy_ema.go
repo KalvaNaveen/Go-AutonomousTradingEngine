@@ -177,20 +177,6 @@ func DetectEMAPullbackFromSlice(opens, closes, highs, lows, volumes []float64) (
 		}
 	}
 
-	// ── MACD Histogram direction — momentum confirmation on bounce bar ────────
-	// Fast = EMA10, Slow = EMA20 (same EMAs as our trend check — no new params).
-	// We only check one thing: histogram must be RISING on the bounce bar.
-	//   histogram[n-1] > histogram[n-2]
-	// This confirms the EMA10−EMA20 gap is expanding (momentum accelerating),
-	// not dead-cat-bouncing on a still-falling MACD.
-	// Skip-safe: if not enough data for the signal line, we do not block the signal.
-	hist := computeMACDHistogram(closes, config.EMA10Period, config.EMA20Period, config.MACDSignalPeriod)
-	if hist != nil && len(hist) >= 2 {
-		if hist[len(hist)-1] <= hist[len(hist)-2] {
-			return // histogram falling on bounce bar → momentum not confirmed
-		}
-	}
-
 	formed = true
 	return
 }

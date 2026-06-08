@@ -342,10 +342,6 @@ const (
 const (
 	EMA50Period       = 50   // 50-day EMA — extension reference
 
-	// MACD — fast=EMA10, slow=EMA20 (same as our trend EMAs), signal=EMA9
-	// MACD line = EMA10 - EMA20. Histogram = MACD - Signal.
-	// We only use histogram DIRECTION on the bounce bar (not crossover).
-	MACDSignalPeriod = 9 // EMA of the MACD line → signal line
 	Extension50EMAPct = 30.0 // skip if LTP > EMA50 × 1.30
 )
 

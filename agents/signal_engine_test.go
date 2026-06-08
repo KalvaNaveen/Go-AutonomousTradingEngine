@@ -350,53 +350,6 @@ func TestDetectEMAPullback_InsufficientData_DoesNotFire(t *testing.T) {
 	}
 }
 
-// ── MACD Histogram tests ──────────────────────────────────────────────────────
-
-func TestComputeMACDHistogram_RisingSeries_HistogramPositive(t *testing.T) {
-	// Flat series → MACD line = 0 throughout → histogram near 0
-	closes := makeFlat(100, 100.0)
-	hist := computeMACDHistogram(closes, 10, 20, 9)
-	if hist == nil {
-		t.Fatal("computeMACDHistogram returned nil for sufficient flat series")
-	}
-	if len(hist) < 2 {
-		t.Fatalf("need at least 2 histogram values, got %d", len(hist))
-	}
-}
-
-func TestComputeMACDHistogram_InsufficientData_ReturnsNil(t *testing.T) {
-	// Too few bars for slowPeriod + signalPeriod
-	closes := makeFlat(15, 100.0)
-	hist := computeMACDHistogram(closes, 10, 20, 9)
-	if hist != nil && len(hist) >= 2 {
-		t.Error("histogram should be nil or too short when data is insufficient")
-	}
-}
-
-func TestMACDHistogram_FallingHistogram_BlocksBounce(t *testing.T) {
-	// Build a valid pullback setup then manually flatten the bounce
-	// so the MACD histogram stays flat/falling on the bounce bar.
-	opens, closes, highs, lows, _ := makePullbackData()
-	n := len(closes)
-
-	// Make the last bar's close only slightly above previous — weak bounce.
-	// The MACD histogram on a weak flat bounce will not be rising.
-	// Replace bounce with a very small gain — histogram direction unlikely to be rising.
-	closes[n-1] = closes[n-2] + 0.01 // tiny gain — MACD histogram unlikely rising
-	opens[n-1] = closes[n-1] - 0.005
-	highs[n-1] = closes[n-1] + 0.01
-	lows[n-1] = closes[n-2]
-
-	// We can't guarantee the MACD direction without computing it, so just verify
-	// computeMACDHistogram runs without panic on real data.
-	hist := computeMACDHistogram(closes, 10, 20, 9)
-	if hist != nil {
-		t.Logf("MACD histogram last 2 values: [%.4f, %.4f] (rising=%v)",
-			hist[len(hist)-2], hist[len(hist)-1],
-			hist[len(hist)-1] > hist[len(hist)-2])
-	}
-}
-
 // ══════════════════════════════════════════════════════════════════════════════
 // 4.  computeEMASeries
 // ══════════════════════════════════════════════════════════════════════════════
