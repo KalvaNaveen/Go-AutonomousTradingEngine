@@ -844,9 +844,12 @@ func buildEODSummary(results []EODScanResult, scanned int, elapsed time.Duration
 			if r.QtyRisk > 0 {
 				qtyTag = fmt.Sprintf(" | Qty `%d`", r.QtyRisk)
 			}
-			msg += fmt.Sprintf("*%d. %s* | Score `%d`\n   ₹`%.0f`%s%s%s%s\n\n",
+			// Earnings-proximity caution (informational only — book p.191:
+			// avoid holding through earnings without a profit cushion).
+			earnTag := EarningsCaution(r.Symbol)
+			msg += fmt.Sprintf("*%d. %s* | Score `%d`\n   ₹`%.0f`%s%s%s%s%s\n\n",
 				i+1, r.Symbol, r.Score,
-				r.LTP, volTag, nearHighTag, slTag, qtyTag)
+				r.LTP, volTag, nearHighTag, slTag, qtyTag, earnTag)
 		}
 		if len(buys) > limit {
 			msg += fmt.Sprintf("_... +%d more in CSV_\n", len(buys)-limit)
