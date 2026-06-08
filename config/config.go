@@ -139,8 +139,11 @@ const (
 	RegimeSMAPeriod      = 200 // informational: SMA200 shown in bird's eye report
 	RegimeMomentumPeriod = 21  // informational: 21-day ROC shown in bird's eye report
 
-	ConsecutiveSLCutoff = 5    // 5 consecutive SL hits → reduce capital
-	ReducedCapitalPct   = 0.35 // Reduce to ~35% capital on contingency
+	// Book p.191 — verbatim: "If your last four trades hit stop-loss, consider
+	// reducing your position size by half." Was previously 5 / 0.35 (engineered
+	// guesses) — corrected to match the book exactly: 4 SLs → halve (0.5).
+	ConsecutiveSLCutoff = 4   // 4 consecutive SL hits → reduce capital (book p.191)
+	ReducedCapitalPct   = 0.5 // Reduce position size by half on contingency (book p.191)
 )
 
 // Data lookback windows
