@@ -49,9 +49,6 @@ func main() {
 	calendar.Refresh()
 
 	q := quotes.New()
-	macro := gate.NewMacro(q)
-	news := gate.NewNews()
-
 	// Broker selection: live Kite orders only when PAPER_MODE=false AND credentials
 	// are present; otherwise the simulated paper broker. The 30-day trial runs paper.
 	var b broker.Broker = broker.NewPaperBroker()
@@ -61,13 +58,26 @@ func main() {
 	}
 
 	eng := &engine.Engine{
-		Scraper:    scanner.NewScraper(config.BTSTScreener),
-		Broker:     b,
-		Store:      st,
-		Notify:     agents.SendTelegram,
-		Quotes:     q,
-		MacroGate:  macro.Check,
-		NewsFilter: news.Filter,
+		Scraper: scanner.NewScraper(config.BTSTScreener),
+		Broker:  b,
+		Store:   st,
+		Notify:  agents.SendTelegram,
+		Quotes:  q,
+	}
+
+	// Automated sentiment gates — OFF by default (manual approval replaces them).
+	if config.BTSTGateEnabled {
+		eng.MacroGate = gate.NewMacro(q).Check
+		eng.NewsFilter = gate.NewNews().Filter
+		log.Printf("[BTST] sentiment gates ENABLED")
+	}
+
+	// Manual BUY approval via Telegram — proposes the basket and waits for PROCEED.
+	if config.BTSTApprovalEnabled && config.TelegramBotToken != "" {
+		eng.ApproveBuy = func(_ context.Context, proposal string) bool {
+			return agents.RequestApproval(proposal, approvalDeadline())
+		}
+		log.Printf("[BTST] manual BUY approval ENABLED (deadline %s IST)", config.BTSTApprovalDeadline)
 	}
 
 	// ── Dashboard ──────────────────────────────────────────────────────
@@ -166,4 +176,12 @@ func modeTag() string {
 		return "PAPER"
 	}
 	return "LIVE"
+}
+
+// approvalDeadline returns today's BTST_APPROVAL_DEADLINE as an IST time — the
+// cutoff after which a missing reply auto-HOLDs. Kept before the 15:30 close.
+func approvalDeadline() time.Time {
+	h, m := config.ParseTime(config.BTSTApprovalDeadline)
+	now := config.NowIST()
+	return time.Date(now.Year(), now.Month(), now.Day(), h, m, 0, 0, config.IST)
 }

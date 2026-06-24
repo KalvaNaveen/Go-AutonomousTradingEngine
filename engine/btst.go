@@ -28,6 +28,11 @@ type Engine struct {
 	// whole day; NewsFilter drops individual symbols, returning a reason per drop.
 	MacroGate  func(ctx context.Context) (ok bool, reason string)
 	NewsFilter func(ctx context.Context, names map[string]string) (dropped map[string]string)
+
+	// ApproveBuy (optional) gates BUY placement on a human decision: it receives
+	// the proposed basket and returns true to PROCEED, false to HOLD. nil =
+	// unconditional placement. SELL is never gated.
+	ApproveBuy func(ctx context.Context, proposal string) bool
 }
 
 // RunEntry executes the 3:20 PM entry: scan → gates → equal-weight sizing →
@@ -89,17 +94,42 @@ func (e *Engine) RunEntry(ctx context.Context) error {
 	n := len(kept)
 	perStock := config.BTSTCapitalPerDay / float64(n)
 
-	var placed []model.Position
-	var deployed float64
+	// Build the proposed basket first (qty + estimated entry/SL), so it can be
+	// shown for approval before any order is placed.
+	var plan []planItem
+	var planDeployed float64
 	for _, s := range kept {
-		// Inject reference price for the paper broker (live ignores this).
-		if ps, ok := e.Broker.(broker.PriceSetter); ok {
-			ps.SetPrice(s.Symbol, s.Close)
-		}
 		qty := int(perStock / s.Close)
 		if qty < 1 {
 			dropped[s.Symbol] = "price > per-stock budget"
 			continue
+		}
+		plan = append(plan, planItem{stock: s, qty: qty, estSL: s.Close * (1 - config.BTSTStopLossPct/100)})
+		planDeployed += s.Close * float64(qty)
+	}
+	if len(plan) == 0 {
+		e.notify(fmt.Sprintf("⚠️ *BTST* — %s [%s]\nNo affordable stocks. No trades.", date, e.modeTag()))
+		return nil
+	}
+
+	// ── Manual BUY approval (Telegram) ─────────────────────────────────
+	if e.ApproveBuy != nil {
+		proposal := e.proposalReport(date, plan, planDeployed)
+		if !e.ApproveBuy(ctx, proposal) {
+			e.notify(fmt.Sprintf("🛑 *BTST HELD* — %s [%s]\nNot approved. No BUY orders placed.",
+				date, e.modeTag()))
+			return nil
+		}
+	}
+
+	// ── Place the approved basket ──────────────────────────────────────
+	var placed []model.Position
+	var deployed float64
+	for _, it := range plan {
+		s, qty := it.stock, it.qty
+		// Inject reference price for the paper broker (live ignores this).
+		if ps, ok := e.Broker.(broker.PriceSetter); ok {
+			ps.SetPrice(s.Symbol, s.Close)
 		}
 		orderID, fill, err := e.Broker.PlaceMarketBuy(s.Symbol, qty)
 		if err != nil {
@@ -125,6 +155,27 @@ func (e *Engine) RunEntry(ctx context.Context) error {
 
 	e.notify(e.entryReport(date, len(stocks), placed, deployed, dropped))
 	return nil
+}
+
+// planItem is one proposed BUY (set before placement, used for the approval message).
+type planItem struct {
+	stock scanner.Stock
+	qty   int
+	estSL float64
+}
+
+// proposalReport formats the basket sent to Telegram for human approval.
+func (e *Engine) proposalReport(date string, plan []planItem, deployed float64) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "🟡 *BTST — Approval needed* — %s [%s]\n", date, e.modeTag())
+	fmt.Fprintf(&b, "Proposed: %d stocks · ₹%s of ₹%s\n",
+		len(plan), commaINR(deployed), commaINR(config.BTSTCapitalPerDay))
+	b.WriteString("———\n")
+	for _, it := range plan {
+		fmt.Fprintf(&b, "`%-12s` qty:%d  ~entry:%.2f  ~SL:%.2f\n",
+			it.stock.Symbol, it.qty, it.stock.Close, it.estSL)
+	}
+	return b.String()
 }
 
 func (e *Engine) entryReport(date string, scanned int, placed []model.Position,

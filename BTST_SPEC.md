@@ -80,6 +80,16 @@ always  dashboard on :8085
 P1 scraper → P2 paper broker + entry → P3 exit + P&L store →
 P4 gates → P5 dashboard → P6 live Kite + deploy.
 
+## Manual BUY approval (v7) + gates OFF
+- Automated sentiment gates default OFF (`BTST_GATE_ENABLED=false`); code kept dormant.
+- At entry time the engine scans + sizes the basket, then sends it to Telegram and
+  waits for a `PROCEED`/`HOLD` reply (`agents.RequestApproval`, getUpdates polling,
+  authorized chat only). No reply by `BTST_APPROVAL_DEADLINE` (default 15:28 IST) →
+  auto-HOLD. BUY only; SELL (T+1 square-off) is never gated. Toggle: `BTST_APPROVAL`.
+- NSE timings (verified): pre-open 09:00–09:15, NORMAL 09:15–15:30 (only window for
+  market orders), closing 15:40–16:00. Entry/exit 15:20 sit before the 15:30 close —
+  deadline 15:28 leaves ~2 min to place market orders.
+
 ## Tier-2 news filter — two layers
 1. Keyword hard-block (severe terms + 48h recency) — always on, free.
 2. Optional LLM second opinion (`gate/llm.go`, Claude Haiku via raw HTTP) — enabled
