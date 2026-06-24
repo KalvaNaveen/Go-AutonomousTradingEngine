@@ -35,23 +35,34 @@ var (
 const newsRecencyHours = 48
 
 // News is the Tier-2 per-stock gate backed by Google News RSS (free, no auth).
+//
+// Two layers, in order:
+//  1. keyword hard-block — severe, unambiguous terms (fraud, raid, insolvency…),
+//     always on, zero cost.
+//  2. optional LLM second opinion (Haiku) — catches subtler materially-negative
+//     news the keyword list misses. Enabled only when an LLM client is wired.
 type News struct {
 	http *http.Client
+	LLM  *LLM // optional; nil = keyword-only
 }
 
-// NewNews builds the news filter.
+// NewNews builds the news filter. If BTST_NEWS_LLM=true and ANTHROPIC_API_KEY is
+// set, an LLM second-opinion layer is attached automatically.
 func NewNews() *News {
-	return &News{http: &http.Client{Timeout: 12 * time.Second}}
+	n := &News{http: &http.Client{Timeout: 12 * time.Second}}
+	if llm := NewLLMFromEnv(); llm != nil {
+		n.LLM = llm
+	}
+	return n
 }
 
-// Filter scans recent headlines for each stock and returns the symbols to DROP,
-// mapped to the matched reason. names maps symbol → company name (used to build a
-// better search query). Lookups run concurrently with a small worker bound.
+// Filter scans recent headlines per stock and returns the symbols to DROP, mapped
+// to the reason. names maps symbol → company name (for a better search query).
+// Keyword blocks happen first; surviving stocks with headlines are then sent to
+// the LLM (if configured) for a materially-negative second opinion.
 func (n *News) Filter(ctx context.Context, names map[string]string) map[string]string {
-	type result struct {
-		symbol, reason string
-	}
 	out := make(map[string]string)
+	survivors := make(map[string][]string) // symbol → headlines, for the LLM pass
 	var mu sync.Mutex
 
 	sem := make(chan struct{}, 6) // cap concurrent RSS fetches
@@ -62,19 +73,32 @@ func (n *News) Filter(ctx context.Context, names map[string]string) map[string]s
 		go func(sym, name string) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			if reason, bad := n.checkOne(ctx, sym, name); bad {
-				mu.Lock()
+			headlines, reason := n.fetchAndScreen(ctx, sym, name)
+			mu.Lock()
+			defer mu.Unlock()
+			if reason != "" {
 				out[sym] = reason
-				mu.Unlock()
+			} else if len(headlines) > 0 {
+				survivors[sym] = headlines
 			}
 		}(sym, name)
 	}
 	wg.Wait()
-	_ = result{}
+
+	// LLM second opinion on stocks that passed the keyword screen.
+	if n.LLM != nil && len(survivors) > 0 {
+		for sym, reason := range n.LLM.Classify(ctx, survivors) {
+			if _, already := out[sym]; !already {
+				out[sym] = reason
+			}
+		}
+	}
 	return out
 }
 
-func (n *News) checkOne(ctx context.Context, symbol, name string) (string, bool) {
+// fetchAndScreen pulls recent headlines for a stock, returns them, and a non-empty
+// keyword reason if a severe term matched a recent company-specific headline.
+func (n *News) fetchAndScreen(ctx context.Context, symbol, name string) (headlines []string, keywordReason string) {
 	q := name
 	if q == "" {
 		q = symbol
@@ -85,24 +109,22 @@ func (n *News) checkOne(ctx context.Context, symbol, name string) (string, bool)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rssURL, nil)
 	if err != nil {
-		return "", false
+		return nil, ""
 	}
 	req.Header.Set("User-Agent", "Mozilla/5.0")
 	resp, err := n.http.Do(req)
 	if err != nil {
-		return "", false // fail-open: news outage must not block trading
+		return nil, "" // fail-open: news outage must not block trading
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return "", false
+		return nil, ""
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 200*1024))
 	if err != nil {
-		return "", false
+		return nil, ""
 	}
 
-	// Scan each <item>: require recency (last 48h) AND a company mention AND a
-	// severe keyword. All three must hold to drop the stock.
 	cutoff := time.Now().Add(-newsRecencyHours * time.Hour)
 	company := strings.ToLower(firstWord(name))
 	sym := strings.ToLower(symbol)
@@ -113,7 +135,8 @@ func (n *News) checkOne(ctx context.Context, symbol, name string) (string, bool)
 		if tm == nil {
 			continue
 		}
-		title := strings.ToLower(tm[1])
+		rawTitle := strings.TrimSpace(tm[1])
+		title := strings.ToLower(rawTitle)
 
 		// Recency check — skip stale headlines.
 		if pm := pubDateRe.FindStringSubmatch(block); pm != nil {
@@ -126,13 +149,14 @@ func (n *News) checkOne(ctx context.Context, symbol, name string) (string, bool)
 		if !strings.Contains(title, company) && !strings.Contains(title, sym) {
 			continue
 		}
+		headlines = append(headlines, rawTitle)
 		for _, kw := range blockKeywords {
 			if strings.Contains(title, kw) {
-				return fmt.Sprintf("news: %q", strings.TrimSpace(kw)), true
+				return headlines, fmt.Sprintf("news: %q", strings.TrimSpace(kw))
 			}
 		}
 	}
-	return "", false
+	return headlines, ""
 }
 
 func firstWord(s string) string {

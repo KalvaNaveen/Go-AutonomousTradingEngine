@@ -32,3 +32,9 @@ type Broker interface {
 type PriceSetter interface {
 	SetPrice(symbol string, price float64)
 }
+
+// Compile-time guarantee both implementations satisfy the interface.
+var (
+	_ Broker = (*PaperBroker)(nil)
+	_ Broker = (*KiteBroker)(nil)
+)

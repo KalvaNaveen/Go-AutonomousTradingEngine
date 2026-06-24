@@ -52,9 +52,17 @@ func main() {
 	macro := gate.NewMacro(q)
 	news := gate.NewNews()
 
+	// Broker selection: live Kite orders only when PAPER_MODE=false AND credentials
+	// are present; otherwise the simulated paper broker. The 30-day trial runs paper.
+	var b broker.Broker = broker.NewPaperBroker()
+	if !config.PaperMode && config.KiteAPIKey != "" && config.KiteAccessToken != "" {
+		b = broker.NewKiteBroker()
+		log.Printf("[BTST] LIVE broker active — real Kite orders will be placed")
+	}
+
 	eng := &engine.Engine{
 		Scraper:    scanner.NewScraper(config.BTSTScreener),
-		Broker:     broker.NewPaperBroker(), // live KiteBroker swaps in here later
+		Broker:     b,
 		Store:      st,
 		Notify:     agents.SendTelegram,
 		Quotes:     q,

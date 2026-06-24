@@ -80,5 +80,19 @@ always  dashboard on :8085
 P1 scraper → P2 paper broker + entry → P3 exit + P&L store →
 P4 gates → P5 dashboard → P6 live Kite + deploy.
 
-## Open verification (non-blocking for paper)
-BTST + resting SL-M legality on Zerodha — confirm in P6. Paper uses software SL.
+## Tier-2 news filter — two layers
+1. Keyword hard-block (severe terms + 48h recency) — always on, free.
+2. Optional LLM second opinion (`gate/llm.go`, Claude Haiku via raw HTTP) — enabled
+   when `BTST_NEWS_LLM=true` and `ANTHROPIC_API_KEY` set. Batches surviving stocks'
+   headlines into one call, drops materially-negative names. Fails open on any error.
+
+## Live broker (broker/kite.go) — DORMANT
+Implements Broker via Kite Connect v3 REST (market BUY, SL-M, square-off, positions).
+Wired in cmd/btst but only selected when PAPER_MODE=false AND Kite creds present.
+UNVERIFIED against live API — smoke-test before going live; confirm BTST resting-SL-M
+legality on CNC (may need software SL fallback).
+
+## Open verification (before live)
+BTST + resting SL-M legality on Zerodha — confirm before flipping PAPER_MODE=false.
+Paper mode (and the safe live fallback) uses software-tracked SL. Tested in
+engine/exit_test.go (SL-breach, square-off, same-day-hold).

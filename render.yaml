@@ -20,6 +20,11 @@ services:
         value: "500000"
       - key: BTST_STOP_LOSS_PCT
         value: "6.5"
+      # Optional LLM news second-opinion (Tier-2). Off by default; set true + key to enable.
+      - key: BTST_NEWS_LLM
+        value: "false"
+      - key: ANTHROPIC_API_KEY
+        sync: false # only needed when BTST_NEWS_LLM=true
       # Secrets — set these in the Render dashboard, not here:
       - key: TELEGRAM_BOT_TOKEN
         sync: false
