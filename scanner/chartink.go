@@ -62,14 +62,43 @@ func NewScraper(screener string) *Scraper {
 	}
 	jar, _ := cookiejar.New(nil)
 	return &Scraper{
-		client:   &http.Client{Jar: jar, Timeout: 30 * time.Second},
+		client:   &http.Client{Jar: jar, Timeout: 20 * time.Second},
 		screener: screener,
 	}
 }
 
-// Fetch runs the screener and returns up to maxStocks cash-equity rows.
-// Index/ETF rows (bsecode == nil) are dropped. Order is preserved from ChartInk.
+// fetchAttempts is how many times Fetch retries a transient failure (ChartInk
+// can be briefly slow/unreachable). A once-daily trade shouldn't be lost to a
+// single network blip, so we retry with a short backoff before giving up.
+const fetchAttempts = 3
+
+// Fetch runs the screener and returns up to maxStocks cash-equity rows, retrying
+// transient failures. Index/ETF rows (bsecode == nil) are dropped.
 func (s *Scraper) Fetch(ctx context.Context, maxStocks int) ([]Stock, error) {
+	var lastErr error
+	for attempt := 1; attempt <= fetchAttempts; attempt++ {
+		stocks, err := s.fetchOnce(ctx, maxStocks)
+		if err == nil {
+			return stocks, nil
+		}
+		lastErr = err
+		if ctx.Err() != nil {
+			break // parent gave up — stop retrying
+		}
+		if attempt < fetchAttempts {
+			backoff := time.Duration(attempt*2) * time.Second
+			select {
+			case <-time.After(backoff):
+			case <-ctx.Done():
+				return nil, fmt.Errorf("chartink fetch cancelled: %w", ctx.Err())
+			}
+		}
+	}
+	return nil, fmt.Errorf("chartink fetch failed after %d attempts: %w", fetchAttempts, lastErr)
+}
+
+// fetchOnce performs a single scrape (bootstrap GET + process POST).
+func (s *Scraper) fetchOnce(ctx context.Context, maxStocks int) ([]Stock, error) {
 	csrf, clause, err := s.bootstrap(ctx)
 	if err != nil {
 		return nil, err
