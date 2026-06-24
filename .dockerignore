@@ -1,0 +1,12 @@
+.git
+.claude
+*.db
+*.exe
+book_pages
+book_full_text.txt
+*.png
+research/*.py
+*.ps1
+ocr_*
+render_*.py
+test_*.png

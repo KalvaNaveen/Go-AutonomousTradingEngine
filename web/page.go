@@ -1,0 +1,103 @@
+package web
+
+// dashboardHTML is the single-page BTST dashboard. It polls /api/summary every
+// 20s and renders stat cards + open/closed tables. Kept dependency-free (no CDN)
+// so it works on a locked-down free cloud box.
+const dashboardHTML = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BTST Dashboard</title>
+<style>
+  :root{--bg:#0d1117;--card:#161b22;--bd:#30363d;--fg:#e6edf3;--mut:#8b949e;--grn:#3fb950;--red:#f85149;--accent:#58a6ff;}
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:var(--bg);color:var(--fg);font:14px/1.5 -apple-system,Segoe UI,Roboto,sans-serif;padding:24px;max-width:1100px;margin:0 auto}
+  header{display:flex;align-items:center;gap:12px;margin-bottom:20px}
+  h1{font-size:20px;font-weight:600}
+  .badge{font-size:11px;font-weight:700;padding:3px 9px;border-radius:20px;letter-spacing:.5px}
+  .paper{background:#1f6feb33;color:var(--accent);border:1px solid var(--accent)}
+  .live{background:#f8514933;color:var(--red);border:1px solid var(--red)}
+  .muted{color:var(--mut);font-size:12px;margin-left:auto}
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:24px}
+  .card{background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:14px 16px}
+  .card .lbl{color:var(--mut);font-size:11px;text-transform:uppercase;letter-spacing:.5px}
+  .card .val{font-size:22px;font-weight:600;margin-top:4px}
+  h2{font-size:14px;margin:18px 0 8px;color:var(--mut);text-transform:uppercase;letter-spacing:.5px}
+  table{width:100%;border-collapse:collapse;background:var(--card);border:1px solid var(--bd);border-radius:10px;overflow:hidden}
+  th,td{text-align:right;padding:9px 12px;border-bottom:1px solid var(--bd);font-variant-numeric:tabular-nums}
+  th:first-child,td:first-child{text-align:left}
+  th{color:var(--mut);font-size:11px;text-transform:uppercase;font-weight:600}
+  tr:last-child td{border-bottom:none}
+  .sym{font-weight:600}
+  .pos{color:var(--grn)} .neg{color:var(--red)}
+  .sl{color:var(--red);font-size:11px}
+  .empty{color:var(--mut);padding:16px;text-align:center}
+</style>
+</head>
+<body>
+<header>
+  <h1>BTST Engine</h1>
+  <span id="mode" class="badge paper">…</span>
+  <span class="muted" id="updated"></span>
+</header>
+<div class="cards" id="cards"></div>
+<h2>Open Positions</h2>
+<div id="open"></div>
+<h2>Closed Trades</h2>
+<div id="closed"></div>
+
+<script>
+const inr = n => '₹' + Math.round(n).toLocaleString('en-IN');
+const cls = n => n > 0 ? 'pos' : n < 0 ? 'neg' : '';
+const sign = n => (n > 0 ? '+' : '') + n.toFixed(2);
+
+function card(lbl, val, klass='') {
+  return '<div class="card"><div class="lbl">'+lbl+'</div><div class="val '+klass+'">'+val+'</div></div>';
+}
+
+function openTable(rows){
+  if(!rows||!rows.length) return '<div class="empty">No open positions.</div>';
+  let h='<table><tr><th>Symbol</th><th>Qty</th><th>Entry</th><th>SL</th><th>Invested</th></tr>';
+  for(const p of rows)
+    h+='<tr><td class="sym">'+p.symbol+'</td><td>'+p.qty+'</td><td>'+p.entry_price.toFixed(2)
+      +'</td><td class="sl">'+p.sl_price.toFixed(2)+'</td><td>'+inr(p.invested)+'</td></tr>';
+  return h+'</table>';
+}
+
+function closedTable(rows){
+  if(!rows||!rows.length) return '<div class="empty">No closed trades yet.</div>';
+  let h='<table><tr><th>Symbol</th><th>Date</th><th>Entry</th><th>Exit</th><th>P&L</th><th>%</th></tr>';
+  for(const p of rows){
+    const slm = p.exit_reason==='stoploss' ? ' <span class="sl">⛔SL</span>' : '';
+    h+='<tr><td class="sym">'+p.symbol+'</td><td>'+p.trade_date+'</td><td>'+p.entry_price.toFixed(2)
+      +'</td><td>'+p.exit_price.toFixed(2)+slm+'</td><td class="'+cls(p.pnl)+'">'+sign(p.pnl)
+      +'</td><td class="'+cls(p.pnl)+'">'+sign(p.pnl_pct)+'%</td></tr>';
+  }
+  return h+'</table>';
+}
+
+async function load(){
+  try{
+    const s = await (await fetch('/api/summary')).json();
+    const m = document.getElementById('mode');
+    m.textContent = s.mode; m.className = 'badge ' + (s.mode==='LIVE'?'live':'paper');
+    document.getElementById('cards').innerHTML =
+      card('Open Positions', s.open_count) +
+      card('Deployed (open)', inr(s.open_invested)) +
+      card('Closed Trades', s.closed_count) +
+      card('Realised P&L', sign(s.realized_pnl), cls(s.realized_pnl)) +
+      card('Return', sign(s.return_pct)+'%', cls(s.return_pct)) +
+      card('Win Rate', s.win_rate.toFixed(0)+'%');
+    document.getElementById('open').innerHTML = openTable(s.open);
+    document.getElementById('closed').innerHTML = closedTable(s.closed);
+    document.getElementById('updated').textContent =
+      'Updated ' + new Date().toLocaleTimeString('en-IN') + ' · ' + s.today;
+  }catch(e){
+    document.getElementById('updated').textContent = 'Error: ' + e;
+  }
+}
+load(); setInterval(load, 20000);
+</script>
+</body>
+</html>`

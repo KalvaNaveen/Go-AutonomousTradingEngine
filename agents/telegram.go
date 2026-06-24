@@ -16,15 +16,6 @@ import (
 	"bnf_go_engine/config"
 )
 
-// ComputeEMA21 — alias for EMA20 (kept for test compatibility).
-func ComputeEMA21(closes []float64) float64 {
-	s := computeEMASeries(closes, config.EMA20Period)
-	if len(s) == 0 {
-		return 0
-	}
-	return s[len(s)-1]
-}
-
 var telegramMu sync.Mutex
 
 // SendTelegram sends a Markdown-formatted message to all configured Telegram chat IDs.

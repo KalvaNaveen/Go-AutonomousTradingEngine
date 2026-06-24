@@ -23,3 +23,8 @@ dashboard/dist/
 # IDE
 .vscode/
 .idea/
+
+# Test / demo databases at repo root
+*.db
+*.db-wal
+*.db-shm

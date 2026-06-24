@@ -1,0 +1,55 @@
+# Render deployment blueprint for the BTST engine.
+# Free tier sleeps on inactivity — UptimeRobot (see DEPLOY.md) keeps it awake so
+# the 15:20 IST scheduler always fires.
+services:
+  - type: web
+    name: btst-engine
+    runtime: docker
+    plan: free
+    healthCheckPath: /
+    envVars:
+      - key: PORT
+        value: "8085"
+      - key: PAPER_MODE
+        value: "true" # flip to false only after the 30-day paper run
+      - key: BTST_DB
+        value: /app/data/btst.db
+      - key: BTST_SCREENER
+        value: pur-ema10-20
+      - key: BTST_CAPITAL_PER_DAY
+        value: "500000"
+      - key: BTST_STOP_LOSS_PCT
+        value: "6.5"
+      # Automated sentiment gates OFF — manual Telegram BUY approval replaces them.
+      - key: BTST_GATE_ENABLED
+        value: "false"
+      # Manual BUY approval: engine proposes the basket, buys only on PROCEED reply.
+      - key: BTST_APPROVAL
+        value: "true"
+      - key: BTST_APPROVAL_DEADLINE
+        value: "15:28" # auto-HOLD if no reply by this IST time (before 15:30 close)
+      # Optional LLM news second-opinion (only used if gates are re-enabled).
+      - key: BTST_NEWS_LLM
+        value: "false"
+      - key: ANTHROPIC_API_KEY
+        sync: false # only needed when BTST_NEWS_LLM=true
+      # Secrets — set these in the Render dashboard, not here:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_IDS
+        sync: false
+      # Kite creds only needed for live mode (PAPER_MODE=false):
+      - key: KITE_API_KEY
+        sync: false
+      - key: KITE_API_SECRET
+        sync: false
+      - key: ZERODHA_USER_ID
+        sync: false
+      - key: ZERODHA_PASSWORD
+        sync: false
+      - key: ZERODHA_TOTP_SECRET
+        sync: false
+    disk:
+      name: btst-data
+      mountPath: /app/data
+      sizeGB: 1
