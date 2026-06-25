@@ -35,6 +35,8 @@ const dashboardHTML = `<!DOCTYPE html>
   .empty{color:var(--mut);padding:16px;text-align:center}
   #runbtn{background:var(--card);color:var(--accent);border:1px solid var(--accent);border-radius:8px;padding:6px 12px;font-size:12px;font-weight:600;cursor:pointer}
   #runbtn:hover{background:#1f6feb22}
+  #histdate{background:var(--card);color:var(--fg);border:1px solid var(--bd);border-radius:8px;padding:6px 10px;font-size:13px}
+  .hsub{color:var(--mut);font-size:12px;margin:10px 0 6px;text-transform:uppercase;letter-spacing:.5px}
 </style>
 </head>
 <body>
@@ -51,6 +53,9 @@ const dashboardHTML = `<!DOCTYPE html>
 <div id="open"></div>
 <h2>Closed Trades</h2>
 <div id="closed"></div>
+<h2>History</h2>
+<div style="margin-bottom:10px"><select id="histdate"><option value="">Loading dates…</option></select></div>
+<div id="hist"></div>
 
 <script>
 const inr = n => '₹' + Math.round(n).toLocaleString('en-IN');
@@ -136,7 +141,44 @@ async function runNow(){
   }catch(e){ alert('Error: ' + e); }
   finally{ btn.disabled = false; btn.textContent = '▶ Run scan now'; setTimeout(load, 1500); }
 }
+function histPositions(rows){
+  if(!rows||!rows.length) return '<div class="empty">No positions this day.</div>';
+  let h='<table><tr><th>Symbol</th><th>Qty</th><th>Entry</th><th>Exit</th><th>P&L</th><th>Status</th></tr>';
+  for(const p of rows){
+    const closed = !!p.exit_price;
+    const slm = p.exit_reason==='stoploss' ? ' <span class="sl">⛔SL</span>' : '';
+    h+='<tr><td class="sym">'+p.symbol+'</td><td>'+p.qty+'</td><td>'+p.entry_price.toFixed(2)
+      +'</td><td>'+(closed? p.exit_price.toFixed(2)+slm : '—')
+      +'</td><td class="'+(closed?cls(p.pnl):'')+'">'+(closed? sign(p.pnl):'—')
+      +'</td><td>'+(closed?'<span class="'+cls(p.pnl)+'">closed</span>':'<span style="color:#d29922">open</span>')+'</td></tr>';
+  }
+  return h+'</table>';
+}
+
+async function loadHistory(date){
+  const box = document.getElementById('hist');
+  if(!date){ box.innerHTML=''; return; }
+  try{
+    const h = await (await fetch('/api/history?date='+encodeURIComponent(date))).json();
+    box.innerHTML =
+      '<div class="hsub">Scan'+(h.scan_time?' — '+h.scan_time+' IST':'')+'</div>' + scanTable(h.scan) +
+      '<div class="hsub">Trades  ·  Net P&L: <span class="'+cls(h.net_pnl)+'">'+sign(h.net_pnl)+'</span></div>' + histPositions(h.positions);
+  }catch(e){ box.innerHTML = '<div class="empty">Error: '+e+'</div>'; }
+}
+
+async function loadDates(){
+  try{
+    const dates = await (await fetch('/api/dates')).json();
+    const sel = document.getElementById('histdate');
+    if(!dates || !dates.length){ sel.innerHTML='<option value="">No history yet</option>'; return; }
+    sel.innerHTML = dates.map(d=>'<option value="'+d+'">'+d+'</option>').join('');
+    sel.onchange = () => loadHistory(sel.value);
+    loadHistory(dates[0]);
+  }catch(e){ document.getElementById('histdate').innerHTML='<option>Error</option>'; }
+}
+
 load(); setInterval(load, 20000);
+loadDates(); setInterval(loadDates, 60000);
 </script>
 </body>
 </html>`

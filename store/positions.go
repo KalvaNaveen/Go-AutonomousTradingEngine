@@ -175,6 +175,30 @@ func (s *Store) ScanByDate(date string) ([]ScanRow, error) {
 	return out, rows.Err()
 }
 
+// Dates returns every date that has a scan or any positions, newest first —
+// used to populate the dashboard's history selector.
+func (s *Store) Dates() ([]string, error) {
+	rows, err := s.db.Query(`
+SELECT d FROM (
+    SELECT scan_date AS d FROM scans
+    UNION
+    SELECT trade_date AS d FROM positions
+) GROUP BY d ORDER BY d DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var d string
+		if err := rows.Scan(&d); err != nil {
+			return nil, err
+		}
+		out = append(out, d)
+	}
+	return out, rows.Err()
+}
+
 // PurgeDate removes all positions and scan rows for a date — used by a forced
 // manual re-run so today's data starts clean.
 func (s *Store) PurgeDate(date string) error {

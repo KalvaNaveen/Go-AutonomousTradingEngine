@@ -39,10 +39,49 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", s.handleIndex)
 	mux.HandleFunc("/api/summary", s.handleSummary)
+	mux.HandleFunc("/api/dates", s.handleDates)
+	mux.HandleFunc("/api/history", s.handleHistory)
 	if s.trigger != nil {
 		mux.HandleFunc("/api/run", s.handleRun)
 	}
 	return mux
+}
+
+// handleDates returns the list of dates that have scan/trade data (newest first).
+func (s *Server) handleDates(w http.ResponseWriter, r *http.Request) {
+	dates, err := s.store.Dates()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(dates)
+}
+
+// handleHistory returns one date's scan list + the positions entered that day.
+func (s *Server) handleHistory(w http.ResponseWriter, r *http.Request) {
+	date := r.URL.Query().Get("date")
+	if date == "" {
+		http.Error(w, "date required", http.StatusBadRequest)
+		return
+	}
+	scan, _ := s.store.ScanByDate(date)
+	scanTime, _ := s.store.ScanTime(date)
+	pos, _ := s.store.PositionsByDate(date)
+
+	out := struct {
+		Date      string          `json:"date"`
+		ScanTime  string          `json:"scan_time"`
+		Scan      []store.ScanRow `json:"scan"`
+		Positions []positionView  `json:"positions"`
+		NetPnL    float64         `json:"net_pnl"`
+	}{Date: date, ScanTime: scanTime, Scan: scan}
+	for _, p := range pos {
+		out.Positions = append(out.Positions, view(p))
+		out.NetPnL += p.PnL
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(out)
 }
 
 // handleRun fires a manual scan+trade. Requires ?token=<BTST_TRIGGER_TOKEN>.
