@@ -1,6 +1,12 @@
-# Render deployment blueprint for the BTST engine.
+# Render deployment blueprint for the BTST engine (FREE tier).
 # Free tier sleeps on inactivity — UptimeRobot (see DEPLOY.md) keeps it awake so
 # the 15:20 IST scheduler always fires.
+#
+# NOTE: free tier has NO persistent disk, so the SQLite DB lives in the container's
+# ephemeral filesystem and is wiped on every restart/redeploy. That's fine for the
+# paper trial — Telegram entry/exit reports are the durable record; the dashboard
+# shows data since the last restart. For full persistence, move to a paid plan and
+# re-add a `disk:` block mounted at /app/data.
 services:
   - type: web
     name: btst-engine
@@ -13,7 +19,7 @@ services:
       - key: PAPER_MODE
         value: "true" # flip to false only after the 30-day paper run
       - key: BTST_DB
-        value: /app/data/btst.db
+        value: /app/data/btst.db # ephemeral on free tier (no disk mounted)
       - key: BTST_SCREENER
         value: pur-ema10-20
       - key: BTST_CAPITAL_PER_DAY
@@ -49,7 +55,3 @@ services:
         sync: false
       - key: ZERODHA_TOTP_SECRET
         sync: false
-    disk:
-      name: btst-data
-      mountPath: /app/data
-      sizeGB: 1
