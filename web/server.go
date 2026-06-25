@@ -66,6 +66,11 @@ type summary struct {
 	WinRate      float64        `json:"win_rate"`
 	Open         []positionView `json:"open"`
 	Closed       []positionView `json:"closed"`
+
+	ScanDate     string          `json:"scan_date"`
+	ScannedCount int             `json:"scanned_count"`
+	TradedCount  int             `json:"traded_count"`
+	Scan         []store.ScanRow `json:"scan"`
 }
 
 func view(p model.Position) positionView {
@@ -122,6 +127,20 @@ func (s *Server) handleSummary(w http.ResponseWriter, r *http.Request) {
 	}
 	if out.ClosedCount > 0 {
 		out.WinRate = float64(out.Wins) / float64(out.ClosedCount) * 100
+	}
+
+	// Most recent daily scan (scanned vs traded vs dropped/held).
+	if d, err := s.store.LatestScanDate(); err == nil && d != "" {
+		if scan, err := s.store.ScanByDate(d); err == nil {
+			out.ScanDate = d
+			out.Scan = scan
+			out.ScannedCount = len(scan)
+			for _, r := range scan {
+				if r.Outcome == "traded" {
+					out.TradedCount++
+				}
+			}
+		}
 	}
 
 	w.Header().Set("Content-Type", "application/json")

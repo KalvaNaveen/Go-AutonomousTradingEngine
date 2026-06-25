@@ -85,6 +85,7 @@ func (e *Engine) RunEntry(ctx context.Context) error {
 		}
 	}
 	if len(kept) == 0 {
+		e.recordScan(date, stocks, nil, dropped, false)
 		e.notify(fmt.Sprintf("⚠️ *BTST* — %s [%s]\nAll %d stocks dropped by news filter. No trades.",
 			date, e.modeTag(), len(stocks)))
 		return nil
@@ -108,6 +109,7 @@ func (e *Engine) RunEntry(ctx context.Context) error {
 		planDeployed += s.Close * float64(qty)
 	}
 	if len(plan) == 0 {
+		e.recordScan(date, stocks, nil, dropped, false)
 		e.notify(fmt.Sprintf("⚠️ *BTST* — %s [%s]\nNo affordable stocks. No trades.", date, e.modeTag()))
 		return nil
 	}
@@ -116,6 +118,7 @@ func (e *Engine) RunEntry(ctx context.Context) error {
 	if e.ApproveBuy != nil {
 		proposal := e.proposalReport(date, plan, planDeployed)
 		if !e.ApproveBuy(ctx, proposal) {
+			e.recordScan(date, stocks, nil, dropped, true)
 			e.notify(fmt.Sprintf("🛑 *BTST HELD* — %s [%s]\nNot approved. No BUY orders placed.",
 				date, e.modeTag()))
 			return nil
@@ -153,8 +156,41 @@ func (e *Engine) RunEntry(ctx context.Context) error {
 		deployed += p.Invested()
 	}
 
+	tradedSet := make(map[string]bool, len(placed))
+	for _, p := range placed {
+		tradedSet[p.Symbol] = true
+	}
+	e.recordScan(date, stocks, tradedSet, dropped, false)
+
 	e.notify(e.entryReport(date, len(stocks), placed, deployed, dropped))
 	return nil
+}
+
+// recordScan persists the day's scanned stocks and their outcome (traded /
+// dropped+reason / held) so the dashboard can show the full scan, not just trades.
+func (e *Engine) recordScan(date string, stocks []scanner.Stock, traded map[string]bool, dropped map[string]string, held bool) {
+	if e.Store == nil {
+		return
+	}
+	rows := make([]store.ScanRow, 0, len(stocks))
+	for _, s := range stocks {
+		r := store.ScanRow{Date: date, Symbol: s.Symbol, Close: s.Close, Outcome: "dropped"}
+		switch {
+		case traded[s.Symbol]:
+			r.Outcome = "traded"
+		case dropped[s.Symbol] != "":
+			r.Reason = dropped[s.Symbol]
+		case held:
+			r.Outcome, r.Reason = "held", "not approved"
+		default:
+			r.Outcome = "dropped"
+		}
+		rows = append(rows, r)
+	}
+	if err := e.Store.SaveScan(date, rows); err != nil {
+		// Non-fatal: scan history is observability, not trade-critical.
+		e.notify(fmt.Sprintf("⚠️ scan record failed for %s: %v", date, err))
+	}
 }
 
 // planItem is one proposed BUY (set before placement, used for the approval message).
