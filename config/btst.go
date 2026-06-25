@@ -39,6 +39,11 @@ var (
 	// BTSTApprovalDeadline is the HH:MM IST cutoff for a reply; must leave room
 	// before the 15:30 NSE close so market orders still execute. Default 15:28.
 	BTSTApprovalDeadline = envStr("BTST_APPROVAL_DEADLINE", "15:28")
+
+	// BTSTTriggerToken protects the manual /api/run endpoint (scan+trade on demand,
+	// for testing outside 15:20). Empty = endpoint DISABLED (safe default — the
+	// dashboard URL is public). Set a long random value to enable.
+	BTSTTriggerToken = envStr("BTST_TRIGGER_TOKEN", "")
 )
 
 // ── NSE session timings (verified against nseindia.com, not assumed) ─────────

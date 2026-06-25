@@ -33,12 +33,15 @@ const dashboardHTML = `<!DOCTYPE html>
   .pos{color:var(--grn)} .neg{color:var(--red)}
   .sl{color:var(--red);font-size:11px}
   .empty{color:var(--mut);padding:16px;text-align:center}
+  #runbtn{background:var(--card);color:var(--accent);border:1px solid var(--accent);border-radius:8px;padding:6px 12px;font-size:12px;font-weight:600;cursor:pointer}
+  #runbtn:hover{background:#1f6feb22}
 </style>
 </head>
 <body>
 <header>
   <h1>BTST Engine</h1>
   <span id="mode" class="badge paper">…</span>
+  <button id="runbtn" onclick="runNow()" title="Manual scan + trade (needs trigger token)">▶ Run scan now</button>
   <span class="muted" id="updated"></span>
 </header>
 <div class="cards" id="cards"></div>
@@ -115,6 +118,20 @@ async function load(){
   }catch(e){
     document.getElementById('updated').textContent = 'Error: ' + e;
   }
+}
+async function runNow(){
+  let t = localStorage.getItem('btst_token') || '';
+  t = prompt('Trigger token (BTST_TRIGGER_TOKEN):', t);
+  if(!t) return;
+  localStorage.setItem('btst_token', t);
+  const btn = document.getElementById('runbtn');
+  btn.disabled = true; btn.textContent = '⏳ running…';
+  try{
+    const r = await fetch('/api/run?force=1&token=' + encodeURIComponent(t));
+    const msg = await r.text();
+    alert(r.ok ? msg : ('Failed: ' + r.status + ' ' + msg));
+  }catch(e){ alert('Error: ' + e); }
+  finally{ btn.disabled = false; btn.textContent = '▶ Run scan now'; setTimeout(load, 1500); }
 }
 load(); setInterval(load, 20000);
 </script>

@@ -34,6 +34,10 @@ services:
         value: "true"
       - key: BTST_APPROVAL_DEADLINE
         value: "15:28" # auto-HOLD if no reply by this IST time (before 15:30 close)
+      # Manual scan+trade trigger (/api/run). Empty = disabled. Set a long random
+      # secret in the Render dashboard to enable testing outside 15:20.
+      - key: BTST_TRIGGER_TOKEN
+        sync: false
       # Optional LLM news second-opinion (only used if gates are re-enabled).
       - key: BTST_NEWS_LLM
         value: "false"

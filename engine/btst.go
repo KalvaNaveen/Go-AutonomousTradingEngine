@@ -35,13 +35,34 @@ type Engine struct {
 	ApproveBuy func(ctx context.Context, proposal string) bool
 }
 
+// forceKeyT marks a context as a forced manual run.
+type forceKeyT struct{}
+
+// WithForceEntry marks ctx so RunEntry bypasses the once-per-day guard and
+// re-runs cleanly (purging today's positions + scan first). Used by the manual
+// /api/run trigger for repeated testing.
+func WithForceEntry(ctx context.Context) context.Context {
+	return context.WithValue(ctx, forceKeyT{}, true)
+}
+
+func forced(ctx context.Context) bool {
+	v, _ := ctx.Value(forceKeyT{}).(bool)
+	return v
+}
+
 // RunEntry executes the 3:20 PM entry: scan → gates → equal-weight sizing →
-// BUY + SL → persist → Telegram report. It is idempotent per trade date.
+// BUY + SL → persist → Telegram report. It is idempotent per trade date, unless
+// the context is marked WithForceEntry (manual re-run).
 func (e *Engine) RunEntry(ctx context.Context) error {
 	now := config.NowIST()
 	date := now.Format("2006-01-02")
 
-	if done, err := e.Store.HasEntryFor(date); err != nil {
+	if forced(ctx) {
+		// Clean slate so a manual re-test doesn't duplicate today's rows.
+		if err := e.Store.PurgeDate(date); err != nil {
+			return fmt.Errorf("force purge: %w", err)
+		}
+	} else if done, err := e.Store.HasEntryFor(date); err != nil {
 		return fmt.Errorf("entry idempotency check: %w", err)
 	} else if done {
 		e.notify(fmt.Sprintf("ℹ️ BTST entry for %s already done — skipping duplicate run.", date))

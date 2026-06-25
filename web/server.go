@@ -16,8 +16,10 @@ import (
 
 // Server wraps the store and serves the dashboard.
 type Server struct {
-	store *store.Store
-	paper bool
+	store   *store.Store
+	paper   bool
+	trigger func(force bool) string // manual scan+trade; nil = disabled
+	token   string                  // required query token for /api/run
 }
 
 // New builds a dashboard server. paper controls the mode badge.
@@ -25,12 +27,35 @@ func New(st *store.Store, paper bool) *Server {
 	return &Server{store: st, paper: paper}
 }
 
+// SetTrigger enables the token-protected manual /api/run endpoint. fn runs the
+// scan+trade (async) and returns a short status string.
+func (s *Server) SetTrigger(token string, fn func(force bool) string) {
+	s.token = token
+	s.trigger = fn
+}
+
 // Handler returns the HTTP mux for the dashboard.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", s.handleIndex)
 	mux.HandleFunc("/api/summary", s.handleSummary)
+	if s.trigger != nil {
+		mux.HandleFunc("/api/run", s.handleRun)
+	}
 	return mux
+}
+
+// handleRun fires a manual scan+trade. Requires ?token=<BTST_TRIGGER_TOKEN>.
+// ?force=1 re-runs cleanly (purges today's rows first).
+func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
+	if s.token == "" || r.URL.Query().Get("token") != s.token {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	force := r.URL.Query().Get("force") == "1"
+	msg := s.trigger(force)
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	fmt.Fprintln(w, msg)
 }
 
 // ListenAndServe starts the dashboard on addr (e.g. ":8085").

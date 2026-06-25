@@ -126,6 +126,16 @@ func (s *Store) ScanByDate(date string) ([]ScanRow, error) {
 	return out, rows.Err()
 }
 
+// PurgeDate removes all positions and scan rows for a date — used by a forced
+// manual re-run so today's data starts clean.
+func (s *Store) PurgeDate(date string) error {
+	if _, err := s.db.Exec(`DELETE FROM positions WHERE trade_date=?`, date); err != nil {
+		return err
+	}
+	_, err := s.db.Exec(`DELETE FROM scans WHERE scan_date=?`, date)
+	return err
+}
+
 // SaveOpen inserts a newly-opened position and returns its assigned ID.
 func (s *Store) SaveOpen(p *model.Position) error {
 	res, err := s.db.Exec(`

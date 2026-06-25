@@ -73,9 +73,15 @@ func main() {
 	}
 
 	// Manual BUY approval via Telegram — proposes the basket and waits for PROCEED.
+	// A manual /api/run trigger injects a short deadline via context (see below);
+	// the scheduled 15:20 run uses the configured BTST_APPROVAL_DEADLINE.
 	if config.BTSTApprovalEnabled && config.TelegramBotToken != "" {
-		eng.ApproveBuy = func(_ context.Context, proposal string) bool {
-			return agents.RequestApproval(proposal, approvalDeadline())
+		eng.ApproveBuy = func(ctx context.Context, proposal string) bool {
+			dl := approvalDeadline()
+			if d, ok := ctx.Value(manualDeadlineKey{}).(time.Time); ok {
+				dl = d
+			}
+			return agents.RequestApproval(proposal, dl)
 		}
 		log.Printf("[BTST] manual BUY approval ENABLED (deadline %s IST)", config.BTSTApprovalDeadline)
 	}
@@ -86,6 +92,29 @@ func main() {
 		port = "8085"
 	}
 	srv := web.New(st, config.PaperMode)
+
+	// Manual scan+trade trigger (testing outside 15:20). Token-protected; uses a
+	// short 6-minute approval window so the Telegram round-trip can be tested live.
+	if config.BTSTTriggerToken != "" {
+		srv.SetTrigger(config.BTSTTriggerToken, func(force bool) string {
+			go func() {
+				ctx := context.WithValue(context.Background(), manualDeadlineKey{},
+					config.NowIST().Add(6*time.Minute))
+				if force {
+					ctx = engine.WithForceEntry(ctx)
+				}
+				cctx, cancel := context.WithTimeout(ctx, 8*time.Minute)
+				defer cancel()
+				log.Printf("[BTST] manual trigger fired (force=%v)", force)
+				if err := eng.RunEntry(cctx); err != nil {
+					log.Printf("[BTST] manual run error: %v", err)
+					agents.SendTelegram("🚨 *Manual run error*: " + err.Error())
+				}
+			}()
+			return "triggered — check Telegram for the approval message"
+		})
+		log.Printf("[BTST] manual /api/run trigger ENABLED")
+	}
 	go func() {
 		log.Printf("[BTST] dashboard on :%s", port)
 		if err := http.ListenAndServe(":"+port, srv.Handler()); err != nil {
@@ -177,6 +206,10 @@ func modeTag() string {
 	}
 	return "LIVE"
 }
+
+// manualDeadlineKey carries a short approval deadline for manual /api/run
+// triggers so testing doesn't wait until the fixed 15:28 cutoff.
+type manualDeadlineKey struct{}
 
 // approvalDeadline returns today's BTST_APPROVAL_DEADLINE as an IST time — the
 // cutoff after which a missing reply auto-HOLDs. Kept before the 15:30 close.
