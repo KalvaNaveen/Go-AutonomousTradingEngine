@@ -1,26 +1,47 @@
-// Package store persists BTST positions to SQLite (open trades, then closed
-// trades with realised P&L). It is the single source of truth for the dashboard
-// and for next-day square-off, surviving restarts on the cloud box.
+// Package store persists BTST positions (open trades, then closed trades with
+// realised P&L). It is the single source of truth for the dashboard and for the
+// next-day square-off.
+//
+// Backend is chosen at Open: if TURSO_DATABASE_URL is set it uses Turso (libSQL,
+// durable, free tier) so position records survive restarts/redeploys — required
+// for an overnight BTST hold on an ephemeral free cloud box. Otherwise it falls
+// back to a local SQLite file (dev/paper). libSQL is SQLite-compatible, so the
+// same schema and queries work unchanged.
 package store
 
 import (
 	"database/sql"
 	"fmt"
+	"os"
 	"time"
 
 	"bnf_go_engine/model"
 
+	_ "github.com/tursodatabase/libsql-client-go/libsql"
 	_ "modernc.org/sqlite"
 )
 
-// Store wraps the SQLite database.
+// Store wraps the database.
 type Store struct {
 	db *sql.DB
 }
 
-// Open opens (and migrates) the positions database at path.
+// Open opens (and migrates) the positions database. If TURSO_DATABASE_URL is set,
+// it connects to Turso (durable); otherwise it opens the local SQLite file at path.
 func Open(path string) (*Store, error) {
-	db, err := sql.Open("sqlite", path)
+	driver, dsn := "sqlite", path
+	if url := os.Getenv("TURSO_DATABASE_URL"); url != "" {
+		driver = "libsql"
+		dsn = url
+		if tok := os.Getenv("TURSO_AUTH_TOKEN"); tok != "" {
+			sep := "?"
+			if containsRune(url, '?') {
+				sep = "&"
+			}
+			dsn = url + sep + "authToken=" + tok
+		}
+	}
+	db, err := sql.Open(driver, dsn)
 	if err != nil {
 		return nil, err
 	}
@@ -30,6 +51,15 @@ func Open(path string) (*Store, error) {
 		return nil, err
 	}
 	return s, nil
+}
+
+func containsRune(s string, r rune) bool {
+	for _, c := range s {
+		if c == r {
+			return true
+		}
+	}
+	return false
 }
 
 // Close closes the database.

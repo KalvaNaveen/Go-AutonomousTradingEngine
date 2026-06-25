@@ -45,6 +45,11 @@ func main() {
 		log.Fatalf("[BTST] store: %v", err)
 	}
 	defer st.Close()
+	if os.Getenv("TURSO_DATABASE_URL") != "" {
+		log.Printf("[BTST] storage: Turso (durable)")
+	} else {
+		log.Printf("[BTST] storage: local SQLite %s (EPHEMERAL — set TURSO_* for durability)", dbPath)
+	}
 
 	calendar.Refresh()
 

@@ -19,7 +19,13 @@ services:
       - key: PAPER_MODE
         value: "true" # flip to false only after the 30-day paper run
       - key: BTST_DB
-        value: /app/data/btst.db # ephemeral on free tier (no disk mounted)
+        value: /app/data/btst.db # local fallback only; used when TURSO_* unset
+      # Durable storage (Turso / libSQL, free tier) — REQUIRED so overnight BTST
+      # positions survive restarts/redeploys. Set both in the Render dashboard.
+      - key: TURSO_DATABASE_URL
+        sync: false # e.g. libsql://btst-<org>.turso.io
+      - key: TURSO_AUTH_TOKEN
+        sync: false
       - key: BTST_SCREENER
         value: pur-ema10-20
       - key: BTST_CAPITAL_PER_DAY
