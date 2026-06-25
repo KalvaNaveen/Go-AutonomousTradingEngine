@@ -42,6 +42,8 @@ const dashboardHTML = `<!DOCTYPE html>
   <span class="muted" id="updated"></span>
 </header>
 <div class="cards" id="cards"></div>
+<h2 id="scanhdr">Today's Scan</h2>
+<div id="scan"></div>
 <h2>Open Positions</h2>
 <div id="open"></div>
 <h2>Closed Trades</h2>
@@ -62,6 +64,20 @@ function openTable(rows){
   for(const p of rows)
     h+='<tr><td class="sym">'+p.symbol+'</td><td>'+p.qty+'</td><td>'+p.entry_price.toFixed(2)
       +'</td><td class="sl">'+p.sl_price.toFixed(2)+'</td><td>'+inr(p.invested)+'</td></tr>';
+  return h+'</table>';
+}
+
+function scanBadge(o){
+  if(o==='traded') return '<span class="pos">● traded</span>';
+  if(o==='held')   return '<span style="color:#d29922">● held</span>';
+  return '<span style="color:var(--mut)">● dropped</span>';
+}
+function scanTable(rows){
+  if(!rows||!rows.length) return '<div class="empty">No scan yet today. The 15:20 IST scan will appear here.</div>';
+  let h='<table><tr><th>Symbol</th><th>Close</th><th>Status</th><th>Reason</th></tr>';
+  for(const r of rows)
+    h+='<tr><td class="sym">'+r.symbol+'</td><td>'+r.close.toFixed(2)+'</td><td>'
+      +scanBadge(r.outcome)+'</td><td style="color:var(--mut)">'+(r.reason||'')+'</td></tr>';
   return h+'</table>';
 }
 
@@ -89,6 +105,9 @@ async function load(){
       card('Realised P&L', sign(s.realized_pnl), cls(s.realized_pnl)) +
       card('Return', sign(s.return_pct)+'%', cls(s.return_pct)) +
       card('Win Rate', s.win_rate.toFixed(0)+'%');
+    document.getElementById('scanhdr').textContent =
+      'Today’s Scan' + (s.scan_date ? ' — ' + s.scan_date + '  (' + s.traded_count + '/' + s.scanned_count + ' traded)' : '');
+    document.getElementById('scan').innerHTML = scanTable(s.scan);
     document.getElementById('open').innerHTML = openTable(s.open);
     document.getElementById('closed').innerHTML = closedTable(s.closed);
     document.getElementById('updated').textContent =

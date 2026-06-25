@@ -54,8 +54,76 @@ CREATE TABLE IF NOT EXISTS positions (
     pnl         REAL
 );
 CREATE INDEX IF NOT EXISTS idx_status ON positions(status);
-CREATE INDEX IF NOT EXISTS idx_trade_date ON positions(trade_date);`)
+CREATE INDEX IF NOT EXISTS idx_trade_date ON positions(trade_date);
+
+CREATE TABLE IF NOT EXISTS scans (
+    scan_date TEXT    NOT NULL,
+    symbol    TEXT    NOT NULL,
+    close     REAL    NOT NULL,
+    outcome   TEXT    NOT NULL,  -- traded | dropped | held
+    reason    TEXT,
+    PRIMARY KEY (scan_date, symbol)
+);
+CREATE INDEX IF NOT EXISTS idx_scan_date ON scans(scan_date);`)
 	return err
+}
+
+// ScanRow is one stock from a day's ChartInk scan and what happened to it.
+type ScanRow struct {
+	Date    string  `json:"date"`
+	Symbol  string  `json:"symbol"`
+	Close   float64 `json:"close"`
+	Outcome string  `json:"outcome"` // traded | dropped | held
+	Reason  string  `json:"reason,omitempty"`
+}
+
+// SaveScan replaces the scan record for a date (idempotent across re-runs).
+func (s *Store) SaveScan(date string, rows []ScanRow) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM scans WHERE scan_date=?`, date); err != nil {
+		tx.Rollback()
+		return err
+	}
+	for _, r := range rows {
+		if _, err := tx.Exec(`INSERT INTO scans (scan_date, symbol, close, outcome, reason)
+			VALUES (?, ?, ?, ?, ?)`, date, r.Symbol, r.Close, r.Outcome, r.Reason); err != nil {
+			tx.Rollback()
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// LatestScanDate returns the most recent scan_date, or "" if none.
+func (s *Store) LatestScanDate() (string, error) {
+	var d sql.NullString
+	err := s.db.QueryRow(`SELECT MAX(scan_date) FROM scans`).Scan(&d)
+	if err != nil {
+		return "", err
+	}
+	return d.String, nil
+}
+
+// ScanByDate returns all scanned rows for a date (preserving insertion order).
+func (s *Store) ScanByDate(date string) ([]ScanRow, error) {
+	rows, err := s.db.Query(`SELECT scan_date, symbol, close, outcome, COALESCE(reason,'')
+		FROM scans WHERE scan_date=? ORDER BY rowid`, date)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ScanRow
+	for rows.Next() {
+		var r ScanRow
+		if err := rows.Scan(&r.Date, &r.Symbol, &r.Close, &r.Outcome, &r.Reason); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
 }
 
 // SaveOpen inserts a newly-opened position and returns its assigned ID.
