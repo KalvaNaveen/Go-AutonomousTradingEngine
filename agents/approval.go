@@ -33,10 +33,10 @@ func RequestApproval(proposal string, deadline time.Time) bool {
 	// Establish the update offset BEFORE sending, so we ignore old messages.
 	offset := latestUpdateID() + 1
 
-	SendTelegram(proposal + fmt.Sprintf(
-		"\n\n*Reply* `PROCEED` to buy or `HOLD` to skip.\nAuto-HOLD at *%s* IST if no reply.",
-		deadline.In(config.IST).Format("15:04")))
-	log.Printf("[Approval] Awaiting PROCEED/HOLD until %s IST", deadline.In(config.IST).Format("15:04"))
+	hhmm := deadline.In(config.IST).Format("15:04")
+	text := proposal + fmt.Sprintf("\n\nTap a button below (or reply PROCEED/HOLD).\nAuto-HOLD at *%s* IST if no response.", hhmm)
+	sendApprovalKeyboard(text)
+	log.Printf("[Approval] Awaiting PROCEED/HOLD until %s IST", hhmm)
 
 	authorized := map[string]bool{}
 	for _, id := range config.TelegramChatIDs {
@@ -47,27 +47,76 @@ func RequestApproval(proposal string, deadline time.Time) bool {
 		updates, next := pollUpdates(offset)
 		offset = next
 		for _, u := range updates {
+			// Inline-button tap (preferred).
+			if cq := u.CallbackQuery; cq != nil {
+				chatID := fmt.Sprintf("%d", cq.Message.Chat.ID)
+				if !authorized[chatID] {
+					continue
+				}
+				answerCallback(cq.ID)
+				switch cq.Data {
+				case "btst_proceed":
+					log.Printf("[Approval] PROCEED (button) from %s", chatID)
+					SendTelegram("✅ *PROCEED* — placing BUY orders.")
+					return true
+				case "btst_hold":
+					log.Printf("[Approval] HOLD (button) from %s", chatID)
+					SendTelegram("🛑 *HOLD* — no trades today.")
+					return false
+				}
+				continue
+			}
+			// Typed reply (fallback).
 			chatID := fmt.Sprintf("%d", u.Message.Chat.ID)
 			if !authorized[chatID] {
 				continue
 			}
-			text := strings.ToLower(strings.TrimSpace(u.Message.Text))
-			if matchesAny(text, proceedWords) {
-				log.Printf("[Approval] PROCEED received from %s", chatID)
+			reply := strings.ToLower(strings.TrimSpace(u.Message.Text))
+			if matchesAny(reply, proceedWords) {
+				log.Printf("[Approval] PROCEED (text) from %s", chatID)
 				SendTelegram("✅ *PROCEED received* — placing BUY orders.")
 				return true
 			}
-			if matchesAny(text, holdWords) {
-				log.Printf("[Approval] HOLD received from %s", chatID)
+			if matchesAny(reply, holdWords) {
+				log.Printf("[Approval] HOLD (text) from %s", chatID)
 				SendTelegram("🛑 *HOLD received* — no trades today.")
 				return false
 			}
 		}
 		time.Sleep(2 * time.Second)
 	}
-	log.Println("[Approval] Deadline passed with no reply — auto-HOLD")
-	SendTelegram("⏰ *No reply by deadline* — auto-HOLD, no trades today.")
+	log.Println("[Approval] Deadline passed with no response — auto-HOLD")
+	SendTelegram("⏰ *No response by deadline* — auto-HOLD, no trades today.")
 	return false
+}
+
+// sendApprovalKeyboard posts the proposal with PROCEED / HOLD inline buttons to
+// every authorized chat.
+func sendApprovalKeyboard(text string) {
+	if config.TelegramBotToken == "" {
+		log.Printf("[ALERT] %s", text)
+		return
+	}
+	markup := `{"inline_keyboard":[[{"text":"✅ PROCEED","callback_data":"btst_proceed"},{"text":"🛑 HOLD","callback_data":"btst_hold"}]]}`
+	api := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", config.TelegramBotToken)
+	for _, chatID := range config.TelegramChatIDs {
+		http.PostForm(api, url.Values{
+			"chat_id":      {chatID},
+			"text":         {text},
+			"parse_mode":   {"Markdown"},
+			"reply_markup": {markup},
+		})
+		time.Sleep(200 * time.Millisecond)
+	}
+}
+
+// answerCallback acknowledges a button tap so Telegram clears the loading state.
+func answerCallback(callbackID string) {
+	if config.TelegramBotToken == "" {
+		return
+	}
+	api := fmt.Sprintf("https://api.telegram.org/bot%s/answerCallbackQuery", config.TelegramBotToken)
+	http.PostForm(api, url.Values{"callback_query_id": {callbackID}})
 }
 
 func matchesAny(text string, words []string) bool {
@@ -89,6 +138,15 @@ type tgUpdate struct {
 			ID int64 `json:"id"`
 		} `json:"chat"`
 	} `json:"message"`
+	CallbackQuery *struct {
+		ID      string `json:"id"`
+		Data    string `json:"data"`
+		Message struct {
+			Chat struct {
+				ID int64 `json:"id"`
+			} `json:"chat"`
+		} `json:"message"`
+	} `json:"callback_query"`
 }
 
 // latestUpdateID returns the highest pending update_id (0 if none), used to skip
