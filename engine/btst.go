@@ -208,7 +208,7 @@ func (e *Engine) recordScan(date string, stocks []scanner.Stock, traded map[stri
 		}
 		rows = append(rows, r)
 	}
-	if err := e.Store.SaveScan(date, rows); err != nil {
+	if err := e.Store.SaveScan(date, config.NowIST(), rows); err != nil {
 		// Non-fatal: scan history is observability, not trade-critical.
 		e.notify(fmt.Sprintf("⚠️ scan record failed for %s: %v", date, err))
 	}

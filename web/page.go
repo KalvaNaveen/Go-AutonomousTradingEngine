@@ -109,7 +109,10 @@ async function load(){
       card('Return', sign(s.return_pct)+'%', cls(s.return_pct)) +
       card('Win Rate', s.win_rate.toFixed(0)+'%');
     document.getElementById('scanhdr').textContent =
-      'Today’s Scan' + (s.scan_date ? ' — ' + s.scan_date + '  (' + s.traded_count + '/' + s.scanned_count + ' traded)' : '');
+      'Today’s Scan' + (s.scan_date
+        ? ' — ' + s.scan_date + (s.scan_time ? ' ' + s.scan_time : '')
+          + ' IST  (' + s.traded_count + '/' + s.scanned_count + ' traded)'
+        : '');
     document.getElementById('scan').innerHTML = scanTable(s.scan);
     document.getElementById('open').innerHTML = openTable(s.open);
     document.getElementById('closed').innerHTML = closedTable(s.closed);

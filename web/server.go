@@ -93,6 +93,7 @@ type summary struct {
 	Closed       []positionView `json:"closed"`
 
 	ScanDate     string          `json:"scan_date"`
+	ScanTime     string          `json:"scan_time"`
 	ScannedCount int             `json:"scanned_count"`
 	TradedCount  int             `json:"traded_count"`
 	Scan         []store.ScanRow `json:"scan"`
@@ -158,6 +159,7 @@ func (s *Server) handleSummary(w http.ResponseWriter, r *http.Request) {
 	if d, err := s.store.LatestScanDate(); err == nil && d != "" {
 		if scan, err := s.store.ScanByDate(d); err == nil {
 			out.ScanDate = d
+			out.ScanTime, _ = s.store.ScanTime(d)
 			out.Scan = scan
 			out.ScannedCount = len(scan)
 			for _, r := range scan {

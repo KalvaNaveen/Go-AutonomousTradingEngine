@@ -87,15 +87,31 @@ CREATE INDEX IF NOT EXISTS idx_status ON positions(status);
 CREATE INDEX IF NOT EXISTS idx_trade_date ON positions(trade_date);
 
 CREATE TABLE IF NOT EXISTS scans (
-    scan_date TEXT    NOT NULL,
-    symbol    TEXT    NOT NULL,
-    close     REAL    NOT NULL,
-    outcome   TEXT    NOT NULL,  -- traded | dropped | held
-    reason    TEXT,
+    scan_date  TEXT    NOT NULL,
+    symbol     TEXT    NOT NULL,
+    close      REAL    NOT NULL,
+    outcome    TEXT    NOT NULL,  -- traded | dropped | held
+    reason     TEXT,
+    scanned_at TEXT,              -- HH:MM:SS IST when the scan ran
     PRIMARY KEY (scan_date, symbol)
 );
 CREATE INDEX IF NOT EXISTS idx_scan_date ON scans(scan_date);`)
-	return err
+	if err != nil {
+		return err
+	}
+	// Best-effort add for a pre-existing scans table; ignore "duplicate column".
+	_, _ = s.db.Exec(`ALTER TABLE scans ADD COLUMN scanned_at TEXT`)
+	return nil
+}
+
+// ScanTime returns the HH:MM:SS IST time the scan for date ran ("" if none).
+func (s *Store) ScanTime(date string) (string, error) {
+	var t sql.NullString
+	err := s.db.QueryRow(`SELECT scanned_at FROM scans WHERE scan_date=? LIMIT 1`, date).Scan(&t)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	return t.String, err
 }
 
 // ScanRow is one stock from a day's ChartInk scan and what happened to it.
@@ -108,7 +124,10 @@ type ScanRow struct {
 }
 
 // SaveScan replaces the scan record for a date (idempotent across re-runs).
-func (s *Store) SaveScan(date string, rows []ScanRow) error {
+// scannedAt records the moment the scan ran, shown on the dashboard so it can be
+// compared against ChartInk at the same instant.
+func (s *Store) SaveScan(date string, scannedAt time.Time, rows []ScanRow) error {
+	at := scannedAt.Format("15:04:05")
 	tx, err := s.db.Begin()
 	if err != nil {
 		return err
@@ -118,8 +137,8 @@ func (s *Store) SaveScan(date string, rows []ScanRow) error {
 		return err
 	}
 	for _, r := range rows {
-		if _, err := tx.Exec(`INSERT INTO scans (scan_date, symbol, close, outcome, reason)
-			VALUES (?, ?, ?, ?, ?)`, date, r.Symbol, r.Close, r.Outcome, r.Reason); err != nil {
+		if _, err := tx.Exec(`INSERT INTO scans (scan_date, symbol, close, outcome, reason, scanned_at)
+			VALUES (?, ?, ?, ?, ?, ?)`, date, r.Symbol, r.Close, r.Outcome, r.Reason, at); err != nil {
 			tx.Rollback()
 			return err
 		}
