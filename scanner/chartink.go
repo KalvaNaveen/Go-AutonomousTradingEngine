@@ -19,6 +19,7 @@ import (
 	"net/http/cookiejar"
 	"net/url"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 )
@@ -139,16 +140,22 @@ func (s *Scraper) fetchOnce(ctx context.Context, maxStocks int) ([]Stock, error)
 		return nil, fmt.Errorf("decode process JSON: %w", err)
 	}
 
-	stocks := make([]Stock, 0, maxStocks)
+	// /process returns rows ordered by CLOSE (descending price) — NOT the
+	// %-change order the ChartInk UI shows. Collect everything, sort by daily
+	// %-change high→low to match the screener view, THEN take the top N.
+	stocks := make([]Stock, 0, len(out.Data))
 	for _, st := range out.Data {
 		if st.BSECode == nil || st.Symbol == "" {
 			continue // index/ETF pseudo-row
 		}
 		st.Source = s.screener
 		stocks = append(stocks, st)
-		if len(stocks) >= maxStocks {
-			break
-		}
+	}
+	sort.SliceStable(stocks, func(i, j int) bool {
+		return stocks[i].PerChange > stocks[j].PerChange
+	})
+	if len(stocks) > maxStocks {
+		stocks = stocks[:maxStocks]
 	}
 	return stocks, nil
 }
