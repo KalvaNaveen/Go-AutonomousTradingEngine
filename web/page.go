@@ -211,10 +211,11 @@ function chart(daily){
 
 function openTable(rows){
   if(!rows||!rows.length) return '<div class="empty">No holdings yet — the 15:20 IST cycle (or ▶ Run scan) fills this.</div>';
-  let h='<tr><th>Instrument</th><th>Qty</th><th>Entry</th><th>LTP</th><th>Peak</th><th>Trail SL</th><th>P&L</th><th>%</th></tr>';
+  let h='<tr><th>Instrument</th><th>Bought at</th><th>Qty</th><th>Entry</th><th>LTP</th><th>Peak</th><th>Trail SL</th><th>P&L</th><th>%</th></tr>';
   for(const p of rows){
     const carry = p.carry_count>0 ? '<span class="carry">↻'+p.carry_count+'</span>' : '';
-    h+='<tr><td>'+inst(p.symbol, p.entry_at||p.trade_date, carry)+'</td><td>'+p.qty+'</td><td>'+f2(p.entry_price)
+    h+='<tr><td>'+inst(p.symbol, '', carry)+'</td><td class="dimtxt">'+(p.entry_at||p.trade_date)
+      +'</td><td>'+p.qty+'</td><td>'+f2(p.entry_price)
       +'</td><td><b>'+f2(p.last_price)+'</b></td><td class="dimtxt">'+f2(p.peak_price)
       +'</td><td class="sl">'+f2(p.sl_price)
       +'</td><td class="'+cls(p.unreal_pnl||0)+'"><b>'+sign(p.unreal_pnl||0)+'</b></td><td>'+pill(p.unreal_pct||0)+'</td></tr>';
@@ -234,13 +235,14 @@ function scanTable(rows){
 
 function closedTable(rows){
   if(!rows||!rows.length) return '<div class="empty">No closed trades yet.</div>';
-  let h='<tr><th>Instrument</th><th>Exit at</th><th>Entry</th><th>Exit</th><th>Reason</th><th>Gross</th><th>Charges</th><th>Net P&L</th><th>Net %</th></tr>';
+  let h='<tr><th>Instrument</th><th>Bought at</th><th>Sold at</th><th>Entry</th><th>Exit</th><th>Reason</th><th>Gross</th><th>Charges</th><th>Net P&L</th><th>Net %</th></tr>';
   for(const p of rows){
     const rsn = p.exit_reason==='stoploss' ? '<span class="sl">SL hit</span>' : '<span class="dimtxt">square-off</span>';
-    h+='<tr><td>'+inst(p.symbol, p.entry_at||p.trade_date)+'</td><td class="dimtxt">'+(p.exit_at||'')
+    h+='<tr><td>'+inst(p.symbol)+'</td><td class="dimtxt">'+(p.entry_at||p.trade_date)
+      +'</td><td class="dimtxt">'+(p.exit_at||'')
       +'</td><td>'+f2(p.entry_price)+'</td><td>'+f2(p.exit_price)+'</td><td>'+rsn
       +'</td><td class="'+cls(p.pnl)+'">'+sign(p.pnl)
-      +'</td><td class="dimtxt">'+f2(p.charges||0)
+      +'</td><td class="dimtxt">₹'+f2(p.charges||0)
       +'</td><td class="'+cls(p.net_pnl||0)+'"><b>'+sign(p.net_pnl||0)+'</b></td><td>'+pill(p.net_pct||0)+'</td></tr>';
   }
   return wrapT(h);

@@ -128,7 +128,38 @@ CREATE INDEX IF NOT EXISTS idx_sl_pos ON sl_events(position_id);`)
 	} {
 		_, _ = s.db.Exec(stmt)
 	}
+	s.backfillCharges()
 	return nil
+}
+
+// backfillCharges computes CNC charges for trades closed before the charges
+// feature existed (charges NULL/0). Deterministic from entry/exit turnover, so
+// historical rows can be repaired exactly. Runs once per missing row.
+func (s *Store) backfillCharges() {
+	rows, err := s.db.Query(`
+SELECT id, qty, entry_price, COALESCE(exit_price,0)
+  FROM positions
+ WHERE status='closed' AND COALESCE(charges,0)=0 AND COALESCE(exit_price,0)>0`)
+	if err != nil {
+		return
+	}
+	type row struct {
+		id          int64
+		qty         int
+		entry, exit float64
+	}
+	var todo []row
+	for rows.Next() {
+		var r row
+		if rows.Scan(&r.id, &r.qty, &r.entry, &r.exit) == nil {
+			todo = append(todo, r)
+		}
+	}
+	rows.Close()
+	for _, r := range todo {
+		c := model.CNCCharges(r.entry*float64(r.qty), r.exit*float64(r.qty))
+		_, _ = s.db.Exec(`UPDATE positions SET charges=? WHERE id=?`, c, r.id)
+	}
 }
 
 // ScanTime returns the HH:MM:SS IST time the scan for date ran ("" if none).
