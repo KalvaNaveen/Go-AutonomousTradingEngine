@@ -2,11 +2,9 @@
 # Free tier sleeps on inactivity — UptimeRobot (see DEPLOY.md) keeps it awake so
 # the 15:20 IST scheduler always fires.
 #
-# NOTE: free tier has NO persistent disk, so the SQLite DB lives in the container's
-# ephemeral filesystem and is wiped on every restart/redeploy. That's fine for the
-# paper trial — Telegram entry/exit reports are the durable record; the dashboard
-# shows data since the last restart. For full persistence, move to a paid plan and
-# re-add a `disk:` block mounted at /app/data.
+# NOTE: free tier has NO persistent disk. Set TURSO_* below for durable storage
+# (positions must survive restarts for the overnight BTST hold). Without it, the
+# local SQLite DB is ephemeral and wiped on every restart/redeploy.
 services:
   - type: web
     name: btst-engine
@@ -32,14 +30,9 @@ services:
         value: "500000"
       - key: BTST_STOP_LOSS_PCT
         value: "6.5"
-      # Automated sentiment gates OFF — manual Telegram BUY approval replaces them.
+      # Automated sentiment gates OFF by default.
       - key: BTST_GATE_ENABLED
         value: "false"
-      # Manual BUY approval: engine proposes the basket, buys only on PROCEED reply.
-      - key: BTST_APPROVAL
-        value: "true"
-      - key: BTST_APPROVAL_DEADLINE
-        value: "15:28" # auto-HOLD if no reply by this IST time (before 15:30 close)
       # Manual scan+trade trigger (/api/run). Empty = disabled. Set a long random
       # secret in the Render dashboard to enable testing outside 15:20.
       - key: BTST_TRIGGER_TOKEN
@@ -49,11 +42,6 @@ services:
         value: "false"
       - key: ANTHROPIC_API_KEY
         sync: false # only needed when BTST_NEWS_LLM=true
-      # Secrets — set these in the Render dashboard, not here:
-      - key: TELEGRAM_BOT_TOKEN
-        sync: false
-      - key: TELEGRAM_CHAT_IDS
-        sync: false
       # Kite creds only needed for live mode (PAPER_MODE=false):
       - key: KITE_API_KEY
         sync: false

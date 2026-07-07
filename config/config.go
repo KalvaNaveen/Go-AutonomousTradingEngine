@@ -74,12 +74,6 @@ var (
 	ZerodhaTOTPSecret = envStr("ZERODHA_TOTP_SECRET", "")
 )
 
-// ── Telegram ────────────────────────────────────────────────
-var (
-	TelegramBotToken = envStr("TELEGRAM_BOT_TOKEN", "")
-	TelegramChatIDs  []string
-)
-
 // ── Dashboard / API ─────────────────────────────────────────
 // DashboardAPIToken protects the JSON endpoints exposed by api.Server
 // (positions, trades, status, ws/live). When empty, auth is disabled —
@@ -106,17 +100,8 @@ func Reload() {
 	ZerodhaPassword = envStr("ZERODHA_PASSWORD", "")
 	ZerodhaTOTPSecret = envStr("ZERODHA_TOTP_SECRET", "")
 
-	TelegramBotToken = envStr("TELEGRAM_BOT_TOKEN", "")
 	DashboardAPIToken = envStr("DASHBOARD_API_TOKEN", "")
 	DashboardAllowedOrigin = envStr("DASHBOARD_ALLOWED_ORIGIN", "http://127.0.0.1:8085")
-	TelegramChatIDs = nil
-	raw := envStr("TELEGRAM_CHAT_IDS", "")
-	for _, id := range strings.Split(raw, ",") {
-		id = strings.TrimSpace(id)
-		if id != "" {
-			TelegramChatIDs = append(TelegramChatIDs, id)
-		}
-	}
 }
 
 // ── Capital ─────────────────────────────────────────────────
@@ -157,7 +142,6 @@ const (
 	RegimeLookbackDays = 1825
 )
 
-
 // ATHProximityPct: stock must be within this % of its 52-week high to pass the
 // Phase 2 filter. Configurable via env ATH_PROXIMITY_PCT (default 10%).
 // BOOK IS SILENT on a number — Ankur Patel says only "buy near highs" and frames it as
@@ -188,7 +172,7 @@ var (
 	// Book gives ranges (p.181): short-term 1-2%, positional 4-8%; author personal 2.5%.
 	// TA expertise: swing trades sit between intraday and positional → 3-5% is the correct
 	// band (survives normal noise without whipsaw). Also the best fit from backtest history.
-	SLFloorPct  = 3.0 // SL never tighter than this % (avoids noise stop-out)
+	SLFloorPct   = 3.0 // SL never tighter than this % (avoids noise stop-out)
 	SLCeilingPct = 5.0 // SL never wider than this % (user hard limit)
 
 )
@@ -246,7 +230,7 @@ func LoadOverride(path string) {
 // between SLFloorPct and SLCeilingPct below the entry price.
 func ComputeStructuralSL(entryPrice, prevCandleLow float64) float64 {
 	structural := prevCandleLow * 0.998
-	floor := entryPrice * (1 - SLFloorPct/100)   // tightest allowed
+	floor := entryPrice * (1 - SLFloorPct/100)     // tightest allowed
 	ceiling := entryPrice * (1 - SLCeilingPct/100) // widest allowed
 	sl := structural
 	if sl > floor {
@@ -322,12 +306,11 @@ func ComputeATR(highs, lows, closes []float64, period int) float64 {
 // Section VII: Exits — EMA-based mechanical exit
 // EMA10 = fast trend filter; EMA20 = trend confirmation and exit trigger.
 const (
-	EMA10Period        = 10 // Fast EMA — entry signal
-	EMA20Period        = 20 // Trend EMA — exit trigger (close below = sell)
+	EMA10Period = 10 // Fast EMA — entry signal
+	EMA20Period = 20 // Trend EMA — exit trigger (close below = sell)
 	// RedCandlesBelowEMA: book Ch.6 — single EOD close below EMA = exit.
 	RedCandlesBelowEMA = 1
 )
-
 
 // ── Book Ch.3 / Ch.11: Trigger Candle thresholds ────────────────────────────
 // A trigger candle marks the START of momentum — a young stock's launch day.
@@ -343,7 +326,7 @@ const (
 // "If a stock is 30–35% away from the 50 EMA, don't buy." (Ch.3 p.49-52)
 // Prevents buying into parabolic/extended stocks with unfavorable risk-reward.
 const (
-	EMA50Period       = 50   // 50-day EMA — extension reference
+	EMA50Period = 50 // 50-day EMA — extension reference
 
 	Extension50EMAPct = 30.0 // skip if LTP > EMA50 × 1.30
 )
@@ -378,7 +361,6 @@ const GapUpFilterPct = 3.0
 
 // (Minimum cash-reserve constant removed — the book caps deployment only via
 //  open-risk 4-5% and position count 8-12, not a fixed cash buffer.)
-
 
 // ── Book Ch.9: Weekly chart alignment (p.220) ─────────────────────────────────
 // "Before entering on the daily chart, check the weekly chart is also in uptrend
@@ -445,7 +427,7 @@ const (
 //   3. Previous Day's % Change ≤ 3.5%
 //   4. Previous Day's % Change ≥ -3.5%
 const (
-	TightRangeTodayMaxPct  = 2.5
+	TightRangeTodayMaxPct     = 2.5
 	TightRangeYesterdayMaxPct = 3.5
 )
 
@@ -456,8 +438,8 @@ const (
 //  trustworthy."
 // Used as a base-quality enhancer: signals near a recent pocket pivot get a boost.
 const (
-	PocketPivotLookback   = 10  // window of past N days to scan for highest down-day vol
-	PocketPivotSignalDays = 5   // signal is considered "close to" pivot if within N days
+	PocketPivotLookback   = 10 // window of past N days to scan for highest down-day vol
+	PocketPivotSignalDays = 5  // signal is considered "close to" pivot if within N days
 )
 
 // ── Book Ch.6 p.171-172: Downside Pivot Exit ──────────────────────────────────
@@ -470,9 +452,9 @@ const (
 //  could be too big for this type of trade."
 // Used as an OPTIONAL alternative to structural SL; selected per-strategy.
 const (
-	ATRPeriod            = 14  // standard ATR window
-	ATRStopMultiplier    = 1.0 // 1 ATR away from entry
-	ATRMiniBaseMaxMult   = 1.0 // mini bases: SL ≤ 1 ATR
+	ATRPeriod          = 14  // standard ATR window
+	ATRStopMultiplier  = 1.0 // 1 ATR away from entry
+	ATRMiniBaseMaxMult = 1.0 // mini bases: SL ≤ 1 ATR
 )
 
 // ── Book Ch.10 p.257: 3-Session Net New Highs Breadth Confirmation ────────────
@@ -484,16 +466,15 @@ const (
 	BreadthConfirmationSessions = 3 // need 3 consecutive sessions for a regime shift
 )
 
-
 // ── Book Ch.4 p.127: Higher Low in Base (quality filter) ──────────────────────
 // "During a basing period, it's important to spot signs of buying interest. One
 //  clear signal is when the stock's price keeps forming higher lows. This pattern
 //  shows that confident investors are buying and holding onto the stock."
 // Quality enhancer: require at least one higher low in the recent base window.
 const (
-	HigherLowBaseLookback   = 40 // ~2 months of base bars to scan
-	HigherLowMinSwings      = 2  // need ≥2 swing lows to check progression
-	HigherLowMinSeparation  = 5  // min bars between successive swing lows
+	HigherLowBaseLookback  = 40 // ~2 months of base bars to scan
+	HigherLowMinSwings     = 2  // need ≥2 swing lows to check progression
+	HigherLowMinSeparation = 5  // min bars between successive swing lows
 )
 
 // ── Book Ch.4 p.137: Breakout Attempts Quality Filter ─────────────────────────
@@ -502,12 +483,11 @@ const (
 // TATAINVEST example (Ch.4 p.138): "tried breaking out twice before finally doing
 // so on 17 November 2023. The breakout led to a 44% surge in just three days."
 const (
-	BreakoutAttemptsLookback        = 60  // ~3 months base window to scan
-	BreakoutAttemptsMinRequired     = 1   // require ≥1 prior attempt for higher conviction
-	BreakoutAttemptsProximityPct    = 1.0 // touching within 1% of recent high counts as "attempt"
-	BreakoutAttemptsFailRetracePct  = 2.0 // attempt must have closed back ≥2% below the high
+	BreakoutAttemptsLookback       = 60  // ~3 months base window to scan
+	BreakoutAttemptsMinRequired    = 1   // require ≥1 prior attempt for higher conviction
+	BreakoutAttemptsProximityPct   = 1.0 // touching within 1% of recent high counts as "attempt"
+	BreakoutAttemptsFailRetracePct = 2.0 // attempt must have closed back ≥2% below the high
 )
-
 
 // ── Book Ch.8: Risk-based position sizing ────────────────────────────────────
 // "Quantity = Risk / (Entry − Stop-Loss)"  where Risk = Capital × RiskPerTradePct
@@ -519,7 +499,6 @@ const (
 	MaxOpenRiskPct     = 4.0 // cap: total open risk across all positions ≤ 4%
 	MaxDrawdownHaltPct = 7.0 // halt new trades when drawdown > 7% (p.205: "keep below 5-7%")
 )
-
 
 // ── Instrument Tokens ───────────────────────────────────────
 // Universe: Nifty Total Market 750 (Nifty 500 + Nifty Microcap 250).
@@ -600,6 +579,6 @@ func PrintBanner() {
 	fmt.Printf("  Strategy: EMA Pullback Bounce (Ch.3)\n")
 	fmt.Printf("  SL: %.1f-%.1f%% structural\n", SLFloorPct, SLCeilingPct)
 	fmt.Printf("  EMA%d (fast) + EMA%d (trend) | Exit: close below EMA%d\n", EMA10Period, EMA20Period, EMA20Period)
-	fmt.Printf("  Lookback: %d days | Alerts via Telegram\n", EODLookbackDays)
+	fmt.Printf("  Lookback: %d days | Reports via log + dashboard\n", EODLookbackDays)
 	fmt.Println("═══════════════════════════════════════════")
 }

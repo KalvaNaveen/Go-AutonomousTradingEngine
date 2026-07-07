@@ -25,7 +25,7 @@ func (e *Engine) WithQuotes(q quoteSource) *Engine { e.Quotes = q; return e }
 // For each open position whose trade date is before today, it fetches the day's
 // OHLC: if the low breached the software stop-loss, the exit is booked at the SL
 // price (reason stoploss); otherwise it squares off at the current price (reason
-// squareoff). Realised P&L is persisted and a Telegram exit report is sent.
+// squareoff). Realised P&L is persisted and an exit report is emitted.
 //
 // includeToday=true ignores the "must be a prior trade date" guard — used only
 // for testing a same-session round-trip.
@@ -91,7 +91,7 @@ func (e *Engine) RunExit(ctx context.Context, includeToday bool) error {
 	}
 
 	if len(closed) == 0 && len(skipped) == 0 {
-		return nil // nothing eligible — silent (no spurious Telegram)
+		return nil // nothing eligible — silent (no spurious report)
 	}
 	e.notify(e.exitReport(today, closed, skipped))
 	return nil

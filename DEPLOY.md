@@ -5,14 +5,15 @@ A single Go binary (`cmd/btst`) that:
 - serves the dashboard on `$PORT` (default 8085),
 - every trading day at `BTST_ENTRY_TIME` (default 15:20 IST) squares off the prior
   day's positions, then scrapes `pur-ema10-20` and places equal-weight ₹5L/N trades,
-- reports to Telegram and persists to SQLite.
+- reports to the log + dashboard and persists to Turso (or local SQLite fallback).
 
 ## Render (free tier)
 1. Push this repo to GitHub.
 2. In Render: **New → Blueprint**, point at this repo. It reads `render.yaml`.
-3. Set the secret env vars (not in the blueprint): `TELEGRAM_BOT_TOKEN`,
-   `TELEGRAM_CHAT_IDS`, and — only for live mode — the `KITE_*` / `ZERODHA_*` creds.
-4. Deploy. Confirm the dashboard URL loads and Telegram gets the "online" message.
+3. Set the secret env vars (not in the blueprint): `TURSO_DATABASE_URL` +
+   `TURSO_AUTH_TOKEN` (durable storage) and — only for live mode — the
+   `KITE_*` / `ZERODHA_*` creds.
+4. Deploy. Confirm the dashboard URL loads and the log shows `[BTST] online`.
 
 `PAPER_MODE=true` is the default. **Do not flip to `false` until the 30-day paper
 run is reviewed.** (Live order placement via KiteBroker is a later phase; until then

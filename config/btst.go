@@ -26,19 +26,9 @@ var (
 	BTSTVIXMax = envFloat("BTST_VIX_MAX", 20.0)
 	// BTSTNiftyDropPct: skip if Nifty 50 is down more than this % intraday.
 	BTSTNiftyDropPct = envFloat("BTST_NIFTY_DROP_PCT", 1.5)
-	// BTSTGateEnabled: master switch for the automated sentiment gate. Default OFF —
-	// the manual Telegram BUY approval (below) replaces it. The gate code is kept
-	// dormant and can be re-enabled with BTST_GATE_ENABLED=true.
+	// BTSTGateEnabled: master switch for the automated sentiment gate. Default OFF.
+	// The gate code is kept dormant and can be re-enabled with BTST_GATE_ENABLED=true.
 	BTSTGateEnabled = envBool("BTST_GATE_ENABLED", false)
-
-	// ── Manual BUY approval (Telegram) ──────────────────────────────────
-	// When enabled, the engine proposes the day's basket to Telegram at the entry
-	// time and places BUY orders ONLY after a PROCEED reply. No reply by the
-	// deadline → auto-HOLD (skip the day). SELL (T+1 square-off) is never gated.
-	BTSTApprovalEnabled = envBool("BTST_APPROVAL", true)
-	// BTSTApprovalDeadline is the HH:MM IST cutoff for a reply; must leave room
-	// before the 15:30 NSE close so market orders still execute. Default 15:28.
-	BTSTApprovalDeadline = envStr("BTST_APPROVAL_DEADLINE", "15:28")
 
 	// BTSTTriggerToken protects the manual /api/run endpoint (scan+trade on demand,
 	// for testing outside 15:20). Empty = endpoint DISABLED (safe default — the

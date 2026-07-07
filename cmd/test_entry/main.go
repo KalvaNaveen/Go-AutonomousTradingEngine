@@ -1,5 +1,5 @@
 // P2 test: run a full paper-mode 3:20 entry against the live pur-ema10-20 list.
-// Prints the Telegram report to stdout and dumps the persisted open positions.
+// Prints the report to stdout and dumps the persisted open positions.
 package main
 
 import (

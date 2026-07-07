@@ -1,7 +1,7 @@
 # BTST Auto-Trade Engine — Build Spec (v6, locked)
 
 > Single Go binary that scans ChartInk `pur-ema10-20` at 3:20 PM, places equal-weight
-> BTST trades, squares off next day at 3:20 PM, with a web dashboard + Telegram reports.
+> BTST trades, squares off next day at 3:20 PM, with a web dashboard.
 > Runs 30 days in paper mode, then flips to live.
 
 ## Locked decisions
@@ -22,7 +22,7 @@
 | Neutral day | TRADE |
 | Mode | Paper 30 days (`PAPER_MODE=true`) → live via flag, identical code |
 | UI | Web dashboard on :8085 (trades, positions, P&L, win rate) |
-| Telegram | Entry / exit / skip reports, both modes, [PAPER] label |
+| Reporting | Entry / exit / skip reports to log + dashboard, [PAPER] label |
 | Repo | Clean rebuild in existing repo; reuse 5 working pieces |
 | Deploy | Render (free) + UptimeRobot keep-alive |
 
@@ -37,8 +37,8 @@
 
 ## File layout
 ```
-KEEP (reuse): core/auto_login.go, agents/telegram.go,
-              config/config.go (trimmed), NSE holiday funcs from main.go
+KEEP (reuse): core/auto_login.go, config/config.go (trimmed),
+              NSE holiday funcs from main.go
 NEW:  scanner/chartink.go      — HTTP scraper
       broker/broker.go         — Broker interface
       broker/paper.go          — simulated fills + software SL
@@ -80,15 +80,14 @@ always  dashboard on :8085
 P1 scraper → P2 paper broker + entry → P3 exit + P&L store →
 P4 gates → P5 dashboard → P6 live Kite + deploy.
 
-## Manual BUY approval (v7) + gates OFF
+## Gates OFF + approval hook
 - Automated sentiment gates default OFF (`BTST_GATE_ENABLED=false`); code kept dormant.
-- At entry time the engine scans + sizes the basket, then sends it to Telegram and
-  waits for a `PROCEED`/`HOLD` reply (`agents.RequestApproval`, getUpdates polling,
-  authorized chat only). No reply by `BTST_APPROVAL_DEADLINE` (default 15:28 IST) →
-  auto-HOLD. BUY only; SELL (T+1 square-off) is never gated. Toggle: `BTST_APPROVAL`.
+- Telegram was fully removed. The engine trades unconditionally at entry time.
+- A generic `Engine.ApproveBuy` hook remains (nil = trade unconditionally): the engine
+  builds the proposed basket and, if a hook is wired, only places BUYs when it returns
+  true. SELL (T+1 square-off) is never gated. The next approval mechanism plugs in here.
 - NSE timings (verified): pre-open 09:00–09:15, NORMAL 09:15–15:30 (only window for
-  market orders), closing 15:40–16:00. Entry/exit 15:20 sit before the 15:30 close —
-  deadline 15:28 leaves ~2 min to place market orders.
+  market orders), closing 15:40–16:00. Entry/exit 15:20 sit before the 15:30 close.
 
 ## Tier-2 news filter — two layers
 1. Keyword hard-block (severe terms + 48h recency) — always on, free.

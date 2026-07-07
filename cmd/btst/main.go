@@ -1,13 +1,12 @@
 // Command btst is the BTST auto-trade engine entrypoint.
 //
-// Each trading day at the configured entry time (default 15:20 IST) it:
-//  1. squares off the prior day's open positions (next-day BTST exit),
-//  2. runs the Tier-1 macro gate; if it passes, scrapes pur-ema10-20,
-//  3. applies the Tier-2 news filter and places equal-weight ₹5L/N orders.
+// Each trading day at the configured entry time (default 15:20 IST) it squares
+// off the prior day's open positions, scrapes pur-ema10-20, and places
+// equal-weight ₹5L/N orders. Reports go to the log and the dashboard.
 //
-// It serves the dashboard on $PORT (default 8085) and reports to Telegram.
-// PAPER_MODE controls paper vs live; live order placement (KiteBroker) lands in
-// a later phase — until then the engine runs paper-only regardless of the flag.
+// It serves the dashboard on $PORT (default 8085). PAPER_MODE controls paper vs
+// live; live order placement (KiteBroker) is selected only when PAPER_MODE=false
+// and Kite credentials are present.
 package main
 
 import (
@@ -17,7 +16,6 @@ import (
 	"os"
 	"time"
 
-	"bnf_go_engine/agents"
 	"bnf_go_engine/broker"
 	"bnf_go_engine/calendar"
 	"bnf_go_engine/config"
@@ -66,29 +64,15 @@ func main() {
 		Scraper: scanner.NewScraper(config.BTSTScreener),
 		Broker:  b,
 		Store:   st,
-		Notify:  agents.SendTelegram,
+		Notify:  func(msg string) { log.Printf("[Report] %s", msg) },
 		Quotes:  q,
 	}
 
-	// Automated sentiment gates — OFF by default (manual approval replaces them).
+	// Automated sentiment gates — OFF by default.
 	if config.BTSTGateEnabled {
 		eng.MacroGate = gate.NewMacro(q).Check
 		eng.NewsFilter = gate.NewNews().Filter
 		log.Printf("[BTST] sentiment gates ENABLED")
-	}
-
-	// Manual BUY approval via Telegram — proposes the basket and waits for PROCEED.
-	// A manual /api/run trigger injects a short deadline via context (see below);
-	// the scheduled 15:20 run uses the configured BTST_APPROVAL_DEADLINE.
-	if config.BTSTApprovalEnabled && config.TelegramBotToken != "" {
-		eng.ApproveBuy = func(ctx context.Context, proposal string) bool {
-			dl := approvalDeadline()
-			if d, ok := ctx.Value(manualDeadlineKey{}).(time.Time); ok {
-				dl = d
-			}
-			return agents.RequestApproval(proposal, dl)
-		}
-		log.Printf("[BTST] manual BUY approval ENABLED (deadline %s IST)", config.BTSTApprovalDeadline)
 	}
 
 	// ── Dashboard ──────────────────────────────────────────────────────
@@ -98,25 +82,22 @@ func main() {
 	}
 	srv := web.New(st, config.PaperMode)
 
-	// Manual scan+trade trigger (testing outside 15:20). Token-protected; uses a
-	// short 6-minute approval window so the Telegram round-trip can be tested live.
+	// Manual scan+trade trigger (testing outside 15:20). Token-protected.
 	if config.BTSTTriggerToken != "" {
 		srv.SetTrigger(config.BTSTTriggerToken, func(force bool) string {
 			go func() {
-				ctx := context.WithValue(context.Background(), manualDeadlineKey{},
-					config.NowIST().Add(6*time.Minute))
+				ctx := context.Background()
 				if force {
 					ctx = engine.WithForceEntry(ctx)
 				}
-				cctx, cancel := context.WithTimeout(ctx, 8*time.Minute)
+				cctx, cancel := context.WithTimeout(ctx, 3*time.Minute)
 				defer cancel()
 				log.Printf("[BTST] manual trigger fired (force=%v)", force)
 				if err := eng.RunEntry(cctx); err != nil {
 					log.Printf("[BTST] manual run error: %v", err)
-					agents.SendTelegram("🚨 *Manual run error*: " + err.Error())
 				}
 			}()
-			return "triggered — check Telegram for the approval message"
+			return "triggered — scan running, watch the dashboard"
 		})
 		log.Printf("[BTST] manual /api/run trigger ENABLED")
 	}
@@ -130,10 +111,8 @@ func main() {
 	// ── Daily holiday refresh at 06:00 IST ─────────────────────────────
 	go dailyAt(6, 0, calendar.Refresh)
 
-	agents.SendTelegram("🚀 *BTST Engine online* [" + modeTag() + "]\n" +
-		"Screener: `" + config.BTSTScreener + "` · Entry/Exit: `" +
-		config.BTSTEntryTime + "` IST\nDashboard on :" + port)
-	log.Printf("[BTST] online [%s] — entry/exit at %s IST", modeTag(), config.BTSTEntryTime)
+	log.Printf("[BTST] online [%s] — screener %s, entry/exit at %s IST, dashboard on :%s",
+		modeTag(), config.BTSTScreener, config.BTSTEntryTime, port)
 
 	runScheduler(eng)
 }
@@ -210,16 +189,4 @@ func modeTag() string {
 		return "PAPER"
 	}
 	return "LIVE"
-}
-
-// manualDeadlineKey carries a short approval deadline for manual /api/run
-// triggers so testing doesn't wait until the fixed 15:28 cutoff.
-type manualDeadlineKey struct{}
-
-// approvalDeadline returns today's BTST_APPROVAL_DEADLINE as an IST time — the
-// cutoff after which a missing reply auto-HOLDs. Kept before the 15:30 close.
-func approvalDeadline() time.Time {
-	h, m := config.ParseTime(config.BTSTApprovalDeadline)
-	now := config.NowIST()
-	return time.Date(now.Year(), now.Month(), now.Day(), h, m, 0, 0, config.IST)
 }

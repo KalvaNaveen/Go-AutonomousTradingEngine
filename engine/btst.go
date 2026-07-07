@@ -1,6 +1,6 @@
 // Package engine orchestrates the BTST daily cycle: the 3:20 PM entry (this file)
 // and the next-day 3:20 PM exit (P3). It ties together the Chartink scanner, the
-// broker (paper or live), the SQLite store, and Telegram reporting.
+// broker (paper or live), the SQLite store, and the report sink.
 package engine
 
 import (
@@ -21,7 +21,7 @@ type Engine struct {
 	Scraper *scanner.Scraper
 	Broker  broker.Broker
 	Store   *store.Store
-	Notify  func(string) // Telegram sender (agents.SendTelegram)
+	Notify  func(string) // report sink (logs + dashboard)
 	Quotes  quoteSource  // daily-OHLC source for exits (Yahoo in paper mode)
 
 	// Gates wired in P4 (nil = disabled). MacroGate returning ok=false skips the
@@ -51,7 +51,7 @@ func forced(ctx context.Context) bool {
 }
 
 // RunEntry executes the 3:20 PM entry: scan → gates → equal-weight sizing →
-// BUY + SL → persist → Telegram report. It is idempotent per trade date, unless
+// BUY + SL → persist → report. It is idempotent per trade date, unless
 // the context is marked WithForceEntry (manual re-run).
 func (e *Engine) RunEntry(ctx context.Context) error {
 	now := config.NowIST()
@@ -135,7 +135,7 @@ func (e *Engine) RunEntry(ctx context.Context) error {
 		return nil
 	}
 
-	// ── Manual BUY approval (Telegram) ─────────────────────────────────
+	// ── Manual BUY approval (optional hook; nil = trade unconditionally) ──
 	if e.ApproveBuy != nil {
 		proposal := e.proposalReport(date, plan, planDeployed)
 		if !e.ApproveBuy(ctx, proposal) {
@@ -221,7 +221,7 @@ type planItem struct {
 	estSL float64
 }
 
-// proposalReport formats the basket sent to Telegram for human approval.
+// proposalReport formats the proposed basket for the approval hook.
 func (e *Engine) proposalReport(date string, plan []planItem, deployed float64) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "🟡 *BTST — Approval needed* — %s [%s]\n", date, e.modeTag())
