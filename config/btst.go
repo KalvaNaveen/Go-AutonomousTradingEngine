@@ -1,5 +1,19 @@
 package config
 
+import "strings"
+
+// envList reads a comma-separated env var into a trimmed, non-empty slice.
+func envList(key, fallback string) []string {
+	raw := envStr(key, fallback)
+	var out []string
+	for _, s := range strings.Split(raw, ",") {
+		if s = strings.TrimSpace(s); s != "" {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
 // ── BTST Auto-Trade parameters (see BTST_SPEC.md) ───────────────────────────
 // All overridable via env so paper/live and cloud deploys need no recompile.
 var (
@@ -8,14 +22,22 @@ var (
 	// the same day — total ₹10L is split into two ₹5L day-buckets.
 	BTSTCapitalPerDay = envFloat("BTST_CAPITAL_PER_DAY", 500000)
 
-	// BTSTMaxStocks caps how many of the screener's stocks we actually trade.
+	// BTSTMaxStocks caps how many stocks are taken from EACH screener before the
+	// distinct union (so two screeners can yield up to 2× this many names).
 	BTSTMaxStocks = int(envFloat("BTST_MAX_STOCKS", 20))
 
-	// BTSTStopLossPct is the stop-loss distance below entry (configurable).
-	BTSTStopLossPct = envFloat("BTST_STOP_LOSS_PCT", 6.5)
+	// BTSTStopLossPct is the TRAILING stop distance: the stop always sits this %
+	// below the highest price seen since entry (the watermark) and only ratchets
+	// up, never down. Initial stop = entry × (1 − pct/100).
+	BTSTStopLossPct = envFloat("BTST_STOP_LOSS_PCT", 2.0)
 
-	// BTSTScreener is the ChartInk saved-screener slug that sources the stock list.
-	BTSTScreener = envStr("BTST_SCREENER", "pur-ema10-20")
+	// BTSTScreeners is the comma-separated list of ChartInk saved-screener slugs.
+	// Top BTSTMaxStocks from each are fetched and de-duplicated (first list wins).
+	BTSTScreeners = envList("BTST_SCREENERS", "ema-reversal-93,pvema-3")
+
+	// BTSTMonitorIntervalMin is how often (minutes) the intraday monitor polls
+	// held positions during market hours to trail the stop and exit on breach.
+	BTSTMonitorIntervalMin = int(envFloat("BTST_MONITOR_INTERVAL_MIN", 5))
 
 	// BTSTEntryTime / BTSTExitTime are the HH:MM IST trigger times.
 	BTSTEntryTime = envStr("BTST_ENTRY_TIME", "15:20")

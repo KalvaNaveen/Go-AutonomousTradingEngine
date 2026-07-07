@@ -24,12 +24,16 @@ services:
         sync: false # e.g. libsql://btst-<org>.turso.io
       - key: TURSO_AUTH_TOKEN
         sync: false
-      - key: BTST_SCREENER
-        value: pur-ema10-20
+      - key: BTST_SCREENERS
+        value: "ema-reversal-93,pvema-3" # top 20 from each, distinct union
       - key: BTST_CAPITAL_PER_DAY
         value: "500000"
+      # Trailing stop: always 2% below the highest price since entry; the intraday
+      # monitor ratchets it every BTST_MONITOR_INTERVAL_MIN minutes.
       - key: BTST_STOP_LOSS_PCT
-        value: "6.5"
+        value: "2"
+      - key: BTST_MONITOR_INTERVAL_MIN
+        value: "5"
       # Automated sentiment gates OFF by default.
       - key: BTST_GATE_ENABLED
         value: "false"

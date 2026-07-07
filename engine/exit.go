@@ -23,15 +23,21 @@ func (e *Engine) WithQuotes(q quoteSource) *Engine { e.Quotes = q; return e }
 // RunExit squares off open BTST positions at the next-day 3:20 PM.
 //
 // For each open position whose trade date is before today, it fetches the day's
-// OHLC: if the low breached the software stop-loss, the exit is booked at the SL
-// price (reason stoploss); otherwise it squares off at the current price (reason
-// squareoff). Realised P&L is persisted and an exit report is emitted.
+// OHLC: if the low breached the (trailing) stop, the exit is booked at the SL
+// price (reason stoploss — the safety net when the intraday monitor missed it);
+// otherwise it squares off at the current price (reason squareoff).
 //
 // includeToday=true ignores the "must be a prior trade date" guard — used only
 // for testing a same-session round-trip.
 func (e *Engine) RunExit(ctx context.Context, includeToday bool) error {
+	return e.exitEligible(ctx, nil, includeToday)
+}
+
+// exitEligible is RunExit with carry-over netting: positions whose symbol is in
+// `carried` are re-listed by today's scan and are NOT sold (the hold continues).
+func (e *Engine) exitEligible(ctx context.Context, carried map[string]bool, includeToday bool) error {
 	if e.Quotes == nil {
-		return fmt.Errorf("RunExit: no quote source wired")
+		return fmt.Errorf("exit: no quote source wired")
 	}
 	today := config.NowIST().Format("2006-01-02")
 
@@ -45,6 +51,9 @@ func (e *Engine) RunExit(ctx context.Context, includeToday bool) error {
 	for _, p := range open {
 		if !includeToday && p.TradeDate >= today {
 			continue // bought today — BTST holds until next trading day
+		}
+		if carried[p.Symbol] {
+			continue // re-listed by today's scan — sell skipped, hold continues
 		}
 
 		ohlc, err := e.Quotes.Daily(ctx, p.Symbol)

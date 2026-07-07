@@ -16,18 +16,23 @@ const (
 	ExitStopLoss  = "stoploss"  // SL breached overnight/next morning
 )
 
-// Position is one BTST trade: bought today at 3:20 PM, sold the next trading
-// day at 3:20 PM (or earlier if the stop-loss is hit).
+// Position is one BTST trade: bought at 3:20 PM, sold the next trading day at
+// 3:20 PM — unless the screener re-lists it (carried, hold continues) or the
+// trailing stop is breached intraday (exited early).
 type Position struct {
 	ID         int64
 	Symbol     string
 	Qty        int
 	EntryPrice float64
 	EntryTime  time.Time
-	SLPrice    float64
-	TradeDate  string // YYYY-MM-DD of entry (the day the stock was bought)
-	Paper      bool   // true = simulated, false = real Kite order
+	SLPrice    float64 // CURRENT trailing stop = PeakPrice × (1 − pct); only ratchets up
+	TradeDate  string  // YYYY-MM-DD of entry (the day the stock was bought)
+	Paper      bool    // true = simulated, false = real Kite order
 	BuyOrderID string
+
+	PeakPrice  float64 // watermark: highest price seen since entry (drives the trail)
+	LastPrice  float64 // most recent monitored price (dashboard / unrealised P&L)
+	CarryCount int     // times the screener re-listed this holding (skipped the sell)
 
 	Status     string // open | closed
 	ExitPrice  float64
@@ -45,4 +50,13 @@ func (p Position) PnLPct() float64 {
 		return 0
 	}
 	return (p.ExitPrice - p.EntryPrice) / p.EntryPrice * 100
+}
+
+// UnrealPnL returns the mark-to-market P&L of an OPEN position using the last
+// monitored price (0 until the monitor has polled at least once).
+func (p Position) UnrealPnL() float64 {
+	if p.LastPrice <= 0 {
+		return 0
+	}
+	return (p.LastPrice - p.EntryPrice) * float64(p.Qty)
 }

@@ -81,7 +81,10 @@ CREATE TABLE IF NOT EXISTS positions (
     exit_price  REAL,
     exit_time   TEXT,
     exit_reason TEXT,
-    pnl         REAL
+    pnl         REAL,
+    peak_price  REAL,             -- trailing-SL watermark (highest seen since entry)
+    last_price  REAL,             -- most recent monitored price
+    carry_count INTEGER DEFAULT 0 -- times the screener re-listed this holding
 );
 CREATE INDEX IF NOT EXISTS idx_status ON positions(status);
 CREATE INDEX IF NOT EXISTS idx_trade_date ON positions(trade_date);
@@ -90,17 +93,37 @@ CREATE TABLE IF NOT EXISTS scans (
     scan_date  TEXT    NOT NULL,
     symbol     TEXT    NOT NULL,
     close      REAL    NOT NULL,
-    outcome    TEXT    NOT NULL,  -- traded | dropped | held
+    outcome    TEXT    NOT NULL,  -- traded | carried | dropped | held
     reason     TEXT,
     scanned_at TEXT,              -- HH:MM:SS IST when the scan ran
+    source     TEXT,              -- screener slug(s) the stock came from
     PRIMARY KEY (scan_date, symbol)
 );
-CREATE INDEX IF NOT EXISTS idx_scan_date ON scans(scan_date);`)
+CREATE INDEX IF NOT EXISTS idx_scan_date ON scans(scan_date);
+
+CREATE TABLE IF NOT EXISTS sl_events (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    position_id INTEGER NOT NULL,
+    symbol      TEXT    NOT NULL,
+    at          TEXT    NOT NULL, -- RFC3339 IST
+    price       REAL    NOT NULL, -- price that caused the update
+    old_sl      REAL    NOT NULL,
+    new_sl      REAL    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_sl_pos ON sl_events(position_id);`)
 	if err != nil {
 		return err
 	}
-	// Best-effort add for a pre-existing scans table; ignore "duplicate column".
-	_, _ = s.db.Exec(`ALTER TABLE scans ADD COLUMN scanned_at TEXT`)
+	// Best-effort adds for pre-existing tables; ignore "duplicate column" errors.
+	for _, stmt := range []string{
+		`ALTER TABLE scans ADD COLUMN scanned_at TEXT`,
+		`ALTER TABLE scans ADD COLUMN source TEXT`,
+		`ALTER TABLE positions ADD COLUMN peak_price REAL`,
+		`ALTER TABLE positions ADD COLUMN last_price REAL`,
+		`ALTER TABLE positions ADD COLUMN carry_count INTEGER DEFAULT 0`,
+	} {
+		_, _ = s.db.Exec(stmt)
+	}
 	return nil
 }
 
@@ -119,8 +142,9 @@ type ScanRow struct {
 	Date    string  `json:"date"`
 	Symbol  string  `json:"symbol"`
 	Close   float64 `json:"close"`
-	Outcome string  `json:"outcome"` // traded | dropped | held
+	Outcome string  `json:"outcome"` // traded | carried | dropped | held
 	Reason  string  `json:"reason,omitempty"`
+	Source  string  `json:"source,omitempty"` // screener slug(s)
 }
 
 // SaveScan replaces the scan record for a date (idempotent across re-runs).
@@ -137,8 +161,8 @@ func (s *Store) SaveScan(date string, scannedAt time.Time, rows []ScanRow) error
 		return err
 	}
 	for _, r := range rows {
-		if _, err := tx.Exec(`INSERT INTO scans (scan_date, symbol, close, outcome, reason, scanned_at)
-			VALUES (?, ?, ?, ?, ?, ?)`, date, r.Symbol, r.Close, r.Outcome, r.Reason, at); err != nil {
+		if _, err := tx.Exec(`INSERT INTO scans (scan_date, symbol, close, outcome, reason, scanned_at, source)
+			VALUES (?, ?, ?, ?, ?, ?, ?)`, date, r.Symbol, r.Close, r.Outcome, r.Reason, at, r.Source); err != nil {
 			tx.Rollback()
 			return err
 		}
@@ -158,7 +182,7 @@ func (s *Store) LatestScanDate() (string, error) {
 
 // ScanByDate returns all scanned rows for a date (preserving insertion order).
 func (s *Store) ScanByDate(date string) ([]ScanRow, error) {
-	rows, err := s.db.Query(`SELECT scan_date, symbol, close, outcome, COALESCE(reason,'')
+	rows, err := s.db.Query(`SELECT scan_date, symbol, close, outcome, COALESCE(reason,''), COALESCE(source,'')
 		FROM scans WHERE scan_date=? ORDER BY rowid`, date)
 	if err != nil {
 		return nil, err
@@ -167,7 +191,7 @@ func (s *Store) ScanByDate(date string) ([]ScanRow, error) {
 	var out []ScanRow
 	for rows.Next() {
 		var r ScanRow
-		if err := rows.Scan(&r.Date, &r.Symbol, &r.Close, &r.Outcome, &r.Reason); err != nil {
+		if err := rows.Scan(&r.Date, &r.Symbol, &r.Close, &r.Outcome, &r.Reason, &r.Source); err != nil {
 			return nil, err
 		}
 		out = append(out, r)
@@ -210,17 +234,79 @@ func (s *Store) PurgeDate(date string) error {
 }
 
 // SaveOpen inserts a newly-opened position and returns its assigned ID.
+// The trailing-SL watermark starts at the entry price.
 func (s *Store) SaveOpen(p *model.Position) error {
+	if p.PeakPrice <= 0 {
+		p.PeakPrice = p.EntryPrice
+	}
+	if p.LastPrice <= 0 {
+		p.LastPrice = p.EntryPrice
+	}
 	res, err := s.db.Exec(`
-INSERT INTO positions (symbol, qty, entry_price, entry_time, sl_price, trade_date, paper, buy_order, status)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+INSERT INTO positions (symbol, qty, entry_price, entry_time, sl_price, trade_date, paper, buy_order, status, peak_price, last_price, carry_count)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`,
 		p.Symbol, p.Qty, p.EntryPrice, p.EntryTime.Format(time.RFC3339),
-		p.SLPrice, p.TradeDate, boolToInt(p.Paper), p.BuyOrderID, model.StatusOpen)
+		p.SLPrice, p.TradeDate, boolToInt(p.Paper), p.BuyOrderID, model.StatusOpen,
+		p.PeakPrice, p.LastPrice)
 	if err != nil {
 		return err
 	}
 	p.ID, _ = res.LastInsertId()
 	return nil
+}
+
+// UpdateTrail persists a monitor tick: the latest price, watermark, and (when it
+// ratcheted) the new trailing stop. When the SL moved, an sl_events audit row is
+// written so the trail history is fully reconstructable.
+func (s *Store) UpdateTrail(p *model.Position, at time.Time, oldSL float64) error {
+	if _, err := s.db.Exec(`
+UPDATE positions SET peak_price=?, last_price=?, sl_price=? WHERE id=?`,
+		p.PeakPrice, p.LastPrice, p.SLPrice, p.ID); err != nil {
+		return err
+	}
+	if p.SLPrice > oldSL {
+		_, err := s.db.Exec(`
+INSERT INTO sl_events (position_id, symbol, at, price, old_sl, new_sl)
+VALUES (?, ?, ?, ?, ?, ?)`,
+			p.ID, p.Symbol, at.Format(time.RFC3339), p.LastPrice, oldSL, p.SLPrice)
+		return err
+	}
+	return nil
+}
+
+// MarkCarried increments a holding's carry counter (screener re-listed it, so
+// the scheduled sell was skipped).
+func (s *Store) MarkCarried(id int64) error {
+	_, err := s.db.Exec(`UPDATE positions SET carry_count = carry_count + 1 WHERE id=?`, id)
+	return err
+}
+
+// SLEvent is one trailing-stop adjustment (audit trail).
+type SLEvent struct {
+	Symbol string  `json:"symbol"`
+	At     string  `json:"at"`
+	Price  float64 `json:"price"`
+	OldSL  float64 `json:"old_sl"`
+	NewSL  float64 `json:"new_sl"`
+}
+
+// SLEvents returns the most recent `limit` trailing-stop adjustments.
+func (s *Store) SLEvents(limit int) ([]SLEvent, error) {
+	rows, err := s.db.Query(`
+SELECT symbol, at, price, old_sl, new_sl FROM sl_events ORDER BY id DESC LIMIT ?`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []SLEvent
+	for rows.Next() {
+		var e SLEvent
+		if err := rows.Scan(&e.Symbol, &e.At, &e.Price, &e.OldSL, &e.NewSL); err != nil {
+			return nil, err
+		}
+		out = append(out, e)
+	}
+	return out, rows.Err()
 }
 
 // ClosePosition records the exit fill, reason, and realised P&L.
@@ -261,7 +347,8 @@ func (s *Store) query(where string, args ...any) ([]model.Position, error) {
 	rows, err := s.db.Query(`
 SELECT id, symbol, qty, entry_price, entry_time, sl_price, trade_date, paper,
        COALESCE(buy_order,''), status, COALESCE(exit_price,0), COALESCE(exit_time,''),
-       COALESCE(exit_reason,''), COALESCE(pnl,0)
+       COALESCE(exit_reason,''), COALESCE(pnl,0),
+       COALESCE(peak_price,entry_price), COALESCE(last_price,entry_price), COALESCE(carry_count,0)
   FROM positions `+where, args...)
 	if err != nil {
 		return nil, err
@@ -275,7 +362,8 @@ SELECT id, symbol, qty, entry_price, entry_time, sl_price, trade_date, paper,
 		var entryTime, exitTime string
 		if err := rows.Scan(&p.ID, &p.Symbol, &p.Qty, &p.EntryPrice, &entryTime,
 			&p.SLPrice, &p.TradeDate, &paper, &p.BuyOrderID, &p.Status,
-			&p.ExitPrice, &exitTime, &p.ExitReason, &p.PnL); err != nil {
+			&p.ExitPrice, &exitTime, &p.ExitReason, &p.PnL,
+			&p.PeakPrice, &p.LastPrice, &p.CarryCount); err != nil {
 			return nil, err
 		}
 		p.Paper = paper == 1

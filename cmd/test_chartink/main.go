@@ -1,4 +1,5 @@
-// Smoke test for the ChartInk scraper: prints the live pur-ema10-20 list.
+// Smoke test for the ChartInk multi-scanner: prints the live distinct union of
+// the configured screeners (default ema-reversal-93 + pvema-3) with sources.
 package main
 
 import (
@@ -7,21 +8,22 @@ import (
 	"log"
 	"time"
 
+	"bnf_go_engine/config"
 	"bnf_go_engine/scanner"
 )
 
 func main() {
-	s := scanner.NewScraper("pur-ema10-20")
-	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
+	m := scanner.NewMulti(config.BTSTScreeners)
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 
-	stocks, err := s.Fetch(ctx, 20)
+	stocks, err := m.Fetch(ctx, config.BTSTMaxStocks)
 	if err != nil {
 		log.Fatalf("fetch failed: %v", err)
 	}
-	fmt.Printf("pur-ema10-20 returned %d stocks (showing up to 20):\n", len(stocks))
+	fmt.Printf("union of %v returned %d distinct stocks:\n", config.BTSTScreeners, len(stocks))
 	for i, st := range stocks {
-		fmt.Printf("%2d. %-14s close=%-10.2f chg=%+.2f%% vol=%d\n",
-			i+1, st.Symbol, st.Close, st.PerChange, st.Volume)
+		fmt.Printf("%2d. %-14s close=%-10.2f chg=%+.2f%%  src=%s\n",
+			i+1, st.Symbol, st.Close, st.PerChange, st.Source)
 	}
 }

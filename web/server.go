@@ -109,6 +109,11 @@ type positionView struct {
 	Qty        int     `json:"qty"`
 	EntryPrice float64 `json:"entry_price"`
 	SLPrice    float64 `json:"sl_price"`
+	PeakPrice  float64 `json:"peak_price,omitempty"`
+	LastPrice  float64 `json:"last_price,omitempty"`
+	CarryCount int     `json:"carry_count,omitempty"`
+	UnrealPnL  float64 `json:"unreal_pnl,omitempty"`
+	UnrealPct  float64 `json:"unreal_pct,omitempty"`
 	ExitPrice  float64 `json:"exit_price,omitempty"`
 	ExitReason string  `json:"exit_reason,omitempty"`
 	Invested   float64 `json:"invested"`
@@ -118,30 +123,33 @@ type positionView struct {
 }
 
 type summary struct {
-	Mode         string         `json:"mode"`
-	Today        string         `json:"today"`
-	CapitalDay   float64        `json:"capital_per_day"`
-	OpenCount    int            `json:"open_count"`
-	OpenInvested float64        `json:"open_invested"`
-	ClosedCount  int            `json:"closed_count"`
-	RealizedPnL  float64        `json:"realized_pnl"`
-	ReturnPct    float64        `json:"return_pct"`
-	Wins         int            `json:"wins"`
-	WinRate      float64        `json:"win_rate"`
-	Open         []positionView `json:"open"`
-	Closed       []positionView `json:"closed"`
+	Mode          string         `json:"mode"`
+	Today         string         `json:"today"`
+	CapitalDay    float64        `json:"capital_per_day"`
+	OpenCount     int            `json:"open_count"`
+	OpenInvested  float64        `json:"open_invested"`
+	UnrealizedPnL float64        `json:"unrealized_pnl"`
+	CarriedCount  int            `json:"carried_count"`
+	ClosedCount   int            `json:"closed_count"`
+	RealizedPnL   float64        `json:"realized_pnl"`
+	ReturnPct     float64        `json:"return_pct"`
+	Wins          int            `json:"wins"`
+	WinRate       float64        `json:"win_rate"`
+	Open          []positionView `json:"open"`
+	Closed        []positionView `json:"closed"`
 
 	ScanDate     string          `json:"scan_date"`
 	ScanTime     string          `json:"scan_time"`
 	ScannedCount int             `json:"scanned_count"`
 	TradedCount  int             `json:"traded_count"`
 	Scan         []store.ScanRow `json:"scan"`
+	SLEvents     []store.SLEvent `json:"sl_events"`
 }
 
 func view(p model.Position) positionView {
 	v := positionView{
 		Symbol: p.Symbol, Qty: p.Qty, EntryPrice: p.EntryPrice, SLPrice: p.SLPrice,
-		Invested: p.Invested(), TradeDate: p.TradeDate,
+		Invested: p.Invested(), TradeDate: p.TradeDate, CarryCount: p.CarryCount,
 	}
 	// P&L only exists once closed — leave open positions at zero rather than
 	// reporting a spurious -100% from a zero exit price.
@@ -150,6 +158,13 @@ func view(p model.Position) positionView {
 		v.ExitReason = p.ExitReason
 		v.PnL = p.PnL
 		v.PnLPct = p.PnLPct()
+	} else {
+		v.PeakPrice = p.PeakPrice
+		v.LastPrice = p.LastPrice
+		v.UnrealPnL = p.UnrealPnL()
+		if p.EntryPrice > 0 && p.LastPrice > 0 {
+			v.UnrealPct = (p.LastPrice - p.EntryPrice) / p.EntryPrice * 100
+		}
 	}
 	return v
 }
@@ -174,6 +189,10 @@ func (s *Server) handleSummary(w http.ResponseWriter, r *http.Request) {
 	for _, p := range open {
 		out.Open = append(out.Open, view(p))
 		out.OpenInvested += p.Invested()
+		out.UnrealizedPnL += p.UnrealPnL()
+		if p.CarryCount > 0 {
+			out.CarriedCount++
+		}
 	}
 	out.OpenCount = len(open)
 
@@ -193,6 +212,8 @@ func (s *Server) handleSummary(w http.ResponseWriter, r *http.Request) {
 	if out.ClosedCount > 0 {
 		out.WinRate = float64(out.Wins) / float64(out.ClosedCount) * 100
 	}
+
+	out.SLEvents, _ = s.store.SLEvents(20)
 
 	// Most recent daily scan (scanned vs traded vs dropped/held).
 	if d, err := s.store.LatestScanDate(); err == nil && d != "" {

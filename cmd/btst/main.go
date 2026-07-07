@@ -1,8 +1,10 @@
 // Command btst is the BTST auto-trade engine entrypoint.
 //
-// Each trading day at the configured entry time (default 15:20 IST) it squares
-// off the prior day's open positions, scrapes pur-ema10-20, and places
-// equal-weight ₹5L/N orders. Reports go to the log and the dashboard.
+// Each trading day at the configured entry time (default 15:20 IST) it runs the
+// full cycle: scan the configured ChartInk screeners (distinct union), CARRY
+// holdings the scan re-listed (skip their sell + skip re-buying them), square
+// off the rest, then place equal-weight ₹5L/N buys on the NEW names — each with
+// a 2% trailing stop that an intraday monitor ratchets every few minutes.
 //
 // It serves the dashboard on $PORT (default 8085). PAPER_MODE controls paper vs
 // live; live order placement (KiteBroker) is selected only when PAPER_MODE=false
@@ -61,7 +63,7 @@ func main() {
 	}
 
 	eng := &engine.Engine{
-		Scraper: scanner.NewScraper(config.BTSTScreener),
+		Scanner: scanner.NewMulti(config.BTSTScreeners),
 		Broker:  b,
 		Store:   st,
 		Notify:  func(msg string) { log.Printf("[Report] %s", msg) },
@@ -93,7 +95,7 @@ func main() {
 				cctx, cancel := context.WithTimeout(ctx, 3*time.Minute)
 				defer cancel()
 				log.Printf("[BTST] manual trigger fired (force=%v)", force)
-				if err := eng.RunEntry(cctx); err != nil {
+				if err := eng.RunCycle(cctx); err != nil {
 					log.Printf("[BTST] manual run error: %v", err)
 				}
 			}()
@@ -111,13 +113,18 @@ func main() {
 	// ── Daily holiday refresh at 06:00 IST ─────────────────────────────
 	go dailyAt(6, 0, calendar.Refresh)
 
-	log.Printf("[BTST] online [%s] — screener %s, entry/exit at %s IST, dashboard on :%s",
-		modeTag(), config.BTSTScreener, config.BTSTEntryTime, port)
+	// ── Intraday trailing-SL monitor ────────────────────────────────────
+	go runMonitor(eng)
+
+	log.Printf("[BTST] online [%s] — screeners %v, cycle at %s IST, trail %.1f%% every %dm, dashboard on :%s",
+		modeTag(), config.BTSTScreeners, config.BTSTEntryTime, config.BTSTStopLossPct,
+		config.BTSTMonitorIntervalMin, port)
 
 	runScheduler(eng)
 }
 
-// runScheduler drives the once-per-day exit+entry at the configured time.
+// runScheduler drives the once-per-day cycle (carry netting → sell → buy) at the
+// configured time.
 func runScheduler(eng *engine.Engine) {
 	entryH, entryM := config.ParseTime(config.BTSTEntryTime)
 	entryHHMM := entryH*100 + entryM
@@ -139,14 +146,9 @@ func runScheduler(eng *engine.Engine) {
 			// Only trade inside the entry window. A late start (process restarted
 			// after the window) must NOT fire on a stale EOD list at a wrong price.
 			if hhmm >= entryHHMM && hhmm < entryHHMM+5 && !done {
-				ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-				// 1) square off prior-day positions (BTST T+1 exit)
-				if err := eng.RunExit(ctx, false); err != nil {
-					log.Printf("[BTST] exit error: %v", err)
-				}
-				// 2) place today's new entries
-				if err := eng.RunEntry(ctx); err != nil {
-					log.Printf("[BTST] entry error: %v", err)
+				ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+				if err := eng.RunCycle(ctx); err != nil {
+					log.Printf("[BTST] cycle error: %v", err)
 				}
 				cancel()
 				done = true
@@ -157,6 +159,30 @@ func runScheduler(eng *engine.Engine) {
 			}
 		}
 		sleepUntilMorning()
+	}
+}
+
+// runMonitor ticks the trailing-SL monitor during market hours (09:15–15:30 IST,
+// trading days). Each tick reloads open positions from the store, so it is
+// restart-safe and needs no coordination with the scheduler.
+func runMonitor(eng *engine.Engine) {
+	interval := time.Duration(config.BTSTMonitorIntervalMin) * time.Minute
+	if interval < time.Minute {
+		interval = time.Minute
+	}
+	openH, openM := config.ParseTime(config.NSEOpenTime)
+	closeH, closeM := config.ParseTime(config.NSECloseTime)
+	openHHMM, closeHHMM := openH*100+openM, closeH*100+closeM
+
+	for {
+		now := config.NowIST()
+		hhmm := now.Hour()*100 + now.Minute()
+		if calendar.IsTradingToday() && hhmm >= openHHMM && hhmm < closeHHMM {
+			ctx, cancel := context.WithTimeout(context.Background(), interval)
+			eng.MonitorOnce(ctx)
+			cancel()
+		}
+		time.Sleep(interval)
 	}
 }
 

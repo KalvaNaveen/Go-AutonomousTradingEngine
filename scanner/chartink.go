@@ -31,10 +31,14 @@ type Stock struct {
 	Close     float64 `json:"close"`
 	PerChange float64 `json:"per_chg"`
 	Volume    int64   `json:"volume"`
+
+	// Source is the screener slug(s) this stock came from ("a+b" when it appears
+	// in more than one). Set by the scrapers for the DB tracker; not ChartInk data.
+	Source string `json:"-"`
 }
 
 const (
-	defaultScreener = "pur-ema10-20"
+	defaultScreener = "ema-reversal-93"
 	baseURL         = "https://chartink.com"
 	userAgent       = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
 		"(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
@@ -140,6 +144,7 @@ func (s *Scraper) fetchOnce(ctx context.Context, maxStocks int) ([]Stock, error)
 		if st.BSECode == nil || st.Symbol == "" {
 			continue // index/ETF pseudo-row
 		}
+		st.Source = s.screener
 		stocks = append(stocks, st)
 		if len(stocks) >= maxStocks {
 			break

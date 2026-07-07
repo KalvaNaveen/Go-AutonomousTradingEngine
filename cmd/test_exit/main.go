@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"bnf_go_engine/broker"
+	"bnf_go_engine/config"
 	"bnf_go_engine/engine"
 	"bnf_go_engine/quotes"
 	"bnf_go_engine/scanner"
@@ -29,7 +30,7 @@ func main() {
 	}
 
 	e := &engine.Engine{
-		Scraper: scanner.NewScraper(""),
+		Scanner: scanner.NewMulti(config.BTSTScreeners),
 		Broker:  broker.NewPaperBroker(),
 		Store:   st,
 		Notify:  func(msg string) { fmt.Println("\n--- TELEGRAM ---\n" + msg) },

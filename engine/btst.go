@@ -16,13 +16,19 @@ import (
 	"bnf_go_engine/store"
 )
 
+// StockSource abstracts the scan (single scraper, multi-screener union, or a
+// test stub). max is the per-screener cap.
+type StockSource interface {
+	Fetch(ctx context.Context, max int) ([]scanner.Stock, error)
+}
+
 // Engine holds the wired dependencies for the BTST cycle.
 type Engine struct {
-	Scraper *scanner.Scraper
+	Scanner StockSource
 	Broker  broker.Broker
 	Store   *store.Store
 	Notify  func(string) // report sink (logs + dashboard)
-	Quotes  quoteSource  // daily-OHLC source for exits (Yahoo in paper mode)
+	Quotes  quoteSource  // daily-OHLC source for exits/monitor (Yahoo in paper mode)
 
 	// Gates wired in P4 (nil = disabled). MacroGate returning ok=false skips the
 	// whole day; NewsFilter drops individual symbols, returning a reason per drop.
@@ -50,10 +56,18 @@ func forced(ctx context.Context) bool {
 	return v
 }
 
-// RunEntry executes the 3:20 PM entry: scan → gates → equal-weight sizing →
-// BUY + SL → persist → report. It is idempotent per trade date, unless
-// the context is marked WithForceEntry (manual re-run).
-func (e *Engine) RunEntry(ctx context.Context) error {
+// RunCycle executes the full 3:20 PM daily cycle with carry-over netting:
+//
+//  1. Fetch the fresh buy list (distinct union of all screeners) FIRST.
+//  2. Holdings still on the list are CARRIED — not sold, not re-bought.
+//  3. Holdings that fell off the list are squared off (sell before buy).
+//  4. New buys = list minus anything already held; ₹CapitalPerDay ÷ N over
+//     the NEW buys only (carried positions consume no fresh capital).
+//
+// Idempotent per trade date, unless the context is marked WithForceEntry.
+// If the scan fails entirely, all eligible holdings are squared off (classic
+// BTST discipline — never hold blind) and the error is returned.
+func (e *Engine) RunCycle(ctx context.Context) error {
 	now := config.NowIST()
 	date := now.Format("2006-01-02")
 
@@ -65,34 +79,33 @@ func (e *Engine) RunEntry(ctx context.Context) error {
 	} else if done, err := e.Store.HasEntryFor(date); err != nil {
 		return fmt.Errorf("entry idempotency check: %w", err)
 	} else if done {
-		e.notify(fmt.Sprintf("ℹ️ BTST entry for %s already done — skipping duplicate run.", date))
+		e.notify(fmt.Sprintf("ℹ️ BTST cycle for %s already done — skipping duplicate run.", date))
 		return nil
 	}
 
-	// ── Tier-1 macro gate ──────────────────────────────────────────────
+	// ── Tier-1 macro gate (dormant unless enabled) ─────────────────────
 	if e.MacroGate != nil {
 		if ok, reason := e.MacroGate(ctx); !ok {
-			e.notify(fmt.Sprintf("⚠️ *BTST Skipped* — %s [%s]\nReason: %s\nNo trades placed.",
+			e.notify(fmt.Sprintf("⚠️ *BTST Skipped* — %s [%s]\nReason: %s\nNo new buys.",
 				date, e.modeTag(), reason))
-			return nil
+			// Still square off eligible holdings — the exit is never gated.
+			return e.exitEligible(ctx, nil, false)
 		}
 	}
 
-	// ── Scan ChartInk ──────────────────────────────────────────────────
-	stocks, err := e.Scraper.Fetch(ctx, config.BTSTMaxStocks)
+	// ── 1. Scan (fresh buy list decides both sells and buys) ───────────
+	stocks, err := e.Scanner.Fetch(ctx, config.BTSTMaxStocks)
 	if err != nil {
-		e.notify(fmt.Sprintf("🚨 *BTST scan failed* — %s\n%v", date, err))
+		e.notify(fmt.Sprintf("🚨 *BTST scan failed* — %s\n%v\nSquaring off all eligible holdings (cannot determine carries).", date, err))
+		if exitErr := e.exitEligible(ctx, nil, false); exitErr != nil {
+			e.notify(fmt.Sprintf("🚨 fallback exit also failed: %v", exitErr))
+		}
 		return err
 	}
-	if len(stocks) == 0 {
-		e.notify(fmt.Sprintf("⚠️ *BTST* — %s [%s]\nScreener returned 0 stocks. No trades.",
-			date, e.modeTag()))
-		return nil
-	}
 
-	// ── Tier-2 per-stock news filter ───────────────────────────────────
+	// ── Tier-2 per-stock news filter (dormant unless enabled) ──────────
 	dropped := map[string]string{}
-	if e.NewsFilter != nil {
+	if e.NewsFilter != nil && len(stocks) > 0 {
 		names := make(map[string]string, len(stocks))
 		for _, s := range stocks {
 			names[s.Symbol] = s.Name
@@ -105,22 +118,50 @@ func (e *Engine) RunEntry(ctx context.Context) error {
 			kept = append(kept, s)
 		}
 	}
-	if len(kept) == 0 {
-		e.recordScan(date, stocks, nil, dropped, false)
-		e.notify(fmt.Sprintf("⚠️ *BTST* — %s [%s]\nAll %d stocks dropped by news filter. No trades.",
-			date, e.modeTag(), len(stocks)))
+
+	// ── 2+3. Carry netting, then sell what fell off the list ───────────
+	open, err := e.Store.OpenPositions()
+	if err != nil {
+		return fmt.Errorf("load holdings: %w", err)
+	}
+	keptSet := make(map[string]bool, len(kept))
+	for _, s := range kept {
+		keptSet[s.Symbol] = true
+	}
+	heldSet := make(map[string]bool, len(open))
+	carried := map[string]bool{}
+	for _, p := range open {
+		heldSet[p.Symbol] = true
+		if keptSet[p.Symbol] && p.TradeDate < date {
+			carried[p.Symbol] = true
+			if err := e.Store.MarkCarried(p.ID); err != nil {
+				e.notify(fmt.Sprintf("⚠️ carry mark failed for %s: %v", p.Symbol, err))
+			}
+		}
+	}
+	if err := e.exitEligible(ctx, carried, false); err != nil {
+		e.notify(fmt.Sprintf("🚨 exit leg failed: %v", err))
+	}
+
+	// ── 4. New buys = list minus anything already held ─────────────────
+	var buys []scanner.Stock
+	for _, s := range kept {
+		if !heldSet[s.Symbol] {
+			buys = append(buys, s)
+		}
+	}
+	if len(buys) == 0 {
+		e.recordScan(date, stocks, nil, carried, dropped, false)
+		e.notify(fmt.Sprintf("ℹ️ *BTST* — %s [%s]\nScan %d, carried %d, no NEW stocks to buy.",
+			date, e.modeTag(), len(stocks), len(carried)))
 		return nil
 	}
 
-	// ── Equal-weight sizing: ₹CapitalPerDay ÷ N ────────────────────────
-	n := len(kept)
-	perStock := config.BTSTCapitalPerDay / float64(n)
-
-	// Build the proposed basket first (qty + estimated entry/SL), so it can be
-	// shown for approval before any order is placed.
+	// Equal-weight sizing over NEW buys only.
+	perStock := config.BTSTCapitalPerDay / float64(len(buys))
 	var plan []planItem
 	var planDeployed float64
-	for _, s := range kept {
+	for _, s := range buys {
 		qty := int(perStock / s.Close)
 		if qty < 1 {
 			dropped[s.Symbol] = "price > per-stock budget"
@@ -130,8 +171,8 @@ func (e *Engine) RunEntry(ctx context.Context) error {
 		planDeployed += s.Close * float64(qty)
 	}
 	if len(plan) == 0 {
-		e.recordScan(date, stocks, nil, dropped, false)
-		e.notify(fmt.Sprintf("⚠️ *BTST* — %s [%s]\nNo affordable stocks. No trades.", date, e.modeTag()))
+		e.recordScan(date, stocks, nil, carried, dropped, false)
+		e.notify(fmt.Sprintf("⚠️ *BTST* — %s [%s]\nNo affordable new stocks. No buys.", date, e.modeTag()))
 		return nil
 	}
 
@@ -139,14 +180,14 @@ func (e *Engine) RunEntry(ctx context.Context) error {
 	if e.ApproveBuy != nil {
 		proposal := e.proposalReport(date, plan, planDeployed)
 		if !e.ApproveBuy(ctx, proposal) {
-			e.recordScan(date, stocks, nil, dropped, true)
+			e.recordScan(date, stocks, nil, carried, dropped, true)
 			e.notify(fmt.Sprintf("🛑 *BTST HELD* — %s [%s]\nNot approved. No BUY orders placed.",
 				date, e.modeTag()))
 			return nil
 		}
 	}
 
-	// ── Place the approved basket ──────────────────────────────────────
+	// ── Place the basket (initial trailing stop = entry × (1 − pct)) ───
 	var placed []model.Position
 	var deployed float64
 	for _, it := range plan {
@@ -162,12 +203,13 @@ func (e *Engine) RunEntry(ctx context.Context) error {
 		}
 		slPrice := fill * (1 - config.BTSTStopLossPct/100)
 		if _, err := e.Broker.PlaceSLM(s.Symbol, qty, slPrice); err != nil {
-			// Non-fatal: paper tracks SL in software; log via drop note.
+			// Non-fatal: the software monitor owns the trailing stop anyway.
 			dropped[s.Symbol+" (SL)"] = "SL register failed: " + err.Error()
 		}
 		p := model.Position{
 			Symbol: s.Symbol, Qty: qty, EntryPrice: fill, EntryTime: now,
-			SLPrice: slPrice, TradeDate: date, Paper: e.Broker.IsPaper(),
+			SLPrice: slPrice, PeakPrice: fill, LastPrice: fill,
+			TradeDate: date, Paper: e.Broker.IsPaper(),
 			BuyOrderID: orderID, Status: model.StatusOpen,
 		}
 		if err := e.Store.SaveOpen(&p); err != nil {
@@ -181,24 +223,27 @@ func (e *Engine) RunEntry(ctx context.Context) error {
 	for _, p := range placed {
 		tradedSet[p.Symbol] = true
 	}
-	e.recordScan(date, stocks, tradedSet, dropped, false)
+	e.recordScan(date, stocks, tradedSet, carried, dropped, false)
 
-	e.notify(e.entryReport(date, len(stocks), placed, deployed, dropped))
+	e.notify(e.entryReport(date, len(stocks), len(carried), placed, deployed, dropped))
 	return nil
 }
 
 // recordScan persists the day's scanned stocks and their outcome (traded /
-// dropped+reason / held) so the dashboard can show the full scan, not just trades.
-func (e *Engine) recordScan(date string, stocks []scanner.Stock, traded map[string]bool, dropped map[string]string, held bool) {
+// carried / dropped+reason / held) plus source screener, so the dashboard can
+// show the full scan — the system's audit trail.
+func (e *Engine) recordScan(date string, stocks []scanner.Stock, traded, carried map[string]bool, dropped map[string]string, held bool) {
 	if e.Store == nil {
 		return
 	}
 	rows := make([]store.ScanRow, 0, len(stocks))
 	for _, s := range stocks {
-		r := store.ScanRow{Date: date, Symbol: s.Symbol, Close: s.Close, Outcome: "dropped"}
+		r := store.ScanRow{Date: date, Symbol: s.Symbol, Close: s.Close, Source: s.Source, Outcome: "dropped"}
 		switch {
 		case traded[s.Symbol]:
 			r.Outcome = "traded"
+		case carried[s.Symbol]:
+			r.Outcome, r.Reason = "carried", "already held — sell skipped"
 		case dropped[s.Symbol] != "":
 			r.Reason = dropped[s.Symbol]
 		case held:
@@ -235,12 +280,12 @@ func (e *Engine) proposalReport(date string, plan []planItem, deployed float64) 
 	return b.String()
 }
 
-func (e *Engine) entryReport(date string, scanned int, placed []model.Position,
+func (e *Engine) entryReport(date string, scanned, carried int, placed []model.Position,
 	deployed float64, dropped map[string]string) string {
 
 	var b strings.Builder
 	fmt.Fprintf(&b, "🟢 *BTST Entry* — %s [%s]\n", date, e.modeTag())
-	fmt.Fprintf(&b, "Traded: %d / %d (max %d)\n", len(placed), scanned, config.BTSTMaxStocks)
+	fmt.Fprintf(&b, "Scanned: %d · Carried: %d · New buys: %d\n", scanned, carried, len(placed))
 	fmt.Fprintf(&b, "Capital deployed: ₹%s of ₹%s\n",
 		commaINR(deployed), commaINR(config.BTSTCapitalPerDay))
 	b.WriteString("———\n")

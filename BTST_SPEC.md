@@ -1,29 +1,25 @@
-# BTST Auto-Trade Engine — Build Spec (v6, locked)
+# BTST Auto-Trade Engine — Build Spec (v8, locked)
 
-> Single Go binary that scans ChartInk `pur-ema10-20` at 3:20 PM, places equal-weight
-> BTST trades, squares off next day at 3:20 PM, with a web dashboard.
+> Single Go binary that scans TWO ChartInk screeners at 3:20 PM (distinct union),
+> CARRIES holdings the scan re-listed, squares off the rest, buys the new names —
+> each with a 2% TRAILING stop ratcheted by an intraday monitor. Web dashboard.
 > Runs 30 days in paper mode, then flips to live.
 
-## Locked decisions
+## Locked decisions (v8)
 | # | Decision |
 |---|----------|
-| Scanner | ChartInk `pur-ema10-20` only (all book scanners removed) |
-| Merge | C# scraper ported into Go → one binary |
-| Scrape method | **HTTP only** — GET screener page, extract `scan_clause` + CSRF at runtime, POST `/process`, parse JSON. No headless browser. |
-| Strategy | Pure BTST: buy 3:20 PM, sell next trading day 3:20 PM |
-| Scan time | 3:20 PM live (accept provisional daily candle) |
-| Entry | Market BUY + SL handling |
-| Stop loss | Configurable % (default 6.5%), software-tracked in paper |
-| Exit | Market SELL next trading day 3:20 PM; skip if SL already hit |
-| Capital | ₹5L fixed per day ÷ N stocks equal weight (N ≤ 20) |
-| Capital cycle | T+1 sale proceeds NOT reused same day; fresh ₹5L/day (₹10L total split) |
-| Macro gate (Tier 1) | India VIX + GIFT Nifty + Nifty intraday → skip whole day if bad |
-| News gate (Tier 2) | Per-stock keyword filter → drop bad names, trade the rest |
-| Neutral day | TRADE |
-| Mode | Paper 30 days (`PAPER_MODE=true`) → live via flag, identical code |
-| UI | Web dashboard on :8085 (trades, positions, P&L, win rate) |
-| Reporting | Entry / exit / skip reports to log + dashboard, [PAPER] label |
-| Repo | Clean rebuild in existing repo; reuse 5 working pieces |
+| Scanners | `ema-reversal-93` + `pvema-3`; top 20 from EACH → distinct union (≤40). One failing screener is tolerated; both failing → square off all + skip buys. |
+| Scrape method | **HTTP only** — GET screener page, extract clause (`atlas_query`) + CSRF at runtime, POST `/process`, parse JSON. No headless browser. |
+| Carry-over | At 15:20 scan FIRST; holdings re-listed by the scan are NOT sold and NOT re-bought (carry_count++). Holdings that fell off the list are squared off. Sell before buy. |
+| Buys | New names only = union − already-held. Market BUY before the 15:30 close. |
+| Stop loss | **2% TRAILING**: stop = watermark × 0.98 where watermark = highest price since entry; only ratchets UP. Entry 10 → SL 9.8; peak 12 → SL 11.76. |
+| Intraday monitor | Every 5 min (config) during 09:15–15:30: poll quotes, ratchet SL (audit row in sl_events), exit immediately on breach at observed price. Entry-day session high is ignored (pre-ownership); later days use the day high. Restart-safe (reloads from DB). |
+| Capital | ₹5L/day ÷ N over NEW buys only; carried positions consume no fresh capital |
+| Tracker | scans (outcome traded/carried/dropped/held + source screener + time), positions (peak, last, carry_count), sl_events (every trail step) — full audit |
+| Gates / approval | Dormant (`BTST_GATE_ENABLED=false`; `ApproveBuy` hook nil) |
+| Mode | Paper (`PAPER_MODE=true`) → live via flag, identical code |
+| UI | Dashboard on :8085 — stat cards (holdings/deployed/unrealised/realised/total/win-rate), tabs: Holdings (peak+trail SL+unreal P&L, carry badge) / Today's Scan (source) / Closed / SL Trail / History. Manual ▶ Run (token). |
+| Storage | Turso (libSQL) when TURSO_* set; local SQLite fallback |
 | Deploy | Render (free) + UptimeRobot keep-alive |
 
 ## ChartInk HTTP recipe (validated 2026-06-24)

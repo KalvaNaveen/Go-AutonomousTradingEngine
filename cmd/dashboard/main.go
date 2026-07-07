@@ -53,14 +53,14 @@ func main() {
 // exits (a win, a loss, and a stop-loss) so the dashboard shows all states.
 func seedDemo(st *store.Store) error {
 	e := &engine.Engine{
-		Scraper: scanner.NewScraper(config.BTSTScreener),
+		Scanner: scanner.NewMulti(config.BTSTScreeners),
 		Broker:  broker.NewPaperBroker(),
 		Store:   st,
 		Notify:  func(string) {},
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
 	defer cancel()
-	if err := e.RunEntry(ctx); err != nil {
+	if err := e.RunCycle(ctx); err != nil {
 		return err
 	}
 

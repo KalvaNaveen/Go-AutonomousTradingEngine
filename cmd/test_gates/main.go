@@ -49,14 +49,15 @@ func main() {
 	defer st.Close()
 
 	e := &engine.Engine{
-		Scraper:    scanner.NewScraper(config.BTSTScreener),
+		Scanner:    scanner.NewMulti(config.BTSTScreeners),
 		Broker:     broker.NewPaperBroker(),
 		Store:      st,
-		Notify:     func(msg string) { fmt.Println("\n--- TELEGRAM ---\n" + msg) },
+		Notify:     func(msg string) { fmt.Println("\n--- REPORT ---\n" + msg) },
+		Quotes:     q,
 		MacroGate:  macro.Check,
 		NewsFilter: news.Filter,
 	}
-	if err := e.RunEntry(ctx); err != nil {
+	if err := e.RunCycle(ctx); err != nil {
 		log.Fatalf("gated entry: %v", err)
 	}
 }
