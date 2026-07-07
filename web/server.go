@@ -145,12 +145,13 @@ type summary struct {
 	Open          []positionView `json:"open"`
 	Closed        []positionView `json:"closed"`
 
-	ScanDate     string          `json:"scan_date"`
-	ScanTime     string          `json:"scan_time"`
-	ScannedCount int             `json:"scanned_count"`
-	TradedCount  int             `json:"traded_count"`
-	Scan         []store.ScanRow `json:"scan"`
-	SLEvents     []store.SLEvent `json:"sl_events"`
+	ScanDate     string           `json:"scan_date"`
+	ScanTime     string           `json:"scan_time"`
+	ScannedCount int              `json:"scanned_count"`
+	TradedCount  int              `json:"traded_count"`
+	Scan         []store.ScanRow  `json:"scan"`
+	SLEvents     []store.SLEvent  `json:"sl_events"`
+	Daily        []store.DailyPnL `json:"daily"` // equity-curve series (net per day)
 }
 
 func view(p model.Position) positionView {
@@ -233,6 +234,7 @@ func (s *Server) handleSummary(w http.ResponseWriter, r *http.Request) {
 	}
 
 	out.SLEvents, _ = s.store.SLEvents(20)
+	out.Daily, _ = s.store.DailyNetPnL()
 
 	// Most recent daily scan (scanned vs traded vs dropped/held).
 	if d, err := s.store.LatestScanDate(); err == nil && d != "" {

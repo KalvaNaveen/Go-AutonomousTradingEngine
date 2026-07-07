@@ -286,6 +286,33 @@ func (s *Store) MarkCarried(id int64) error {
 	return err
 }
 
+// DailyPnL is one day's realised net P&L (after charges) — the equity curve.
+type DailyPnL struct {
+	Date string  `json:"date"`
+	Net  float64 `json:"net"`
+}
+
+// DailyNetPnL returns net realised P&L per trade date, oldest first.
+func (s *Store) DailyNetPnL() ([]DailyPnL, error) {
+	rows, err := s.db.Query(`
+SELECT trade_date, SUM(COALESCE(pnl,0) - COALESCE(charges,0))
+  FROM positions WHERE status='closed'
+ GROUP BY trade_date ORDER BY trade_date`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []DailyPnL
+	for rows.Next() {
+		var d DailyPnL
+		if err := rows.Scan(&d.Date, &d.Net); err != nil {
+			return nil, err
+		}
+		out = append(out, d)
+	}
+	return out, rows.Err()
+}
+
 // SLEvent is one trailing-stop adjustment (audit trail).
 type SLEvent struct {
 	Symbol string  `json:"symbol"`

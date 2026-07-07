@@ -1,8 +1,9 @@
 package web
 
-// dashboardHTML is the single-page BTST dashboard, styled after Zerodha
-// Kite/Console: white, thin borders, dense readable tables, colour only where
-// it carries meaning. Polls /api/summary every 20s. Dependency-free (no CDN).
+// dashboardHTML is the single-page BTST dashboard, designed after modern retail
+// trading apps (Groww / Robinhood): hero P&L with an SVG equity curve, ticker
+// avatars, red/green pills, soft cards, pill tabs. Polls /api/summary every 20s.
+// Dependency-free — the chart is hand-rolled SVG, no CDN.
 const dashboardHTML = `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -11,86 +12,127 @@ const dashboardHTML = `<!DOCTYPE html>
 <title>BTST Engine</title>
 <style>
   :root{
-    --blue:#387ed1;--grn:#4caf50;--red:#df514c;--amb:#de9b00;
-    --txt:#444;--mut:#9b9b9b;--faint:#cfcfcf;--bd:#e8e8e8;--bg2:#f9f9f9;
+    --acc:#5367ff;--grn:#00b386;--red:#eb5b3c;--amb:#f5a623;
+    --txt:#44475b;--head:#1b1e2e;--mut:#7c7e8c;--faint:#b6b8c3;
+    --bg:#f7f8fc;--card:#ffffff;--bd:#ebedf5;
+    --shadow:0 2px 10px rgba(20,24,60,.06);
   }
   *{box-sizing:border-box;margin:0;padding:0}
-  body{background:#fff;color:var(--txt);
-    font:13px/1.5 'Inter','Helvetica Neue',Helvetica,Arial,sans-serif;
-    padding-bottom:56px}
-  .wrap{max-width:1100px;margin:0 auto;padding:0 20px}
+  body{background:var(--bg);color:var(--txt);
+    font:14px/1.5 'Inter',-apple-system,'Segoe UI',Roboto,'Helvetica Neue',sans-serif;
+    padding-bottom:60px}
+  .wrap{max-width:1080px;margin:0 auto;padding:0 20px}
 
-  /* ── top bar ─────────────────────────────────────────── */
-  header{position:sticky;top:0;z-index:10;background:#fff;border-bottom:1px solid var(--bd)}
-  .bar{display:flex;align-items:center;gap:10px;padding:12px 0;flex-wrap:wrap}
-  .logo{font-size:15px;font-weight:600;color:#333}
-  .badge{font-size:10px;font-weight:600;padding:2px 8px;border-radius:3px;letter-spacing:.5px}
-  .paper{background:#e8f1fb;color:var(--blue)}
-  .live{background:#fdeeed;color:var(--red)}
+  /* ── nav ─────────────────────────────────────────────── */
+  nav{background:var(--card);border-bottom:1px solid var(--bd);position:sticky;top:0;z-index:20}
+  .bar{display:flex;align-items:center;gap:12px;padding:14px 0;flex-wrap:wrap}
+  .logo{display:flex;align-items:center;gap:9px;font-size:16.5px;font-weight:700;color:var(--head)}
+  .logomark{width:28px;height:28px;border-radius:8px;background:linear-gradient(135deg,var(--acc),#7a8cff);
+    color:#fff;display:inline-flex;align-items:center;justify-content:center;font-size:13px;font-weight:800}
+  .badge{font-size:10px;font-weight:700;padding:3px 10px;border-radius:999px;letter-spacing:.6px}
+  .paper{background:#eef1ff;color:var(--acc)}
+  .live{background:#fdeeea;color:var(--red)}
   .spacer{margin-left:auto}
-  .muted{color:var(--mut);font-size:11.5px}
-  #runbtn{background:var(--blue);color:#fff;border:0;border-radius:3px;
-    padding:7px 14px;font-size:12px;font-weight:600;cursor:pointer}
-  #runbtn:hover{background:#3272bd}
-  #runbtn:disabled{opacity:.5;cursor:wait}
+  .muted{color:var(--mut);font-size:12px}
+  #runbtn{background:var(--acc);color:#fff;border:0;border-radius:10px;
+    padding:9px 18px;font-size:13px;font-weight:700;cursor:pointer;
+    box-shadow:0 4px 12px #5367ff33;transition:all .15s}
+  #runbtn:hover{background:#4356e0;transform:translateY(-1px)}
+  #runbtn:disabled{opacity:.5;cursor:wait;transform:none}
 
-  /* ── stat strip ──────────────────────────────────────── */
-  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));
-    gap:0;margin:18px 0;border:1px solid var(--bd);border-radius:4px;background:#fff}
-  .card{padding:13px 16px;border-right:1px solid var(--bd)}
-  .card:last-child{border-right:0}
-  .card .lbl{color:var(--mut);font-size:10.5px;text-transform:uppercase;letter-spacing:.5px}
-  .card .val{font-size:18px;font-weight:500;margin-top:4px;font-variant-numeric:tabular-nums;color:#333}
-  .card .val.pos{color:var(--grn)} .card .val.neg{color:var(--red)}
-  .card .sub{color:var(--mut);font-size:11px;margin-top:1px}
+  /* ── hero ────────────────────────────────────────────── */
+  .hero{background:var(--card);border:1px solid var(--bd);border-radius:16px;
+    box-shadow:var(--shadow);margin:20px 0;padding:22px 24px 8px;overflow:hidden}
+  .hero .lbl{color:var(--mut);font-size:12px;font-weight:600}
+  .heroline{display:flex;align-items:baseline;gap:12px;flex-wrap:wrap;margin-top:4px}
+  .heroval{font-size:34px;font-weight:800;color:var(--head);font-variant-numeric:tabular-nums;letter-spacing:-.5px}
+  .heroval.pos{color:var(--grn)} .heroval.neg{color:var(--red)}
+  .chips{display:flex;gap:8px;flex-wrap:wrap;margin:10px 0 4px}
+  .chipk{background:var(--bg);border:1px solid var(--bd);border-radius:999px;
+    padding:4px 12px;font-size:11.5px;color:var(--mut)}
+  .chipk b{color:var(--txt);font-weight:600;font-variant-numeric:tabular-nums}
+  .chipk b.pos{color:var(--grn)} .chipk b.neg{color:var(--red)}
+  #chart{width:100%;height:150px;display:block;margin-top:6px}
+  .chartempty{color:var(--faint);font-size:12.5px;text-align:center;padding:38px 0}
 
-  /* ── tabs ────────────────────────────────────────────── */
-  .tabs{display:flex;gap:22px;border-bottom:1px solid var(--bd);margin:4px 0 0;overflow-x:auto}
-  .tab{background:none;border:0;color:var(--mut);font-size:12.5px;font-weight:500;cursor:pointer;
-    padding:9px 2px;border-bottom:2px solid transparent;white-space:nowrap}
-  .tab:hover{color:var(--txt)}
-  .tab.on{color:var(--blue);border-bottom-color:var(--blue);font-weight:600}
-  .tab .n{color:var(--faint);font-size:11px;margin-left:4px}
-  .tab.on .n{color:var(--blue)}
-  section{display:none;padding-top:14px}
+  /* ── quick stats ─────────────────────────────────────── */
+  .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin:0 0 20px}
+  .stat{background:var(--card);border:1px solid var(--bd);border-radius:14px;
+    box-shadow:var(--shadow);padding:14px 16px}
+  .stat .lbl{color:var(--mut);font-size:11px;font-weight:600}
+  .stat .val{font-size:19px;font-weight:700;color:var(--head);margin-top:3px;font-variant-numeric:tabular-nums}
+  .stat .sub{color:var(--faint);font-size:11px;margin-top:1px}
+
+  /* ── pill tabs ───────────────────────────────────────── */
+  .tabs{display:flex;gap:8px;margin:0 0 14px;overflow-x:auto;padding-bottom:2px}
+  .tab{background:var(--card);border:1px solid var(--bd);color:var(--mut);
+    font-size:12.5px;font-weight:600;cursor:pointer;padding:8px 16px;border-radius:999px;
+    white-space:nowrap;transition:all .12s}
+  .tab:hover{color:var(--head);border-color:#d5d9ea}
+  .tab.on{background:var(--head);border-color:var(--head);color:#fff}
+  .tab .n{opacity:.55;margin-left:5px;font-weight:500}
+  section{display:none}
   section.on{display:block}
 
-  /* ── tables ──────────────────────────────────────────── */
+  /* ── panels & tables ─────────────────────────────────── */
+  .panel{background:var(--card);border:1px solid var(--bd);border-radius:16px;
+    box-shadow:var(--shadow);overflow:hidden}
   .tblwrap{overflow-x:auto}
-  table{width:100%;border-collapse:collapse;min-width:640px}
-  th,td{text-align:right;padding:9px 12px;border-bottom:1px solid #f1f1f1;
-    font-variant-numeric:tabular-nums;white-space:nowrap;font-size:12.5px}
-  th:first-child,td:first-child{text-align:left;padding-left:2px}
-  th:last-child,td:last-child{padding-right:2px}
-  th{color:var(--mut);font-size:10.5px;text-transform:uppercase;letter-spacing:.5px;
-    font-weight:500;border-bottom:1px solid var(--bd)}
-  tbody tr:hover{background:var(--bg2)}
-  .sym{font-weight:600;color:#333}
+  table{width:100%;border-collapse:collapse;min-width:700px}
+  th,td{text-align:right;padding:12px 14px;font-variant-numeric:tabular-nums;
+    white-space:nowrap;font-size:13px;border-bottom:1px solid #f3f4fa}
+  th:first-child,td:first-child{text-align:left;padding-left:18px}
+  th:last-child,td:last-child{padding-right:18px}
+  th{color:var(--mut);font-size:10.5px;text-transform:uppercase;letter-spacing:.6px;
+    font-weight:600;background:#fafbff}
+  tbody tr:last-child td{border-bottom:none}
+  tbody tr{transition:background .1s}
+  tbody tr:hover{background:#fafbff}
+  .inst{display:flex;align-items:center;gap:10px}
+  .av{width:30px;height:30px;border-radius:9px;display:inline-flex;align-items:center;
+    justify-content:center;font-size:11px;font-weight:800;flex:none}
+  .sym{font-weight:600;color:var(--head);font-size:13px}
+  .symsub{color:var(--faint);font-size:10.5px;margin-top:1px}
   .pos{color:var(--grn)} .neg{color:var(--red)}
-  .sl{color:var(--red)} .dimtxt{color:var(--mut);font-size:11.5px}
-  .chip{display:inline-block;font-size:10px;font-weight:600;padding:1px 7px;border-radius:2px}
-  .c-traded{background:#edf7ee;color:var(--grn)}
-  .c-carried{background:#e8f1fb;color:var(--blue)}
-  .c-dropped{background:#f5f5f5;color:var(--mut)}
-  .c-held{background:#fdf6e3;color:var(--amb)}
-  .carry{color:var(--blue);font-size:10.5px;font-weight:600;margin-left:5px}
-  .empty{color:var(--mut);padding:40px;text-align:center;font-size:12.5px}
-  .hsub{color:var(--mut);font-size:10.5px;margin:18px 0 6px;text-transform:uppercase;letter-spacing:.5px;font-weight:500}
-  #histdate{background:#fff;color:var(--txt);border:1px solid var(--bd);border-radius:3px;
-    padding:6px 10px;font-size:12.5px;margin-bottom:10px}
+  .sl{color:var(--red)} .dimtxt{color:var(--mut);font-size:12px}
+  .pill{display:inline-block;font-size:11px;font-weight:700;padding:2.5px 9px;border-radius:999px}
+  .pg{background:#e5f7f1;color:var(--grn)} .pr{background:#fdeeea;color:var(--red)}
+  .pn{background:#f1f2f7;color:var(--mut)}
+  .chip{display:inline-block;font-size:10.5px;font-weight:700;padding:2px 9px;border-radius:999px}
+  .c-traded{background:#e5f7f1;color:var(--grn)}
+  .c-carried{background:#eef1ff;color:var(--acc)}
+  .c-dropped{background:#f1f2f7;color:var(--mut)}
+  .c-held{background:#fdf3df;color:var(--amb)}
+  .carry{color:var(--acc);font-size:10px;font-weight:800;margin-left:6px;
+    background:#eef1ff;border-radius:999px;padding:1px 6px}
+  .empty{color:var(--mut);padding:44px;text-align:center;font-size:13px}
+  .hsub{color:var(--mut);font-size:11px;margin:18px 2px 8px;text-transform:uppercase;
+    letter-spacing:.6px;font-weight:600}
+  #histdate{background:var(--card);color:var(--txt);border:1px solid var(--bd);border-radius:10px;
+    padding:8px 12px;font-size:13px;margin-bottom:12px;box-shadow:var(--shadow)}
 </style>
 </head>
 <body>
-<header><div class="wrap bar">
-  <span class="logo">BTST Engine</span>
+<nav><div class="wrap bar">
+  <span class="logo"><span class="logomark">B</span>BTST Engine</span>
   <span id="mode" class="badge paper">…</span>
   <span class="spacer"></span>
   <span class="muted" id="updated"></span>
-  <button id="runbtn" onclick="runNow()" title="Manual scan + trade (needs trigger token)">Run scan</button>
-</div></header>
+  <button id="runbtn" onclick="runNow()" title="Manual scan + trade (needs trigger token)">▶ Run scan</button>
+</div></nav>
 
 <div class="wrap">
-  <div class="cards" id="cards"></div>
+  <div class="hero">
+    <div class="lbl">Total P&L (net of charges)</div>
+    <div class="heroline">
+      <span class="heroval" id="heropnl">—</span>
+      <span id="heropill"></span>
+    </div>
+    <div class="chips" id="herochips"></div>
+    <div id="chartbox"><div class="chartempty">Equity curve appears once trades start closing</div></div>
+  </div>
+
+  <div class="stats" id="stats"></div>
 
   <div class="tabs">
     <button class="tab on" data-t="positions" onclick="showTab('positions')">Holdings<span class="n" id="n-pos">0</span></button>
@@ -100,10 +142,10 @@ const dashboardHTML = `<!DOCTYPE html>
     <button class="tab" data-t="hist" onclick="showTab('hist')">History</button>
   </div>
 
-  <section id="s-positions" class="on"><div id="open"></div></section>
-  <section id="s-scan"><div class="hsub" id="scanmeta"></div><div id="scan"></div></section>
-  <section id="s-closed"><div id="closed"></div></section>
-  <section id="s-sl"><div id="slev"></div></section>
+  <section id="s-positions" class="on"><div class="panel" id="open"></div></section>
+  <section id="s-scan"><div class="hsub" id="scanmeta"></div><div class="panel" id="scan"></div></section>
+  <section id="s-closed"><div class="panel" id="closed"></div></section>
+  <section id="s-sl"><div class="panel" id="slev"></div></section>
   <section id="s-hist">
     <select id="histdate"><option value="">Loading dates…</option></select>
     <div id="hist"></div>
@@ -111,33 +153,71 @@ const dashboardHTML = `<!DOCTYPE html>
 </div>
 
 <script>
-const inr = n => '₹' + Math.round(n).toLocaleString('en-IN');
+const inr = n => '₹' + Math.round(Math.abs(n)).toLocaleString('en-IN');
+const sinr = n => (n<0?'−':'+') + inr(n);
 const cls = n => n > 0 ? 'pos' : n < 0 ? 'neg' : '';
 const sign = n => (n > 0 ? '+' : '') + n.toFixed(2);
 const f2 = n => (n == null ? 0 : n).toFixed(2);
+const AVC = ['#5367ff','#00b386','#eb5b3c','#f5a623','#9b59b6','#17a2b8','#e91e63','#2e7d32'];
+function av(sym){
+  let h=0; for(let i=0;i<sym.length;i++) h=(h*31+sym.charCodeAt(i))>>>0;
+  const c=AVC[h%AVC.length];
+  return '<span class="av" style="background:'+c+'1c;color:'+c+'">'+sym.slice(0,2)+'</span>';
+}
+function pill(v){ return '<span class="pill '+(v>0?'pg':v<0?'pr':'pn')+'">'+sign(v)+'%</span>'; }
+function inst(sym, sub, extra){
+  return '<div class="inst">'+av(sym)+'<div><div class="sym">'+sym+(extra||'')+'</div>'
+       + (sub?'<div class="symsub">'+sub+'</div>':'')+'</div></div>';
+}
 
 function showTab(t){
   document.querySelectorAll('.tab').forEach(b=>b.classList.toggle('on', b.dataset.t===t));
   document.querySelectorAll('section').forEach(s=>s.classList.toggle('on', s.id==='s-'+t));
 }
 
-function card(lbl, val, sub, klass){
-  return '<div class="card"><div class="lbl">'+lbl+'</div><div class="val '+(klass||'')+'">'+val+'</div>'
-       + (sub?'<div class="sub">'+sub+'</div>':'') + '</div>';
+function stat(lbl, val, sub){
+  return '<div class="stat"><div class="lbl">'+lbl+'</div><div class="val">'+val+'</div>'
+       + (sub?'<div class="sub">'+sub+'</div>':'')+'</div>';
 }
 function wrapT(inner){ return '<div class="tblwrap"><table>'+inner+'</table></div>'; }
 
+/* ── equity curve (hand-rolled SVG) ── */
+function chart(daily){
+  if(!daily || daily.length < 2) return '<div class="chartempty">Equity curve appears once a few days of trades close</div>';
+  let cum = 0;
+  const pts = daily.map(d => (cum += d.net));
+  const n = pts.length, W = 720, H = 150, P = 10;
+  let mn = Math.min(0, ...pts), mx = Math.max(0, ...pts);
+  if(mx === mn){ mx = mn + 1; }
+  const X = i => P + i*(W-2*P)/(n-1);
+  const Y = v => P + (mx-v)*(H-2*P)/(mx-mn);
+  const up = pts[n-1] >= 0, col = up ? '#00b386' : '#eb5b3c';
+  let line = '', area = 'M'+X(0)+','+Y(0>mn?0:mn)+' ';
+  for(let i=0;i<n;i++){ line += (i?'L':'M')+X(i).toFixed(1)+','+Y(pts[i]).toFixed(1)+' '; }
+  area = line + 'L'+X(n-1).toFixed(1)+','+(H-P)+' L'+X(0).toFixed(1)+','+(H-P)+' Z';
+  const zero = (mn<0 && mx>0)
+    ? '<line x1="'+P+'" y1="'+Y(0).toFixed(1)+'" x2="'+(W-P)+'" y2="'+Y(0).toFixed(1)+'" stroke="#d5d9ea" stroke-dasharray="4 4"/>' : '';
+  const lastX = X(n-1).toFixed(1), lastY = Y(pts[n-1]).toFixed(1);
+  return '<svg id="chart" viewBox="0 0 '+W+' '+H+'" preserveAspectRatio="none">'
+    + '<defs><linearGradient id="g" x1="0" y1="0" x2="0" y2="1">'
+    + '<stop offset="0%" stop-color="'+col+'" stop-opacity=".18"/>'
+    + '<stop offset="100%" stop-color="'+col+'" stop-opacity="0"/></linearGradient></defs>'
+    + zero
+    + '<path d="'+area+'" fill="url(#g)"/>'
+    + '<path d="'+line+'" fill="none" stroke="'+col+'" stroke-width="2.2" stroke-linejoin="round"/>'
+    + '<circle cx="'+lastX+'" cy="'+lastY+'" r="3.5" fill="'+col+'"/>'
+    + '</svg>';
+}
+
 function openTable(rows){
-  if(!rows||!rows.length) return '<div class="empty">No holdings. The 15:20 IST cycle (or Run scan) fills this.</div>';
-  let h='<tr><th>Instrument</th><th>Entry at</th><th>Qty</th><th>Entry</th><th>LTP</th><th>Peak</th><th>Trail SL</th><th>P&L</th><th>%</th></tr>';
+  if(!rows||!rows.length) return '<div class="empty">No holdings yet — the 15:20 IST cycle (or ▶ Run scan) fills this.</div>';
+  let h='<tr><th>Instrument</th><th>Qty</th><th>Entry</th><th>LTP</th><th>Peak</th><th>Trail SL</th><th>P&L</th><th>%</th></tr>';
   for(const p of rows){
     const carry = p.carry_count>0 ? '<span class="carry">↻'+p.carry_count+'</span>' : '';
-    h+='<tr><td class="sym">'+p.symbol+carry+'</td><td class="dimtxt">'+(p.entry_at||p.trade_date)
-      +'</td><td>'+p.qty+'</td><td>'+f2(p.entry_price)
-      +'</td><td>'+f2(p.last_price)+'</td><td class="dimtxt">'+f2(p.peak_price)
+    h+='<tr><td>'+inst(p.symbol, p.entry_at||p.trade_date, carry)+'</td><td>'+p.qty+'</td><td>'+f2(p.entry_price)
+      +'</td><td><b>'+f2(p.last_price)+'</b></td><td class="dimtxt">'+f2(p.peak_price)
       +'</td><td class="sl">'+f2(p.sl_price)
-      +'</td><td class="'+cls(p.unreal_pnl||0)+'">'+sign(p.unreal_pnl||0)
-      +'</td><td class="'+cls(p.unreal_pct||0)+'">'+sign(p.unreal_pct||0)+'%</td></tr>';
+      +'</td><td class="'+cls(p.unreal_pnl||0)+'"><b>'+sign(p.unreal_pnl||0)+'</b></td><td>'+pill(p.unreal_pct||0)+'</td></tr>';
   }
   return wrapT(h);
 }
@@ -145,35 +225,33 @@ function openTable(rows){
 function scanBadge(o){ return '<span class="chip c-'+o+'">'+o+'</span>'; }
 function scanTable(rows){
   if(!rows||!rows.length) return '<div class="empty">No scan yet today.</div>';
-  let h='<tr><th>Instrument</th><th>Source</th><th>Chg%</th><th>Close</th><th>Status</th><th>Reason</th></tr>';
+  let h='<tr><th>Instrument</th><th>Chg%</th><th>Close</th><th>Status</th><th>Reason</th></tr>';
   for(const r of rows)
-    h+='<tr><td class="sym">'+r.symbol+'</td><td class="dimtxt">'+(r.source||'')+'</td><td class="'+cls(r.per_chg||0)+'">'+sign(r.per_chg||0)+'%</td><td>'+f2(r.close)
+    h+='<tr><td>'+inst(r.symbol, r.source||'')+'</td><td>'+pill(r.per_chg||0)+'</td><td>'+f2(r.close)
       +'</td><td>'+scanBadge(r.outcome)+'</td><td class="dimtxt">'+(r.reason||'')+'</td></tr>';
   return wrapT(h);
 }
 
 function closedTable(rows){
   if(!rows||!rows.length) return '<div class="empty">No closed trades yet.</div>';
-  let h='<tr><th>Instrument</th><th>Entry at</th><th>Exit at</th><th>Entry</th><th>Exit</th><th>Reason</th><th>Gross P&L</th><th>Charges</th><th>Net P&L</th><th>Net %</th></tr>';
+  let h='<tr><th>Instrument</th><th>Exit at</th><th>Entry</th><th>Exit</th><th>Reason</th><th>Gross</th><th>Charges</th><th>Net P&L</th><th>Net %</th></tr>';
   for(const p of rows){
     const rsn = p.exit_reason==='stoploss' ? '<span class="sl">SL hit</span>' : '<span class="dimtxt">square-off</span>';
-    h+='<tr><td class="sym">'+p.symbol+'</td><td class="dimtxt">'+(p.entry_at||p.trade_date)
-      +'</td><td class="dimtxt">'+(p.exit_at||'')+'</td><td>'+f2(p.entry_price)
-      +'</td><td>'+f2(p.exit_price)+'</td><td>'+rsn
+    h+='<tr><td>'+inst(p.symbol, p.entry_at||p.trade_date)+'</td><td class="dimtxt">'+(p.exit_at||'')
+      +'</td><td>'+f2(p.entry_price)+'</td><td>'+f2(p.exit_price)+'</td><td>'+rsn
       +'</td><td class="'+cls(p.pnl)+'">'+sign(p.pnl)
       +'</td><td class="dimtxt">'+f2(p.charges||0)
-      +'</td><td class="'+cls(p.net_pnl||0)+'">'+sign(p.net_pnl||0)
-      +'</td><td class="'+cls(p.net_pct||0)+'">'+sign(p.net_pct||0)+'%</td></tr>';
+      +'</td><td class="'+cls(p.net_pnl||0)+'"><b>'+sign(p.net_pnl||0)+'</b></td><td>'+pill(p.net_pct||0)+'</td></tr>';
   }
   return wrapT(h);
 }
 
 function slTable(rows){
-  if(!rows||!rows.length) return '<div class="empty">No trailing-SL adjustments yet. They appear as prices rise.</div>';
+  if(!rows||!rows.length) return '<div class="empty">No trailing-SL adjustments yet — they appear as prices rise.</div>';
   let h='<tr><th>Instrument</th><th>When</th><th>Price</th><th>Old SL</th><th>New SL</th></tr>';
   for(const e of rows)
-    h+='<tr><td class="sym">'+e.symbol+'</td><td class="dimtxt">'+e.at.replace('T',' ').slice(0,19)
-      +'</td><td>'+f2(e.price)+'</td><td class="dimtxt">'+f2(e.old_sl)+'</td><td class="pos">'+f2(e.new_sl)+'</td></tr>';
+    h+='<tr><td>'+inst(e.symbol)+'</td><td class="dimtxt">'+e.at.replace('T',' ').slice(0,19)
+      +'</td><td>'+f2(e.price)+'</td><td class="dimtxt">'+f2(e.old_sl)+'</td><td class="pos"><b>'+f2(e.new_sl)+'</b></td></tr>';
   return wrapT(h);
 }
 
@@ -182,14 +260,25 @@ async function load(){
     const s = await (await fetch('/api/summary')).json();
     const m = document.getElementById('mode');
     m.textContent = s.mode; m.className = 'badge ' + (s.mode==='LIVE'?'live':'paper');
+
     const netTot = (s.net_realized||0)+(s.unrealized_pnl||0);
-    document.getElementById('cards').innerHTML =
-      card('Holdings', s.open_count, s.carried_count ? s.carried_count+' carried' : '&nbsp;') +
-      card('Deployed', inr(s.open_invested), 'of '+inr(s.capital_per_day)+'/day') +
-      card('Unrealised', sign(s.unrealized_pnl||0), 'mark-to-market', cls(s.unrealized_pnl||0)) +
-      card('Realised (net)', sign(s.net_realized||0), 'gross '+sign(s.realized_pnl||0)+' − '+(s.total_charges||0).toFixed(0)+' chg', cls(s.net_realized||0)) +
-      card('Total P&L', sign(netTot), 'net of charges', cls(netTot)) +
-      card('Win rate', (s.win_rate||0).toFixed(0)+'%', s.wins+' of '+s.closed_count);
+    const hero = document.getElementById('heropnl');
+    hero.textContent = sinr(netTot); hero.className = 'heroval ' + cls(netTot);
+    const invested = s.open_invested||0;
+    document.getElementById('heropill').innerHTML = invested>0 ? pill(netTot/invested*100) : '';
+    document.getElementById('herochips').innerHTML =
+      '<span class="chipk">Realised <b class="'+cls(s.net_realized||0)+'">'+sinr(s.net_realized||0)+'</b></span>'
+     +'<span class="chipk">Unrealised <b class="'+cls(s.unrealized_pnl||0)+'">'+sinr(s.unrealized_pnl||0)+'</b></span>'
+     +'<span class="chipk">Charges <b>'+inr(s.total_charges||0)+'</b></span>'
+     +'<span class="chipk">Win rate <b>'+(s.win_rate||0).toFixed(0)+'%</b></span>';
+    document.getElementById('chartbox').innerHTML = chart(s.daily);
+
+    document.getElementById('stats').innerHTML =
+      stat('Holdings', s.open_count, s.carried_count ? s.carried_count+' carried over' : 'positions') +
+      stat('Deployed', inr(s.open_invested), 'of '+inr(s.capital_per_day)+' / day') +
+      stat('Closed trades', s.closed_count, s.wins+' winners') +
+      stat('Today’s scan', s.scanned_count||0, (s.traded_count||0)+' traded'+(s.scan_time?' at '+s.scan_time:''));
+
     document.getElementById('open').innerHTML = openTable(s.open);
     document.getElementById('scan').innerHTML = scanTable(s.scan);
     document.getElementById('closed').innerHTML = closedTable(s.closed);
@@ -210,14 +299,14 @@ async function load(){
 
 function histPositions(rows){
   if(!rows||!rows.length) return '<div class="empty">No positions this day.</div>';
-  let h='<tr><th>Instrument</th><th>Qty</th><th>Entry</th><th>Exit</th><th>P&L</th><th>Status</th></tr>';
+  let h='<tr><th>Instrument</th><th>Qty</th><th>Entry</th><th>Exit</th><th>Net P&L</th><th>Status</th></tr>';
   for(const p of rows){
     const closed = !!p.exit_price;
     const slm = p.exit_reason==='stoploss' ? ' <span class="sl">SL</span>' : '';
-    h+='<tr><td class="sym">'+p.symbol+'</td><td>'+p.qty+'</td><td>'+f2(p.entry_price)
+    h+='<tr><td>'+inst(p.symbol, p.entry_at||'')+'</td><td>'+p.qty+'</td><td>'+f2(p.entry_price)
       +'</td><td>'+(closed? f2(p.exit_price)+slm : '—')
-      +'</td><td class="'+(closed?cls(p.pnl):'')+'">'+(closed? sign(p.pnl):'—')
-      +'</td><td>'+(closed?'<span class="dimtxt">closed</span>':'<span style="color:var(--amb)">open</span>')+'</td></tr>';
+      +'</td><td class="'+(closed?cls(p.net_pnl||p.pnl):'')+'">'+(closed? sign(p.net_pnl!=null?p.net_pnl:p.pnl):'—')
+      +'</td><td>'+(closed?'<span class="pill pn">closed</span>':'<span class="pill" style="background:#fdf3df;color:var(--amb)">open</span>')+'</td></tr>';
   }
   return wrapT(h);
 }
@@ -228,8 +317,8 @@ async function loadHistory(date){
   try{
     const h = await (await fetch('/api/history?date='+encodeURIComponent(date))).json();
     box.innerHTML =
-      '<div class="hsub">Scan'+(h.scan_time?' — '+h.scan_time+' IST':'')+'</div>' + scanTable(h.scan) +
-      '<div class="hsub">Trades · net P&L <span class="'+cls(h.net_pnl)+'">'+sign(h.net_pnl)+'</span></div>' + histPositions(h.positions);
+      '<div class="hsub">Scan'+(h.scan_time?' — '+h.scan_time+' IST':'')+'</div><div class="panel">' + scanTable(h.scan) + '</div>'
+     +'<div class="hsub">Trades · net P&L <span class="'+cls(h.net_pnl)+'">'+sign(h.net_pnl)+'</span></div><div class="panel">' + histPositions(h.positions) + '</div>';
   }catch(e){ box.innerHTML = '<div class="empty">Error: '+e+'</div>'; }
 }
 
@@ -258,7 +347,7 @@ async function runNow(){
     const msg = await r.text();
     alert(r.ok ? msg : ('Failed: ' + r.status + ' ' + msg));
   }catch(e){ alert('Error: ' + e); }
-  finally{ btn.disabled = false; btn.textContent = 'Run scan'; setTimeout(load, 2500); }
+  finally{ btn.disabled = false; btn.textContent = '▶ Run scan'; setTimeout(load, 2500); }
 }
 
 load(); setInterval(load, 20000);
