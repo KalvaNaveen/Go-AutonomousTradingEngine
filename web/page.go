@@ -129,14 +129,15 @@ function wrapT(inner){ return '<div class="tblwrap"><table>'+inner+'</table></di
 
 function openTable(rows){
   if(!rows||!rows.length) return '<div class="empty">No holdings. The 15:20 IST cycle (or Run scan) fills this.</div>';
-  let h='<tr><th>Instrument</th><th>Qty</th><th>Entry</th><th>LTP</th><th>Peak</th><th>Trail SL</th><th>P&L</th><th>%</th><th>Since</th></tr>';
+  let h='<tr><th>Instrument</th><th>Entry at</th><th>Qty</th><th>Entry</th><th>LTP</th><th>Peak</th><th>Trail SL</th><th>P&L</th><th>%</th></tr>';
   for(const p of rows){
     const carry = p.carry_count>0 ? '<span class="carry">↻'+p.carry_count+'</span>' : '';
-    h+='<tr><td class="sym">'+p.symbol+carry+'</td><td>'+p.qty+'</td><td>'+f2(p.entry_price)
+    h+='<tr><td class="sym">'+p.symbol+carry+'</td><td class="dimtxt">'+(p.entry_at||p.trade_date)
+      +'</td><td>'+p.qty+'</td><td>'+f2(p.entry_price)
       +'</td><td>'+f2(p.last_price)+'</td><td class="dimtxt">'+f2(p.peak_price)
       +'</td><td class="sl">'+f2(p.sl_price)
       +'</td><td class="'+cls(p.unreal_pnl||0)+'">'+sign(p.unreal_pnl||0)
-      +'</td><td class="'+cls(p.unreal_pct||0)+'">'+sign(p.unreal_pct||0)+'%</td><td class="dimtxt">'+p.trade_date+'</td></tr>';
+      +'</td><td class="'+cls(p.unreal_pct||0)+'">'+sign(p.unreal_pct||0)+'%</td></tr>';
   }
   return wrapT(h);
 }
@@ -153,12 +154,16 @@ function scanTable(rows){
 
 function closedTable(rows){
   if(!rows||!rows.length) return '<div class="empty">No closed trades yet.</div>';
-  let h='<tr><th>Instrument</th><th>Date</th><th>Entry</th><th>Exit</th><th>Reason</th><th>P&L</th><th>%</th></tr>';
+  let h='<tr><th>Instrument</th><th>Entry at</th><th>Exit at</th><th>Entry</th><th>Exit</th><th>Reason</th><th>Gross P&L</th><th>Charges</th><th>Net P&L</th><th>Net %</th></tr>';
   for(const p of rows){
     const rsn = p.exit_reason==='stoploss' ? '<span class="sl">SL hit</span>' : '<span class="dimtxt">square-off</span>';
-    h+='<tr><td class="sym">'+p.symbol+'</td><td class="dimtxt">'+p.trade_date+'</td><td>'+f2(p.entry_price)
+    h+='<tr><td class="sym">'+p.symbol+'</td><td class="dimtxt">'+(p.entry_at||p.trade_date)
+      +'</td><td class="dimtxt">'+(p.exit_at||'')+'</td><td>'+f2(p.entry_price)
       +'</td><td>'+f2(p.exit_price)+'</td><td>'+rsn
-      +'</td><td class="'+cls(p.pnl)+'">'+sign(p.pnl)+'</td><td class="'+cls(p.pnl_pct)+'">'+sign(p.pnl_pct)+'%</td></tr>';
+      +'</td><td class="'+cls(p.pnl)+'">'+sign(p.pnl)
+      +'</td><td class="dimtxt">'+f2(p.charges||0)
+      +'</td><td class="'+cls(p.net_pnl||0)+'">'+sign(p.net_pnl||0)
+      +'</td><td class="'+cls(p.net_pct||0)+'">'+sign(p.net_pct||0)+'%</td></tr>';
   }
   return wrapT(h);
 }
@@ -177,13 +182,13 @@ async function load(){
     const s = await (await fetch('/api/summary')).json();
     const m = document.getElementById('mode');
     m.textContent = s.mode; m.className = 'badge ' + (s.mode==='LIVE'?'live':'paper');
-    const totPnl = (s.realized_pnl||0)+(s.unrealized_pnl||0);
+    const netTot = (s.net_realized||0)+(s.unrealized_pnl||0);
     document.getElementById('cards').innerHTML =
       card('Holdings', s.open_count, s.carried_count ? s.carried_count+' carried' : '&nbsp;') +
       card('Deployed', inr(s.open_invested), 'of '+inr(s.capital_per_day)+'/day') +
       card('Unrealised', sign(s.unrealized_pnl||0), 'mark-to-market', cls(s.unrealized_pnl||0)) +
-      card('Realised', sign(s.realized_pnl||0), s.closed_count+' closed', cls(s.realized_pnl||0)) +
-      card('Total P&L', sign(totPnl), '&nbsp;', cls(totPnl)) +
+      card('Realised (net)', sign(s.net_realized||0), 'gross '+sign(s.realized_pnl||0)+' − '+(s.total_charges||0).toFixed(0)+' chg', cls(s.net_realized||0)) +
+      card('Total P&L', sign(netTot), 'net of charges', cls(netTot)) +
       card('Win rate', (s.win_rate||0).toFixed(0)+'%', s.wins+' of '+s.closed_count);
     document.getElementById('open').innerHTML = openTable(s.open);
     document.getElementById('scan').innerHTML = scanTable(s.scan);

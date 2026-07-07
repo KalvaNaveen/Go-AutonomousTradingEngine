@@ -38,7 +38,19 @@ type Position struct {
 	ExitPrice  float64
 	ExitTime   time.Time
 	ExitReason string  // squareoff | stoploss
-	PnL        float64 // (ExitPrice - EntryPrice) * Qty, set on close
+	PnL        float64 // GROSS: (ExitPrice - EntryPrice) * Qty, set on close
+	Charges    float64 // round-trip CNC charges (STT/txn/SEBI/stamp/GST/DP), set on close
+}
+
+// NetPnL returns the realised P&L after broker/statutory charges.
+func (p Position) NetPnL() float64 { return p.PnL - p.Charges }
+
+// NetPct returns the post-charges return % on invested capital (closed trades).
+func (p Position) NetPct() float64 {
+	if inv := p.Invested(); inv > 0 {
+		return p.NetPnL() / inv * 100
+	}
+	return 0
 }
 
 // Invested returns the capital deployed into this position at entry.

@@ -88,6 +88,7 @@ func (e *Engine) MonitorOnce(ctx context.Context) {
 			p.ExitReason = model.ExitStopLoss
 			p.ExitTime = config.NowIST()
 			p.PnL = (fill - p.EntryPrice) * float64(p.Qty)
+			p.Charges = model.CNCCharges(p.Invested(), fill*float64(p.Qty))
 			p.Status = model.StatusClosed
 			if err := e.Store.ClosePosition(&p); err != nil {
 				log.Printf("[Monitor] persist close %s: %v", p.Symbol, err)

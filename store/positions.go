@@ -82,6 +82,7 @@ CREATE TABLE IF NOT EXISTS positions (
     exit_time   TEXT,
     exit_reason TEXT,
     pnl         REAL,
+    charges     REAL,           -- round-trip CNC charges, set on close
     peak_price  REAL,             -- trailing-SL watermark (highest seen since entry)
     last_price  REAL,             -- most recent monitored price
     carry_count INTEGER DEFAULT 0 -- times the screener re-listed this holding
@@ -123,6 +124,7 @@ CREATE INDEX IF NOT EXISTS idx_sl_pos ON sl_events(position_id);`)
 		`ALTER TABLE positions ADD COLUMN peak_price REAL`,
 		`ALTER TABLE positions ADD COLUMN last_price REAL`,
 		`ALTER TABLE positions ADD COLUMN carry_count INTEGER DEFAULT 0`,
+		`ALTER TABLE positions ADD COLUMN charges REAL`,
 	} {
 		_, _ = s.db.Exec(stmt)
 	}
@@ -316,10 +318,10 @@ SELECT symbol, at, price, old_sl, new_sl FROM sl_events ORDER BY id DESC LIMIT ?
 func (s *Store) ClosePosition(p *model.Position) error {
 	_, err := s.db.Exec(`
 UPDATE positions
-   SET status=?, exit_price=?, exit_time=?, exit_reason=?, pnl=?
+   SET status=?, exit_price=?, exit_time=?, exit_reason=?, pnl=?, charges=?
  WHERE id=?`,
 		model.StatusClosed, p.ExitPrice, p.ExitTime.Format(time.RFC3339),
-		p.ExitReason, p.PnL, p.ID)
+		p.ExitReason, p.PnL, p.Charges, p.ID)
 	return err
 }
 
@@ -350,7 +352,7 @@ func (s *Store) query(where string, args ...any) ([]model.Position, error) {
 	rows, err := s.db.Query(`
 SELECT id, symbol, qty, entry_price, entry_time, sl_price, trade_date, paper,
        COALESCE(buy_order,''), status, COALESCE(exit_price,0), COALESCE(exit_time,''),
-       COALESCE(exit_reason,''), COALESCE(pnl,0),
+       COALESCE(exit_reason,''), COALESCE(pnl,0), COALESCE(charges,0),
        COALESCE(peak_price,entry_price), COALESCE(last_price,entry_price), COALESCE(carry_count,0)
   FROM positions `+where, args...)
 	if err != nil {
@@ -365,7 +367,7 @@ SELECT id, symbol, qty, entry_price, entry_time, sl_price, trade_date, paper,
 		var entryTime, exitTime string
 		if err := rows.Scan(&p.ID, &p.Symbol, &p.Qty, &p.EntryPrice, &entryTime,
 			&p.SLPrice, &p.TradeDate, &paper, &p.BuyOrderID, &p.Status,
-			&p.ExitPrice, &exitTime, &p.ExitReason, &p.PnL,
+			&p.ExitPrice, &exitTime, &p.ExitReason, &p.PnL, &p.Charges,
 			&p.PeakPrice, &p.LastPrice, &p.CarryCount); err != nil {
 			return nil, err
 		}

@@ -119,6 +119,11 @@ type positionView struct {
 	Invested   float64 `json:"invested"`
 	PnL        float64 `json:"pnl"`
 	PnLPct     float64 `json:"pnl_pct"`
+	Charges    float64 `json:"charges,omitempty"`
+	NetPnL     float64 `json:"net_pnl,omitempty"`
+	NetPct     float64 `json:"net_pct,omitempty"`
+	EntryAt    string  `json:"entry_at,omitempty"` // "02 Jan 15:04:05" IST
+	ExitAt     string  `json:"exit_at,omitempty"`
 	TradeDate  string  `json:"trade_date"`
 }
 
@@ -132,6 +137,8 @@ type summary struct {
 	CarriedCount  int            `json:"carried_count"`
 	ClosedCount   int            `json:"closed_count"`
 	RealizedPnL   float64        `json:"realized_pnl"`
+	TotalCharges  float64        `json:"total_charges"`
+	NetRealized   float64        `json:"net_realized"`
 	ReturnPct     float64        `json:"return_pct"`
 	Wins          int            `json:"wins"`
 	WinRate       float64        `json:"win_rate"`
@@ -151,6 +158,10 @@ func view(p model.Position) positionView {
 		Symbol: p.Symbol, Qty: p.Qty, EntryPrice: p.EntryPrice, SLPrice: p.SLPrice,
 		Invested: p.Invested(), TradeDate: p.TradeDate, CarryCount: p.CarryCount,
 	}
+	const dt = "02 Jan 15:04:05"
+	if !p.EntryTime.IsZero() {
+		v.EntryAt = p.EntryTime.In(config.IST).Format(dt)
+	}
 	// P&L only exists once closed — leave open positions at zero rather than
 	// reporting a spurious -100% from a zero exit price.
 	if p.Status == model.StatusClosed {
@@ -158,6 +169,12 @@ func view(p model.Position) positionView {
 		v.ExitReason = p.ExitReason
 		v.PnL = p.PnL
 		v.PnLPct = p.PnLPct()
+		v.Charges = p.Charges
+		v.NetPnL = p.NetPnL()
+		v.NetPct = p.NetPct()
+		if !p.ExitTime.IsZero() {
+			v.ExitAt = p.ExitTime.In(config.IST).Format(dt)
+		}
 	} else {
 		v.PeakPrice = p.PeakPrice
 		v.LastPrice = p.LastPrice
@@ -200,11 +217,13 @@ func (s *Server) handleSummary(w http.ResponseWriter, r *http.Request) {
 	for _, p := range closed {
 		out.Closed = append(out.Closed, view(p))
 		out.RealizedPnL += p.PnL
+		out.TotalCharges += p.Charges
 		closedInvested += p.Invested()
 		if p.PnL > 0 {
 			out.Wins++
 		}
 	}
+	out.NetRealized = out.RealizedPnL - out.TotalCharges
 	out.ClosedCount = len(closed)
 	if closedInvested > 0 {
 		out.ReturnPct = out.RealizedPnL / closedInvested * 100

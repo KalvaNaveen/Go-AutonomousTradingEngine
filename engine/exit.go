@@ -92,6 +92,7 @@ func (e *Engine) exitEligible(ctx context.Context, carried map[string]bool, incl
 		p.ExitReason = reason
 		p.ExitTime = config.NowIST()
 		p.PnL = (fill - p.EntryPrice) * float64(p.Qty)
+		p.Charges = model.CNCCharges(p.Invested(), fill*float64(p.Qty))
 		p.Status = model.StatusClosed
 		if err := e.Store.ClosePosition(&p); err != nil {
 			return fmt.Errorf("persist close %s: %w", p.Symbol, err)
