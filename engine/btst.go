@@ -238,7 +238,8 @@ func (e *Engine) recordScan(date string, stocks []scanner.Stock, traded, carried
 	}
 	rows := make([]store.ScanRow, 0, len(stocks))
 	for _, s := range stocks {
-		r := store.ScanRow{Date: date, Symbol: s.Symbol, Close: s.Close, Source: s.Source, Outcome: "dropped"}
+		r := store.ScanRow{Date: date, Symbol: s.Symbol, Close: s.Close, PerChange: s.PerChange,
+			Source: s.Source, Outcome: "dropped"}
 		switch {
 		case traded[s.Symbol]:
 			r.Outcome = "traded"

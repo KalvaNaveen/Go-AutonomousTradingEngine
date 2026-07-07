@@ -97,6 +97,7 @@ CREATE TABLE IF NOT EXISTS scans (
     reason     TEXT,
     scanned_at TEXT,              -- HH:MM:SS IST when the scan ran
     source     TEXT,              -- screener slug(s) the stock came from
+    per_chg    REAL,              -- daily %-change at scan time (list is sorted by this)
     PRIMARY KEY (scan_date, symbol)
 );
 CREATE INDEX IF NOT EXISTS idx_scan_date ON scans(scan_date);
@@ -118,6 +119,7 @@ CREATE INDEX IF NOT EXISTS idx_sl_pos ON sl_events(position_id);`)
 	for _, stmt := range []string{
 		`ALTER TABLE scans ADD COLUMN scanned_at TEXT`,
 		`ALTER TABLE scans ADD COLUMN source TEXT`,
+		`ALTER TABLE scans ADD COLUMN per_chg REAL`,
 		`ALTER TABLE positions ADD COLUMN peak_price REAL`,
 		`ALTER TABLE positions ADD COLUMN last_price REAL`,
 		`ALTER TABLE positions ADD COLUMN carry_count INTEGER DEFAULT 0`,
@@ -139,12 +141,13 @@ func (s *Store) ScanTime(date string) (string, error) {
 
 // ScanRow is one stock from a day's ChartInk scan and what happened to it.
 type ScanRow struct {
-	Date    string  `json:"date"`
-	Symbol  string  `json:"symbol"`
-	Close   float64 `json:"close"`
-	Outcome string  `json:"outcome"` // traded | carried | dropped | held
-	Reason  string  `json:"reason,omitempty"`
-	Source  string  `json:"source,omitempty"` // screener slug(s)
+	Date      string  `json:"date"`
+	Symbol    string  `json:"symbol"`
+	Close     float64 `json:"close"`
+	PerChange float64 `json:"per_chg"`
+	Outcome   string  `json:"outcome"` // traded | carried | dropped | held
+	Reason    string  `json:"reason,omitempty"`
+	Source    string  `json:"source,omitempty"` // screener slug(s)
 }
 
 // SaveScan replaces the scan record for a date (idempotent across re-runs).
@@ -161,8 +164,8 @@ func (s *Store) SaveScan(date string, scannedAt time.Time, rows []ScanRow) error
 		return err
 	}
 	for _, r := range rows {
-		if _, err := tx.Exec(`INSERT INTO scans (scan_date, symbol, close, outcome, reason, scanned_at, source)
-			VALUES (?, ?, ?, ?, ?, ?, ?)`, date, r.Symbol, r.Close, r.Outcome, r.Reason, at, r.Source); err != nil {
+		if _, err := tx.Exec(`INSERT INTO scans (scan_date, symbol, close, outcome, reason, scanned_at, source, per_chg)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, date, r.Symbol, r.Close, r.Outcome, r.Reason, at, r.Source, r.PerChange); err != nil {
 			tx.Rollback()
 			return err
 		}
@@ -182,7 +185,7 @@ func (s *Store) LatestScanDate() (string, error) {
 
 // ScanByDate returns all scanned rows for a date (preserving insertion order).
 func (s *Store) ScanByDate(date string) ([]ScanRow, error) {
-	rows, err := s.db.Query(`SELECT scan_date, symbol, close, outcome, COALESCE(reason,''), COALESCE(source,'')
+	rows, err := s.db.Query(`SELECT scan_date, symbol, close, outcome, COALESCE(reason,''), COALESCE(source,''), COALESCE(per_chg,0)
 		FROM scans WHERE scan_date=? ORDER BY rowid`, date)
 	if err != nil {
 		return nil, err
@@ -191,7 +194,7 @@ func (s *Store) ScanByDate(date string) ([]ScanRow, error) {
 	var out []ScanRow
 	for rows.Next() {
 		var r ScanRow
-		if err := rows.Scan(&r.Date, &r.Symbol, &r.Close, &r.Outcome, &r.Reason, &r.Source); err != nil {
+		if err := rows.Scan(&r.Date, &r.Symbol, &r.Close, &r.Outcome, &r.Reason, &r.Source, &r.PerChange); err != nil {
 			return nil, err
 		}
 		out = append(out, r)
