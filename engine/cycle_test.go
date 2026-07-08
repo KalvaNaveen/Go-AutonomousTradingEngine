@@ -161,4 +161,42 @@ func TestMonitorOnce_TrailsAndExits(t *testing.T) {
 	}
 }
 
+func TestMonitorOnce_ProfitFloorLocks(t *testing.T) {
+	// Entry 200 × 75. Price rises ~2.5% (net > activate 2%) → the stop must be
+	// raised to the +1%-net floor price, ABOVE the plain 2% trail, and a later
+	// dip to just under the floor must exit with net ≈ +1%.
+	entry, qty := 200.0, 75
+	activate := model.SellPriceForNetPct(entry, qty, 2.0) // ≈ 204.66
+	floor := model.SellPriceForNetPct(entry, qty, 1.0)    // ≈ 202.65
+
+	eng, st := newTestEngine(t, fakeQuotes{quotes.OHLC{Low: 199, Last: activate + 0.5, High: activate + 0.5}})
+	seedOpen(t, st, model.Position{Symbol: "PBK", Qty: qty, EntryPrice: entry,
+		SLPrice: entry * 0.98, PeakPrice: entry})
+
+	eng.MonitorOnce(context.Background())
+	open, _ := st.OpenPositions()
+	if len(open) != 1 {
+		t.Fatalf("should still be open, got %d", len(open))
+	}
+	plainTrail := (activate + 0.5) * 0.98
+	if open[0].SLPrice < floor-0.01 {
+		t.Errorf("SL %.4f below profit floor %.4f", open[0].SLPrice, floor)
+	}
+	if open[0].SLPrice < plainTrail && open[0].SLPrice < floor {
+		t.Errorf("SL %.4f raised by neither trail nor floor", open[0].SLPrice)
+	}
+
+	// Dip below the floor → exit; realised NET must be ≈ +1% (not a loss).
+	eng.Quotes = fakeQuotes{quotes.OHLC{Low: floor - 1, Last: floor - 0.05, High: activate + 1}}
+	eng.MonitorOnce(context.Background())
+	closed, _ := st.ClosedPositions(5)
+	if len(closed) != 1 {
+		t.Fatalf("expected profit-floor exit, got %d closed", len(closed))
+	}
+	netPct := closed[0].NetPct()
+	if netPct < 0.85 || netPct > 1.1 {
+		t.Errorf("locked net %.3f%%, want ≈ +1%%", netPct)
+	}
+}
+
 var _ = broker.NewPaperBroker // silence unused-import edge in some build modes

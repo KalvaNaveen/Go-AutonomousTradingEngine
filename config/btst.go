@@ -39,6 +39,14 @@ var (
 	// held positions during market hours to trail the stop and exit on breach.
 	BTSTMonitorIntervalMin = int(envFloat("BTST_MONITOR_INTERVAL_MIN", 5))
 
+	// ── Profit booking (trailing floor, NET of charges) ─────────────────
+	// Once a position's watermark reaches a price worth BTSTProfitActivatePct
+	// net return (charges included), the stop is raised to at least the price
+	// worth BTSTProfitFloorPct net — locking a worst-case profit instead of
+	// waiting for the day's square-off. Set activate to 0 to disable.
+	BTSTProfitActivatePct = envFloat("BTST_PROFIT_ACTIVATE_PCT", 2.0)
+	BTSTProfitFloorPct    = envFloat("BTST_PROFIT_FLOOR_PCT", 1.0)
+
 	// BTSTEntryTime / BTSTExitTime are the HH:MM IST trigger times.
 	BTSTEntryTime = envStr("BTST_ENTRY_TIME", "15:20")
 	BTSTExitTime  = envStr("BTST_EXIT_TIME", "15:20")

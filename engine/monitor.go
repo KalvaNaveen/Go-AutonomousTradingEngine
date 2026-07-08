@@ -66,6 +66,19 @@ func (e *Engine) MonitorOnce(ctx context.Context) {
 			p.TradeDate == today, config.BTSTStopLossPct)
 		p.LastPrice = ohlc.Last
 
+		// ── Profit-booking floor (net of charges) ───────────────────────
+		// Once the watermark has been worth ≥ activate% net, never give back
+		// below floor% net: raise the stop to the floor price if it's higher.
+		// Sticky by design — keyed to the peak, so a dip can't unlock it.
+		if config.BTSTProfitActivatePct > 0 {
+			activate := model.SellPriceForNetPct(p.EntryPrice, p.Qty, config.BTSTProfitActivatePct)
+			if p.PeakPrice >= activate {
+				if floor := model.SellPriceForNetPct(p.EntryPrice, p.Qty, config.BTSTProfitFloorPct); floor > p.SLPrice {
+					p.SLPrice = floor
+				}
+			}
+		}
+
 		if err := e.Store.UpdateTrail(&p, config.NowIST(), oldSL); err != nil {
 			log.Printf("[Monitor] trail persist %s: %v", p.Symbol, err)
 		}

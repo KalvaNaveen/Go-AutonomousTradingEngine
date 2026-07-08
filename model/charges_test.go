@@ -25,6 +25,27 @@ func TestCNCCharges(t *testing.T) {
 	}
 }
 
+// SellPriceForNetPct must produce an exit price whose NET return (after
+// CNCCharges) equals the requested target.
+func TestSellPriceForNetPct(t *testing.T) {
+	entry, qty := 200.0, 75 // ₹15k position, typical basket size
+	for _, target := range []float64{1.0, 2.0} {
+		x := SellPriceForNetPct(entry, qty, target)
+		if x <= entry {
+			t.Fatalf("target %.1f%%: exit %.4f not above entry", target, x)
+		}
+		gross := (x - entry) * float64(qty)
+		net := gross - CNCCharges(entry*float64(qty), x*float64(qty))
+		gotPct := net / (entry * float64(qty)) * 100
+		if gotPct < target-0.01 || gotPct > target+0.01 {
+			t.Errorf("target %.2f%%: achieved %.4f%% (exit %.4f)", target, gotPct, x)
+		}
+	}
+	if SellPriceForNetPct(0, 10, 1) != 0 || SellPriceForNetPct(100, 0, 1) != 0 {
+		t.Errorf("invalid inputs must return 0")
+	}
+}
+
 func TestNetPnL(t *testing.T) {
 	p := Position{Qty: 100, EntryPrice: 100, ExitPrice: 110,
 		PnL: 1000, Charges: 38.62, Status: StatusClosed}

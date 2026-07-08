@@ -7,12 +7,17 @@ package web
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
 
 	"bnf_go_engine/config"
 	"bnf_go_engine/model"
 	"bnf_go_engine/store"
 )
+
+// r2 rounds to 2 decimals — applied to every float leaving the API so no
+// consumer (UI, JSON viewer, script) ever sees 877.4507500000001.
+func r2(v float64) float64 { return math.Round(v*100) / 100 }
 
 // Server wraps the store and serves the dashboard.
 type Server struct {
@@ -78,8 +83,9 @@ func (s *Server) handleHistory(w http.ResponseWriter, r *http.Request) {
 	}{Date: date, ScanTime: scanTime, Scan: scan}
 	for _, p := range pos {
 		out.Positions = append(out.Positions, view(p))
-		out.NetPnL += p.PnL
+		out.NetPnL += p.NetPnL()
 	}
+	out.NetPnL = r2(out.NetPnL)
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(out)
 }
@@ -156,8 +162,8 @@ type summary struct {
 
 func view(p model.Position) positionView {
 	v := positionView{
-		Symbol: p.Symbol, Qty: p.Qty, EntryPrice: p.EntryPrice, SLPrice: p.SLPrice,
-		Invested: p.Invested(), TradeDate: p.TradeDate, CarryCount: p.CarryCount,
+		Symbol: p.Symbol, Qty: p.Qty, EntryPrice: r2(p.EntryPrice), SLPrice: r2(p.SLPrice),
+		Invested: r2(p.Invested()), TradeDate: p.TradeDate, CarryCount: p.CarryCount,
 	}
 	const dt = "02 Jan 15:04:05"
 	if !p.EntryTime.IsZero() {
@@ -166,22 +172,22 @@ func view(p model.Position) positionView {
 	// P&L only exists once closed — leave open positions at zero rather than
 	// reporting a spurious -100% from a zero exit price.
 	if p.Status == model.StatusClosed {
-		v.ExitPrice = p.ExitPrice
+		v.ExitPrice = r2(p.ExitPrice)
 		v.ExitReason = p.ExitReason
-		v.PnL = p.PnL
-		v.PnLPct = p.PnLPct()
-		v.Charges = p.Charges
-		v.NetPnL = p.NetPnL()
-		v.NetPct = p.NetPct()
+		v.PnL = r2(p.PnL)
+		v.PnLPct = r2(p.PnLPct())
+		v.Charges = r2(p.Charges)
+		v.NetPnL = r2(p.NetPnL())
+		v.NetPct = r2(p.NetPct())
 		if !p.ExitTime.IsZero() {
 			v.ExitAt = p.ExitTime.In(config.IST).Format(dt)
 		}
 	} else {
-		v.PeakPrice = p.PeakPrice
-		v.LastPrice = p.LastPrice
-		v.UnrealPnL = p.UnrealPnL()
+		v.PeakPrice = r2(p.PeakPrice)
+		v.LastPrice = r2(p.LastPrice)
+		v.UnrealPnL = r2(p.UnrealPnL())
 		if p.EntryPrice > 0 && p.LastPrice > 0 {
-			v.UnrealPct = (p.LastPrice - p.EntryPrice) / p.EntryPrice * 100
+			v.UnrealPct = r2((p.LastPrice - p.EntryPrice) / p.EntryPrice * 100)
 		}
 	}
 	return v
@@ -233,8 +239,24 @@ func (s *Server) handleSummary(w http.ResponseWriter, r *http.Request) {
 		out.WinRate = float64(out.Wins) / float64(out.ClosedCount) * 100
 	}
 
+	// Round every remaining float leaving the API.
+	out.OpenInvested = r2(out.OpenInvested)
+	out.UnrealizedPnL = r2(out.UnrealizedPnL)
+	out.RealizedPnL = r2(out.RealizedPnL)
+	out.TotalCharges = r2(out.TotalCharges)
+	out.NetRealized = r2(out.NetRealized)
+	out.ReturnPct = r2(out.ReturnPct)
+	out.WinRate = r2(out.WinRate)
+
 	out.SLEvents, _ = s.store.SLEvents(20)
+	for i := range out.SLEvents {
+		e := &out.SLEvents[i]
+		e.Price, e.OldSL, e.NewSL = r2(e.Price), r2(e.OldSL), r2(e.NewSL)
+	}
 	out.Daily, _ = s.store.DailyNetPnL()
+	for i := range out.Daily {
+		out.Daily[i].Net = r2(out.Daily[i].Net)
+	}
 
 	// Most recent daily scan (scanned vs traded vs dropped/held).
 	if d, err := s.store.LatestScanDate(); err == nil && d != "" {

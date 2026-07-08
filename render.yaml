@@ -34,6 +34,12 @@ services:
         value: "2"
       - key: BTST_MONITOR_INTERVAL_MIN
         value: "5"
+      # Profit booking: once a holding has been worth >= ACTIVATE% NET of charges,
+      # the stop is raised so the worst case locks FLOOR% net profit.
+      - key: BTST_PROFIT_ACTIVATE_PCT
+        value: "2"
+      - key: BTST_PROFIT_FLOOR_PCT
+        value: "1"
       # Automated sentiment gates OFF by default.
       - key: BTST_GATE_ENABLED
         value: "false"
