@@ -10,6 +10,9 @@ const dashboardHTML = `<!DOCTYPE html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>BTST Engine</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet">
 <style>
   :root{
     --acc:#5367ff;--grn:#00b386;--red:#eb5b3c;--amb:#f5a623;
@@ -19,7 +22,7 @@ const dashboardHTML = `<!DOCTYPE html>
   }
   *{box-sizing:border-box;margin:0;padding:0}
   body{background:var(--bg);color:var(--txt);
-    font:14px/1.5 'Inter',-apple-system,'Segoe UI',Roboto,'Helvetica Neue',sans-serif;
+    font:14px/1.5 'Manrope',-apple-system,'Segoe UI',Roboto,'Helvetica Neue',sans-serif;
     padding-bottom:60px}
   .wrap{max-width:1080px;margin:0 auto;padding:0 20px}
 
@@ -44,9 +47,18 @@ const dashboardHTML = `<!DOCTYPE html>
   .hero{background:var(--card);border:1px solid var(--bd);border-radius:16px;
     box-shadow:var(--shadow);margin:20px 0;padding:22px 24px 8px;overflow:hidden}
   .hero .lbl{color:var(--mut);font-size:12px;font-weight:600}
-  .heroline{display:flex;align-items:baseline;gap:12px;flex-wrap:wrap;margin-top:4px}
-  .heroval{font-size:34px;font-weight:800;color:var(--head);font-variant-numeric:tabular-nums;letter-spacing:-.5px}
+  .heroline{display:flex;align-items:baseline;gap:14px;flex-wrap:wrap;margin-top:4px}
+  .heroval{font-family:'Space Grotesk','Manrope',sans-serif;font-size:46px;font-weight:700;
+    color:var(--head);font-variant-numeric:tabular-nums;letter-spacing:-1.5px;line-height:1.1}
   .heroval.pos{color:var(--grn)} .heroval.neg{color:var(--red)}
+  .heroval .cur{font-size:26px;font-weight:600;opacity:.55;margin-right:2px;letter-spacing:0}
+  .delta{display:inline-flex;align-items:center;gap:4px;font-size:13px;font-weight:800;
+    padding:5px 12px;border-radius:999px;font-family:'Space Grotesk',sans-serif}
+  .stat .val{font-family:'Space Grotesk','Manrope',sans-serif}
+  #tip{position:absolute;pointer-events:none;background:var(--head);color:#fff;
+    font-size:11px;font-weight:600;padding:5px 10px;border-radius:8px;white-space:nowrap;
+    transform:translate(-50%,-130%);display:none;z-index:5;font-variant-numeric:tabular-nums}
+  #chartbox{position:relative}
   .chips{display:flex;gap:8px;flex-wrap:wrap;margin:10px 0 4px}
   .chipk{background:var(--bg);border:1px solid var(--bd);border-radius:999px;
     padding:4px 12px;font-size:11.5px;color:var(--mut)}
@@ -182,31 +194,88 @@ function stat(lbl, val, sub){
 function wrapT(inner){ return '<div class="tblwrap"><table>'+inner+'</table></div>'; }
 
 /* ── equity curve (hand-rolled SVG) ── */
+let _chartPts = null; // {xs, ys, dates, vals} for the hover tooltip
 function chart(daily){
-  if(!daily || daily.length < 2) return '<div class="chartempty">Equity curve appears once a few days of trades close</div>';
+  if(!daily || daily.length < 2){ _chartPts = null;
+    return '<div class="chartempty">Equity curve appears once a few days of trades close</div>'; }
   let cum = 0;
-  const pts = daily.map(d => (cum += d.net));
-  const n = pts.length, W = 720, H = 150, P = 10;
-  let mn = Math.min(0, ...pts), mx = Math.max(0, ...pts);
+  const vals = daily.map(d => (cum += d.net));
+  const n = vals.length, W = 720, H = 150, P = 10;
+  let mn = Math.min(0, ...vals), mx = Math.max(0, ...vals);
   if(mx === mn){ mx = mn + 1; }
   const X = i => P + i*(W-2*P)/(n-1);
   const Y = v => P + (mx-v)*(H-2*P)/(mx-mn);
-  const up = pts[n-1] >= 0, col = up ? '#00b386' : '#eb5b3c';
-  let line = '', area = 'M'+X(0)+','+Y(0>mn?0:mn)+' ';
-  for(let i=0;i<n;i++){ line += (i?'L':'M')+X(i).toFixed(1)+','+Y(pts[i]).toFixed(1)+' '; }
-  area = line + 'L'+X(n-1).toFixed(1)+','+(H-P)+' L'+X(0).toFixed(1)+','+(H-P)+' Z';
+  const xs = [], ys = [];
+  for(let i=0;i<n;i++){ xs.push(X(i)); ys.push(Y(vals[i])); }
+  _chartPts = {xs:xs, ys:ys, dates:daily.map(d=>d.date), vals:vals, W:W, H:H};
+
+  // Smooth quadratic curve through midpoints (Dribbble-style soft line).
+  let line = 'M'+xs[0].toFixed(1)+','+ys[0].toFixed(1);
+  for(let i=1;i<n-1;i++){
+    const xc=(xs[i]+xs[i+1])/2, yc=(ys[i]+ys[i+1])/2;
+    line += ' Q'+xs[i].toFixed(1)+','+ys[i].toFixed(1)+' '+xc.toFixed(1)+','+yc.toFixed(1);
+  }
+  line += ' L'+xs[n-1].toFixed(1)+','+ys[n-1].toFixed(1);
+  const up = vals[n-1] >= 0, col = up ? '#00b386' : '#eb5b3c';
+  const area = line + ' L'+xs[n-1].toFixed(1)+','+(H-P)+' L'+xs[0].toFixed(1)+','+(H-P)+' Z';
   const zero = (mn<0 && mx>0)
     ? '<line x1="'+P+'" y1="'+Y(0).toFixed(1)+'" x2="'+(W-P)+'" y2="'+Y(0).toFixed(1)+'" stroke="#d5d9ea" stroke-dasharray="4 4"/>' : '';
-  const lastX = X(n-1).toFixed(1), lastY = Y(pts[n-1]).toFixed(1);
   return '<svg id="chart" viewBox="0 0 '+W+' '+H+'" preserveAspectRatio="none">'
     + '<defs><linearGradient id="g" x1="0" y1="0" x2="0" y2="1">'
-    + '<stop offset="0%" stop-color="'+col+'" stop-opacity=".18"/>'
+    + '<stop offset="0%" stop-color="'+col+'" stop-opacity=".22"/>'
     + '<stop offset="100%" stop-color="'+col+'" stop-opacity="0"/></linearGradient></defs>'
     + zero
     + '<path d="'+area+'" fill="url(#g)"/>'
-    + '<path d="'+line+'" fill="none" stroke="'+col+'" stroke-width="2.2" stroke-linejoin="round"/>'
-    + '<circle cx="'+lastX+'" cy="'+lastY+'" r="3.5" fill="'+col+'"/>'
-    + '</svg>';
+    + '<path d="'+line+'" fill="none" stroke="'+col+'" stroke-width="2.4" stroke-linejoin="round" stroke-linecap="round"/>'
+    + '<circle cx="'+xs[n-1].toFixed(1)+'" cy="'+ys[n-1].toFixed(1)+'" r="4" fill="'+col+'">'
+    + '<animate attributeName="r" values="4;5.5;4" dur="2s" repeatCount="indefinite"/></circle>'
+    + '<circle id="hovdot" r="4" fill="'+col+'" stroke="#fff" stroke-width="1.5" style="display:none"/>'
+    + '</svg><div id="tip"></div>';
+}
+
+// Hover tooltip: nearest point → date + cumulative value.
+function wireChartHover(){
+  const svg = document.getElementById('chart');
+  if(!svg || !_chartPts) return;
+  const tip = document.getElementById('tip'), dot = document.getElementById('hovdot');
+  svg.addEventListener('mousemove', function(e){
+    const r = svg.getBoundingClientRect();
+    const fx = (e.clientX - r.left) / r.width * _chartPts.W;
+    let best = 0, bd = 1e9;
+    for(let i=0;i<_chartPts.xs.length;i++){
+      const d = Math.abs(_chartPts.xs[i]-fx);
+      if(d < bd){ bd = d; best = i; }
+    }
+    dot.style.display=''; dot.setAttribute('cx', _chartPts.xs[best]); dot.setAttribute('cy', _chartPts.ys[best]);
+    tip.style.display='block';
+    tip.style.left = (_chartPts.xs[best]/_chartPts.W*r.width)+'px';
+    tip.style.top = (_chartPts.ys[best]/_chartPts.H*r.height)+'px';
+    tip.textContent = _chartPts.dates[best].slice(5) + ' · ' + sinr(_chartPts.vals[best]);
+  });
+  svg.addEventListener('mouseleave', function(){ tip.style.display='none'; dot.style.display='none'; });
+}
+
+// Count-up animation for the hero number (runs once per page load).
+let _heroAnimated = false;
+function animateHero(el, target){
+  if(_heroAnimated){ el.innerHTML = fmtHero(target); return; }
+  _heroAnimated = true;
+  const t0 = performance.now(), dur = 850;
+  function step(t){
+    const k = Math.min(1, (t-t0)/dur), e = 1 - Math.pow(1-k, 3);
+    el.innerHTML = fmtHero(target*e);
+    if(k < 1) requestAnimationFrame(step);
+  }
+  requestAnimationFrame(step);
+}
+function fmtHero(n){
+  const neg = n < 0;
+  return (neg?'−':'') + '<span class="cur">₹</span>'
+       + Math.round(Math.abs(n)).toLocaleString('en-IN');
+}
+function delta(v){
+  const up = v >= 0;
+  return '<span class="delta '+(up?'pg':'pr')+'">'+(up?'▲':'▼')+' '+Math.abs(v).toFixed(2)+'%</span>';
 }
 
 function openTable(rows){
@@ -265,15 +334,17 @@ async function load(){
 
     const netTot = (s.net_realized||0)+(s.unrealized_pnl||0);
     const hero = document.getElementById('heropnl');
-    hero.textContent = sinr(netTot); hero.className = 'heroval ' + cls(netTot);
+    hero.className = 'heroval ' + cls(netTot);
+    animateHero(hero, netTot);
     const invested = s.open_invested||0;
-    document.getElementById('heropill').innerHTML = invested>0 ? pill(netTot/invested*100) : '';
+    document.getElementById('heropill').innerHTML = invested>0 ? delta(netTot/invested*100) : '';
     document.getElementById('herochips').innerHTML =
       '<span class="chipk">Realised <b class="'+cls(s.net_realized||0)+'">'+sinr(s.net_realized||0)+'</b></span>'
      +'<span class="chipk">Unrealised <b class="'+cls(s.unrealized_pnl||0)+'">'+sinr(s.unrealized_pnl||0)+'</b></span>'
      +'<span class="chipk">Charges <b>'+inr(s.total_charges||0)+'</b></span>'
      +'<span class="chipk">Win rate <b>'+(s.win_rate||0).toFixed(0)+'%</b></span>';
     document.getElementById('chartbox').innerHTML = chart(s.daily);
+    wireChartHover();
 
     document.getElementById('stats').innerHTML =
       stat('Holdings', s.open_count, s.carried_count ? s.carried_count+' carried over' : 'positions') +
