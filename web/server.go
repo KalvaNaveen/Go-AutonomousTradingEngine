@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"math"
 	"net/http"
+	"strconv"
 
 	"bnf_go_engine/config"
 	"bnf_go_engine/model"
@@ -46,6 +47,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/summary", s.handleSummary)
 	mux.HandleFunc("/api/dates", s.handleDates)
 	mux.HandleFunc("/api/history", s.handleHistory)
+	mux.HandleFunc("/api/delete", s.handleDelete)
 	if s.trigger != nil {
 		mux.HandleFunc("/api/run", s.handleRun)
 	}
@@ -90,6 +92,50 @@ func (s *Server) handleHistory(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(out)
 }
 
+// handleDelete removes trade records: ?id=<position id> deletes one position
+// (and its SL events), ?date=YYYY-MM-DD wipes every position + scan row for
+// that day. Destructive, so when a trigger token is configured it is required
+// here too; without one (local dev dashboard) it is open.
+func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost && r.Method != http.MethodDelete {
+		http.Error(w, "POST or DELETE required", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.token != "" && r.URL.Query().Get("token") != s.token {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	q := r.URL.Query()
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	switch {
+	case q.Get("id") != "":
+		id, err := strconv.ParseInt(q.Get("id"), 10, 64)
+		if err != nil {
+			http.Error(w, "bad id", http.StatusBadRequest)
+			return
+		}
+		n, err := s.store.DeletePosition(id)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if n == 0 {
+			http.Error(w, "no such record", http.StatusNotFound)
+			return
+		}
+		fmt.Fprintf(w, "deleted record #%d\n", id)
+	case q.Get("date") != "":
+		date := q.Get("date")
+		if err := s.store.PurgeDate(date); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		fmt.Fprintf(w, "deleted all records for %s\n", date)
+	default:
+		http.Error(w, "id or date required", http.StatusBadRequest)
+	}
+}
+
 // handleRun fires a manual scan+trade. Requires ?token=<BTST_TRIGGER_TOKEN>.
 // ?force=1 re-runs cleanly (purges today's rows first).
 func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
@@ -111,6 +157,7 @@ func (s *Server) ListenAndServe(addr string) error {
 // ── JSON view models ────────────────────────────────────────────────────────
 
 type positionView struct {
+	ID         int64   `json:"id"`
 	Symbol     string  `json:"symbol"`
 	Qty        int     `json:"qty"`
 	EntryPrice float64 `json:"entry_price"`
@@ -162,7 +209,7 @@ type summary struct {
 
 func view(p model.Position) positionView {
 	v := positionView{
-		Symbol: p.Symbol, Qty: p.Qty, EntryPrice: r2(p.EntryPrice), SLPrice: r2(p.SLPrice),
+		ID: p.ID, Symbol: p.Symbol, Qty: p.Qty, EntryPrice: r2(p.EntryPrice), SLPrice: r2(p.SLPrice),
 		Invested: r2(p.Invested()), TradeDate: p.TradeDate, CarryCount: p.CarryCount,
 	}
 	const dt = "02 Jan 15:04:05"

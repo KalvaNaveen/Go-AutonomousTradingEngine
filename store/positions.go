@@ -259,14 +259,32 @@ SELECT d FROM (
 	return out, rows.Err()
 }
 
-// PurgeDate removes all positions and scan rows for a date — used by a forced
-// manual re-run so today's data starts clean.
+// PurgeDate removes all positions, their SL audit events, and scan rows for a
+// date — used by a forced manual re-run and by the dashboard's delete-by-date.
 func (s *Store) PurgeDate(date string) error {
+	if _, err := s.db.Exec(`DELETE FROM sl_events WHERE position_id IN
+		(SELECT id FROM positions WHERE trade_date=?)`, date); err != nil {
+		return err
+	}
 	if _, err := s.db.Exec(`DELETE FROM positions WHERE trade_date=?`, date); err != nil {
 		return err
 	}
 	_, err := s.db.Exec(`DELETE FROM scans WHERE scan_date=?`, date)
 	return err
+}
+
+// DeletePosition removes a single position and its SL audit events. Returns
+// the number of position rows removed (0 if the id didn't exist).
+func (s *Store) DeletePosition(id int64) (int64, error) {
+	if _, err := s.db.Exec(`DELETE FROM sl_events WHERE position_id=?`, id); err != nil {
+		return 0, err
+	}
+	res, err := s.db.Exec(`DELETE FROM positions WHERE id=?`, id)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
 }
 
 // SaveOpen inserts a newly-opened position and returns its assigned ID.

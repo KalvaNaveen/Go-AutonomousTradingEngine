@@ -122,6 +122,12 @@ const dashboardHTML = `<!DOCTYPE html>
     letter-spacing:.6px;font-weight:600}
   #histdate{background:var(--card);color:var(--txt);border:1px solid var(--bd);border-radius:10px;
     padding:8px 12px;font-size:13px;margin-bottom:12px;box-shadow:var(--shadow)}
+  .del{background:none;border:0;color:var(--faint);cursor:pointer;font-size:13px;
+    padding:2px 7px;border-radius:7px;line-height:1;transition:all .12s}
+  .del:hover{color:var(--red);background:#fdeeea}
+  #deldate{background:none;border:1px solid var(--bd);color:var(--red);border-radius:10px;
+    padding:8px 14px;font-size:12.5px;font-weight:600;cursor:pointer;margin-left:8px;transition:all .12s}
+  #deldate:hover{background:#fdeeea;border-color:#f3c6bb}
 </style>
 </head>
 <body>
@@ -160,6 +166,7 @@ const dashboardHTML = `<!DOCTYPE html>
   <section id="s-sl"><div class="panel" id="slev"></div></section>
   <section id="s-hist">
     <select id="histdate"><option value="">Loading dates…</option></select>
+    <button id="deldate" onclick="delDate()" title="Delete every scan row and trade for the selected date">🗑 Delete day</button>
     <div id="hist"></div>
   </section>
 </div>
@@ -280,14 +287,15 @@ function delta(v){
 
 function openTable(rows){
   if(!rows||!rows.length) return '<div class="empty">No holdings yet — the 15:20 IST cycle (or ▶ Run scan) fills this.</div>';
-  let h='<tr><th>Instrument</th><th>Bought at</th><th>Qty</th><th>Entry</th><th>LTP</th><th>Peak</th><th>Trail SL</th><th>P&L</th><th>%</th></tr>';
+  let h='<tr><th>Instrument</th><th>Bought at</th><th>Qty</th><th>Entry</th><th>LTP</th><th>Peak</th><th>Trail SL</th><th>P&L</th><th>%</th><th></th></tr>';
   for(const p of rows){
     const carry = p.carry_count>0 ? '<span class="carry">↻'+p.carry_count+'</span>' : '';
     h+='<tr><td>'+inst(p.symbol, '', carry)+'</td><td class="dimtxt">'+(p.entry_at||p.trade_date)
       +'</td><td>'+p.qty+'</td><td>'+f2(p.entry_price)
       +'</td><td><b>'+f2(p.last_price)+'</b></td><td class="dimtxt">'+f2(p.peak_price)
       +'</td><td class="sl">'+f2(p.sl_price)
-      +'</td><td class="'+cls(p.unreal_pnl||0)+'"><b>'+sign(p.unreal_pnl||0)+'</b></td><td>'+pill(p.unreal_pct||0)+'</td></tr>';
+      +'</td><td class="'+cls(p.unreal_pnl||0)+'"><b>'+sign(p.unreal_pnl||0)+'</b></td><td>'+pill(p.unreal_pct||0)
+      +'</td><td>'+delBtn(p)+'</td></tr>';
   }
   return wrapT(h);
 }
@@ -304,7 +312,7 @@ function scanTable(rows){
 
 function closedTable(rows){
   if(!rows||!rows.length) return '<div class="empty">No closed trades yet.</div>';
-  let h='<tr><th>Instrument</th><th>Bought at</th><th>Sold at</th><th>Entry</th><th>Exit</th><th>Reason</th><th>Gross</th><th>Charges</th><th>Net P&L</th><th>Net %</th></tr>';
+  let h='<tr><th>Instrument</th><th>Bought at</th><th>Sold at</th><th>Entry</th><th>Exit</th><th>Reason</th><th>Gross</th><th>Charges</th><th>Net P&L</th><th>Net %</th><th></th></tr>';
   for(const p of rows){
     const rsn = p.exit_reason==='stoploss' ? '<span class="sl">SL hit</span>' : '<span class="dimtxt">square-off</span>';
     h+='<tr><td>'+inst(p.symbol)+'</td><td class="dimtxt">'+(p.entry_at||p.trade_date)
@@ -312,7 +320,8 @@ function closedTable(rows){
       +'</td><td>'+f2(p.entry_price)+'</td><td>'+f2(p.exit_price)+'</td><td>'+rsn
       +'</td><td class="'+cls(p.pnl)+'">'+sign(p.pnl)
       +'</td><td class="dimtxt">₹'+f2(p.charges||0)
-      +'</td><td class="'+cls(p.net_pnl||0)+'"><b>'+sign(p.net_pnl||0)+'</b></td><td>'+pill(p.net_pct||0)+'</td></tr>';
+      +'</td><td class="'+cls(p.net_pnl||0)+'"><b>'+sign(p.net_pnl||0)+'</b></td><td>'+pill(p.net_pct||0)
+      +'</td><td>'+delBtn(p)+'</td></tr>';
   }
   return wrapT(h);
 }
@@ -372,14 +381,15 @@ async function load(){
 
 function histPositions(rows){
   if(!rows||!rows.length) return '<div class="empty">No positions this day.</div>';
-  let h='<tr><th>Instrument</th><th>Qty</th><th>Entry</th><th>Exit</th><th>Net P&L</th><th>Status</th></tr>';
+  let h='<tr><th>Instrument</th><th>Qty</th><th>Entry</th><th>Exit</th><th>Net P&L</th><th>Status</th><th></th></tr>';
   for(const p of rows){
     const closed = !!p.exit_price;
     const slm = p.exit_reason==='stoploss' ? ' <span class="sl">SL</span>' : '';
     h+='<tr><td>'+inst(p.symbol, p.entry_at||'')+'</td><td>'+p.qty+'</td><td>'+f2(p.entry_price)
       +'</td><td>'+(closed? f2(p.exit_price)+slm : '—')
       +'</td><td class="'+(closed?cls(p.net_pnl||p.pnl):'')+'">'+(closed? sign(p.net_pnl!=null?p.net_pnl:p.pnl):'—')
-      +'</td><td>'+(closed?'<span class="pill pn">closed</span>':'<span class="pill" style="background:#fdf3df;color:var(--amb)">open</span>')+'</td></tr>';
+      +'</td><td>'+(closed?'<span class="pill pn">closed</span>':'<span class="pill" style="background:#fdf3df;color:var(--amb)">open</span>')
+      +'</td><td>'+delBtn(p)+'</td></tr>';
   }
   return wrapT(h);
 }
@@ -406,6 +416,37 @@ async function loadDates(){
     sel.onchange = () => loadHistory(sel.value);
     if(!cur) loadHistory(dates[0]);
   }catch(e){ document.getElementById('histdate').innerHTML='<option>Error</option>'; }
+}
+
+function delBtn(p){
+  return '<button class="del" title="Delete this record" onclick="delRec('+p.id+',\''+p.symbol+'\')">✕</button>';
+}
+
+// POSTs /api/delete with the stored trigger token; on 403 asks for the token
+// once and retries. Refreshes every view afterwards.
+async function apiDelete(qs, label){
+  if(!confirm('Delete '+label+'? This cannot be undone.')) return;
+  let t = localStorage.getItem('btst_token') || '';
+  const call = tok => fetch('/api/delete?'+qs+'&token='+encodeURIComponent(tok), {method:'POST'});
+  try{
+    let r = await call(t);
+    if(r.status === 403){
+      t = prompt('Trigger token (BTST_TRIGGER_TOKEN):', t);
+      if(!t) return;
+      localStorage.setItem('btst_token', t);
+      r = await call(t);
+    }
+    if(!r.ok){ alert('Failed: ' + r.status + ' ' + await r.text()); return; }
+  }catch(e){ alert('Error: ' + e); return; }
+  load(); loadDates();
+  const sel = document.getElementById('histdate');
+  if(sel.value) loadHistory(sel.value);
+}
+function delRec(id, sym){ apiDelete('id='+id, sym+' (record #'+id+')'); }
+function delDate(){
+  const d = document.getElementById('histdate').value;
+  if(!d){ alert('Pick a date first.'); return; }
+  apiDelete('date='+encodeURIComponent(d), 'ALL trades and scan rows for '+d);
 }
 
 async function runNow(){
