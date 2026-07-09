@@ -310,11 +310,18 @@ function scanTable(rows){
   return wrapT(h);
 }
 
+// A trailing stop that fired above breakeven locked in profit — label it as
+// such (green) instead of the loss-implying red "SL hit".
+function exitLabel(p){
+  if(p.exit_reason!=='stoploss') return '<span class="dimtxt">square-off</span>';
+  return (p.net_pnl||0) > 0 ? '<span class="pos">Trail profit</span>' : '<span class="sl">SL hit</span>';
+}
+
 function closedTable(rows){
   if(!rows||!rows.length) return '<div class="empty">No closed trades yet.</div>';
   let h='<tr><th>Instrument</th><th>Bought at</th><th>Sold at</th><th>Entry</th><th>Exit</th><th>Reason</th><th>Gross</th><th>Charges</th><th>Net P&L</th><th>Net %</th><th></th></tr>';
   for(const p of rows){
-    const rsn = p.exit_reason==='stoploss' ? '<span class="sl">SL hit</span>' : '<span class="dimtxt">square-off</span>';
+    const rsn = exitLabel(p);
     h+='<tr><td>'+inst(p.symbol)+'</td><td class="dimtxt">'+(p.entry_at||p.trade_date)
       +'</td><td class="dimtxt">'+(p.exit_at||'')
       +'</td><td>'+f2(p.entry_price)+'</td><td>'+f2(p.exit_price)+'</td><td>'+rsn
@@ -384,7 +391,8 @@ function histPositions(rows){
   let h='<tr><th>Instrument</th><th>Qty</th><th>Entry</th><th>Exit</th><th>Net P&L</th><th>Status</th><th></th></tr>';
   for(const p of rows){
     const closed = !!p.exit_price;
-    const slm = p.exit_reason==='stoploss' ? ' <span class="sl">SL</span>' : '';
+    const slm = p.exit_reason!=='stoploss' ? ''
+      : (p.net_pnl||0) > 0 ? ' <span class="pos">TP</span>' : ' <span class="sl">SL</span>';
     h+='<tr><td>'+inst(p.symbol, p.entry_at||'')+'</td><td>'+p.qty+'</td><td>'+f2(p.entry_price)
       +'</td><td>'+(closed? f2(p.exit_price)+slm : '—')
       +'</td><td class="'+(closed?cls(p.net_pnl||p.pnl):'')+'">'+(closed? sign(p.net_pnl!=null?p.net_pnl:p.pnl):'—')
